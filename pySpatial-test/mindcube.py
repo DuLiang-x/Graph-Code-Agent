@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Evaluate pySpatial Agent on MindCube dataset and calculate statistics for three types:
@@ -12,7 +11,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from collections import defaultdict
 from multiprocessing import Pool, cpu_count
@@ -22,6 +21,10 @@ import threading
 import backoff
 import re
 import string
+import textwrap
+
+from PIL import Image, ImageFont, ImageDraw
+import numpy as np
 
 # Add parent directory to Python path to import pySpatial_Interface
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,7 +39,7 @@ request_lock = threading.Lock()
 def rate_limit():
     """Apply rate limiting between API requests"""
     global last_request_time
-    
+
     with request_lock:
         current_time = time.time()
         time_since_last = current_time - last_request_time
@@ -65,10 +68,10 @@ def call_agent_with_retry(agent, method_name, *args, **kwargs):
 def extract_type_from_images(images: List[str]) -> str:
     """
     Extract the type (among, around, rotation) from the image paths.
-    
+
     Args:
         images: List of image paths
-        
+
     Returns:
         The type string or 'unknown' if cannot be determined
     """
@@ -79,7 +82,7 @@ def extract_type_from_images(images: List[str]) -> str:
             return 'around'
         elif 'rotation' in image_path:
             return 'rotation'
-    
+
     return 'unknown'
 
 
@@ -87,16 +90,16 @@ def normalize_answer(answer: str) -> str:
     """Normalize answer for more flexible matching."""
     if not answer:
         return ""
-    
+
     # Convert to lowercase
     answer = answer.lower().strip()
-    
+
     # Remove extra whitespace
     answer = re.sub(r'\s+', ' ', answer)
-    
+
     # Remove punctuation except numbers and basic symbols
     answer = answer.strip(string.punctuation)
-    
+
     return answer
 
 
@@ -114,25 +117,33 @@ def flexible_answer_match(generated: str, expected: str) -> bool:
     """
     if not generated or not expected:
         return False
-    
+
     # Strategy 1: Exact match
     if generated == expected:
         return True
-    
+
     # Strategy 2: Normalized match
     norm_gen = normalize_answer(generated)
     norm_exp = normalize_answer(expected)
     if norm_gen == norm_exp:
         return True
-    
+
     # Strategy 3: Substring match (either direction)
-    if norm_exp in norm_gen or norm_gen in norm_exp:
-        return True
-    
+    # For short expected answers (e.g., "A", "B", "C", "D"), use word boundary
+    # matching to avoid false positives (e.g., "c" matching inside "classroom")
+    if len(norm_exp) <= 2:
+        if re.search(r'\b' + re.escape(norm_exp) + r'\b', norm_gen):
+            return True
+        if re.search(r'\b' + re.escape(norm_gen) + r'\b', norm_exp):
+            return True
+    else:
+        if norm_exp in norm_gen or norm_gen in norm_exp:
+            return True
+
     # Strategy 4: Numeric equivalence
     gen_numbers = extract_numbers(norm_gen)
     exp_numbers = extract_numbers(norm_exp)
-    
+
     if gen_numbers and exp_numbers:
         # Check if all expected numbers appear in generated
         if all(num in gen_numbers for num in exp_numbers):
@@ -143,14 +154,14 @@ def flexible_answer_match(generated: str, expected: str) -> bool:
             exp_nums = [float(n) for n in exp_numbers]
             if len(gen_nums) == len(exp_nums):
                 matches = all(
-                    abs(g - e) < 0.1 * max(abs(e), 1.0) 
+                    abs(g - e) < 0.1 * max(abs(e), 1.0)
                     for g, e in zip(gen_nums, exp_nums)
                 )
                 if matches:
                     return True
         except ValueError:
             pass
-    
+
     # Strategy 5: Keyword overlap (for longer answers)
     if len(norm_gen.split()) > 2 and len(norm_exp.split()) > 2:
         gen_words = set(norm_gen.split())
@@ -159,7 +170,7 @@ def flexible_answer_match(generated: str, expected: str) -> bool:
         # If 80%+ of expected words are in generated
         if overlap >= 0.8 * len(exp_words):
             return True
-    
+
     # Strategy 6: Yes/No, True/False normalization
     yes_no_map = {
         'yes': ['yes', 'true', 'correct', 'right'],
@@ -170,7 +181,7 @@ def flexible_answer_match(generated: str, expected: str) -> bool:
     for canonical, variants in yes_no_map.items():
         if norm_exp in variants and any(v in norm_gen for v in variants):
             return True
-    
+
     return False
 
 
@@ -179,32 +190,453 @@ def evaluate_answer_correctness(generated_answer: str, expected_answer: str) -> 
     return flexible_answer_match(generated_answer, expected_answer)
 
 
+# ============================================================
+# Visualization Utilities (adapted from APC-VLM)
+# ============================================================
+
+def _tile_images(image_paths: List[str], cols: int = 4, thumb_size: int = 150, base_dir: str = None) -> Image.Image:
+    """
+    Tile multiple images into a single grid image.
+    Each image is resized to thumb_size x thumb_size (max), preserving aspect ratio.
+    Returns a PIL Image.
+    """
+    if not image_paths:
+        # Return a placeholder image
+        return Image.new('RGB', (thumb_size, thumb_size), (200, 200, 200))
+
+    imgs = []
+    for p in image_paths:
+        try:
+            full_path = os.path.join(base_dir, p) if base_dir and not os.path.isabs(p) else p
+            img = Image.open(full_path).convert('RGB')
+            # Resize preserving aspect ratio
+            img.thumbnail((thumb_size, thumb_size), Image.LANCZOS)
+            imgs.append(img)
+        except Exception:
+            continue
+
+    if not imgs:
+        return Image.new('RGB', (thumb_size, thumb_size), (200, 200, 200))
+
+    n = len(imgs)
+    rows = (n + cols - 1) // cols
+    actual_cols = min(n, cols)
+
+    grid_w = actual_cols * thumb_size + (actual_cols - 1) * 5
+    grid_h = rows * thumb_size + (rows - 1) * 5
+    grid = Image.new('RGB', (grid_w, grid_h), (255, 255, 255))
+
+    for idx, img in enumerate(imgs):
+        r = idx // cols
+        c = idx % cols
+        x = c * (thumb_size + 5)
+        y = r * (thumb_size + 5)
+        # Center image in its cell
+        offset_x = (thumb_size - img.width) // 2
+        offset_y = (thumb_size - img.height) // 2
+        grid.paste(img, (x + offset_x, y + offset_y))
+
+    return grid
+
+
+def _format_code(code: str) -> str:
+    """Return full code without truncation."""
+    if not code:
+        return "N/A"
+    return code
+
+
+def _colorize_code(code: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    Colorize code for display in flowchart.
+    Returns a list of (text, color) tuples where color is a hex string or None (default color).
+    - PySpatial API calls: blue (#0000FF)
+    - Other function definitions/calls: red (#FF0000)
+    - Everything else: default text color (None)
+    """
+    if not code:
+        return [("N/A", None)]
+
+    lines = code.split('\n')
+    colored_segments = []
+
+    # Patterns for highlighting
+    py_spatial_pattern = re.compile(r'\bpySpatial\.\w+')
+    # Simple pattern for user-defined functions (function name followed by '(')
+    user_func_pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
+
+    for line in lines:
+        segments = []
+        pos = 0
+        # First pass: mark pySpatial calls blue
+        for match in py_spatial_pattern.finditer(line):
+            start, end = match.span()
+            if start > pos:
+                segments.append((line[pos:start], None))
+            segments.append((match.group(), "#0000FF"))  # blue
+            pos = end
+
+        if pos < len(line):
+            remaining = line[pos:]
+            # Second pass: find user-defined function calls in remaining text
+            sub_pos = 0
+            for m in user_func_pattern.finditer(remaining):
+                s, e = m.span()
+                func_name = m.group(1)
+                # Avoid recoloring pySpatial
+                if py_spatial_pattern.fullmatch(m.group(0).rstrip('(')):
+                    continue
+                if s > sub_pos:
+                    segments.append((remaining[sub_pos:s], None))
+                segments.append((m.group(), "#FF0000"))  # red
+                sub_pos = e
+            if sub_pos < len(remaining):
+                segments.append((remaining[sub_pos:], None))
+
+        # Merge consecutive segments with same color
+        merged = []
+        for text, color in segments:
+            if merged and merged[-1][1] == color:
+                merged[-1] = (merged[-1][0] + text, color)
+            else:
+                merged.append((text, color))
+        colored_segments.extend(merged)
+        colored_segments.append(("\n", None))  # newline as separate segment
+
+    # Remove trailing newline segment if present
+    if colored_segments and colored_segments[-1][0] == "\n":
+        colored_segments.pop()
+
+    return colored_segments
+
+
+def _extract_api_calls(code: str) -> List[str]:
+    """Extract pySpatial API calls from code string."""
+    api_patterns = [
+        'pySpatial.reconstruct',
+        'pySpatial.describe_camera_motion',
+        'pySpatial.synthesize_novel_view',
+        'pySpatial.rotate_right',
+        'pySpatial.rotate_left',
+        'pySpatial.move_forward',
+        'pySpatial.move_backward',
+        'pySpatial.turn_around',
+    ]
+    return [api for api in api_patterns if api in code]
+
+
+def _rounded_rect(draw, xy, radius, fill):
+    """Draw a rounded rectangle, fallback to rectangle if not available."""
+    try:
+        draw.rounded_rectangle(xy, radius=radius, fill=fill)
+    except Exception:
+        draw.rectangle(xy, fill=fill)
+
+
+def visualize_conversation(
+    items: List[dict],
+    width: int = 1400,
+    padding: int = 28,
+    row_gap: int = 18,
+    image_max_width: int = 650,
+    font_path: Optional[str] = None,
+    font_size: int = 20,
+    text_bg: tuple = (246, 246, 246),
+    canvas_bg: tuple = (255, 255, 255),
+    text_color: tuple = (20, 20, 20),
+    bubble_radius: int = 16,
+    output_path: Optional[str] = None
+) -> Image.Image:
+    """
+    Visualize a conversation / pipeline trace as a single image.
+    Layout: each row has an optional left-side image, and a right-side text bubble.
+    Adapted from APC-VLM/apc/utils.py.
+    """
+    def load_font(size: int) -> ImageFont.FreeTypeFont:
+        try:
+            if font_path and os.path.exists(font_path):
+                return ImageFont.truetype(font_path, size)
+            return ImageFont.truetype("DejaVuSans.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
+
+    def wrap_color_segments(segments, font, max_width, draw):
+        """
+        Wrap a list of (text, color) segments into lines,
+        where each line is a list of segments that fit within max_width.
+        """
+        lines = []
+        current_line_segments = []
+        current_line_width = 0
+
+        for text, color in segments:
+            # Handle newline explicitly
+            if text == "\n":
+                lines.append(current_line_segments)
+                current_line_segments = []
+                current_line_width = 0
+                continue
+
+            # Split text into words to allow line breaks within a segment
+            words = text.split(' ')
+            for i, word in enumerate(words):
+                # Add space except before first word
+                if i > 0:
+                    word_with_space = ' ' + word
+                else:
+                    word_with_space = word
+
+                bbox = draw.textbbox((0, 0), word_with_space, font=font)
+                w = bbox[2] - bbox[0]
+
+                if current_line_width + w <= max_width:
+                    current_line_segments.append((word_with_space, color))
+                    current_line_width += w
+                else:
+                    # Line break
+                    if current_line_segments:
+                        lines.append(current_line_segments)
+                    current_line_segments = [(word, color)]  # no leading space
+                    bbox_word = draw.textbbox((0, 0), word, font=font)
+                    current_line_width = bbox_word[2] - bbox_word[0]
+
+        if current_line_segments:
+            lines.append(current_line_segments)
+        return lines
+
+    def load_image(img):
+        if img is None:
+            return None
+        if isinstance(img, Image.Image):
+            return img
+        try:
+            return Image.open(img).convert("RGBA")
+        except Exception:
+            return None
+
+    # --- measurement pass ---
+    tmp = Image.new("RGB", (width, 200), canvas_bg)
+    tmp_draw = ImageDraw.Draw(tmp)
+    font = load_font(font_size)
+    line_height = max(font_size, int(font_size * 1.3))
+    line_gap = max(4, int(font_size * 0.2))
+
+    measured_rows = []
+    total_height = padding
+
+    for idx, item in enumerate(items):
+        text_content = item.get("text", "")
+        img = load_image(item.get("image"))
+
+        # Determine text area width
+        if img is not None:
+            left_block_w = image_max_width
+            gutter = 16
+            text_area_w = width - (padding * 2) - left_block_w - gutter
+        else:
+            left_block_w = 0
+            gutter = 0
+            text_area_w = width - (padding * 2)
+
+        # Convert text_content to segments if it's a string
+        if isinstance(text_content, str):
+            segments = [(text_content, None)]
+        else:
+            segments = text_content  # list of (text, color)
+
+        # Wrap into colored lines
+        wrapped_lines = wrap_color_segments(segments, font, text_area_w, tmp_draw)
+        # Calculate total height of text block
+        text_h = len(wrapped_lines) * line_height + max(0, len(wrapped_lines) - 1) * line_gap
+        text_h = max(text_h, line_height)
+
+        img_h = 0
+        img_w = 0
+        if img is not None:
+            iw, ih = img.size
+            scale = min(image_max_width / iw, 1.0)
+            img_w = int(iw * scale)
+            img_h = int(ih * scale)
+            max_img_h = min(400, text_h * 2)
+            if img_h > max_img_h:
+                scale = max_img_h / img_h
+                img_w = int(img_w * scale)
+                img_h = int(img_h * scale)
+
+        row_h = max(text_h, img_h) + padding
+        measured_rows.append({
+            "wrapped_lines": wrapped_lines,
+            "text_h": text_h,
+            "img": img,
+            "img_w": img_w,
+            "img_h": img_h,
+            "left_block_w": left_block_w,
+            "text_area_w": text_area_w,
+            "row_h": row_h,
+            "gutter": gutter
+        })
+        total_height += row_h + row_gap
+
+    total_height += padding - row_gap
+
+    # --- compose final image ---
+    canvas = Image.new("RGB", (width, total_height), canvas_bg)
+    draw = ImageDraw.Draw(canvas)
+
+    y = padding
+    for idx, row in enumerate(measured_rows):
+        img = row["img"]
+        img_w, img_h = row["img_w"], row["img_h"]
+        row_h = row["row_h"]
+        gutter = row["gutter"]
+
+        x = padding
+        if img is not None and img_w > 0 and img_h > 0:
+            img_resized = img.resize((img_w, img_h), Image.LANCZOS)
+            img_y = y + (row_h - img_h) // 2
+            canvas.paste(img_resized, (x, img_y))
+            x += img_w + gutter
+
+        bubble_w = row["text_area_w"]
+        bubble_h = row["text_h"] + padding // 2
+        bubble_x0 = x
+        bubble_y0 = y + (row_h - bubble_h) // 2
+        bubble_x1 = min(bubble_x0 + bubble_w, width - padding)
+        bubble_w = bubble_x1 - bubble_x0
+        bubble_y1 = bubble_y0 + bubble_h
+
+        row_bg = text_bg
+        if idx == len(measured_rows) - 1:
+            # Last row: highlight correctness with color
+            text_lower = str(items[idx].get("text", "")).lower()
+            if "correct" in text_lower or "✓" in text_lower:
+                row_bg = (230, 255, 230)  # light green
+            elif "incorrect" in text_lower or "failed" in text_lower or "✗" in text_lower:
+                row_bg = (255, 230, 230)  # light red
+
+        _rounded_rect(draw, (bubble_x0, bubble_y0, bubble_x1, bubble_y1), bubble_radius, row_bg)
+
+        # Draw colored text lines
+        tx = bubble_x0 + padding // 2
+        ty = bubble_y0 + padding // 4
+        for line_segments in row["wrapped_lines"]:
+            x_cursor = tx
+            for seg_text, seg_color in line_segments:
+                color = seg_color if seg_color else text_color
+                draw.text((x_cursor, ty), seg_text, font=font, fill=color)
+                bbox = draw.textbbox((0, 0), seg_text, font=font)
+                x_cursor += bbox[2] - bbox[0]
+            ty += line_height + line_gap
+
+        y += row_h + row_gap
+
+    if output_path:
+        canvas.save(output_path)
+
+    return canvas
+
+
+def create_sample_flowchart(result: Dict[str, Any], save_dir: str, parsed_code: str = None) -> str:
+    """
+    Create a per-sample visualization flowchart showing:
+    - Input images (tiled grid)
+    - Question
+    - GT Answer
+    - Model name (e.g., Qwen2.5-VL-7B-Instruct)
+    - generate_code status + full code (colored)
+    - execute status + APIs called
+    - answer status
+    - Model Answer
+    - Correctness
+
+    Returns the path to the saved flowchart image.
+    """
+    scene_id = result.get("scene_id", "unknown")
+    question = result.get("question", "")
+    expected_answer = result.get("expected_answer", "")
+    generated_answer = result.get("generated_answer", "")
+    parse_success = result.get("parse_success", False)
+    execution_success = result.get("execution_success", False)
+    answer_gen_success = result.get("answer_generation_success", False)
+    answer_correct = result.get("answer_correct", False)
+    images = result.get("images", [])
+
+    # Tile all input images into one grid
+    base_dir = getattr(Scene, 'IMAGE_BASE_DIR', None)
+    input_images_grid = _tile_images(images, cols=4, thumb_size=150, base_dir=base_dir)
+
+    # Model name
+    model_name = getattr(Agent, '_model_name', 'unknown')
+    model_short = os.path.basename(model_name)
+
+    # Build code display with syntax highlighting
+    code_status = "✓ Success" if parse_success else "✗ Failed"
+    if parsed_code and parse_success:
+        # Create colored segments: header + colored code
+        combined_segments = [(f"generate_code: {code_status}\n", None)]
+        combined_segments.append(("```python\n", None))
+        combined_segments.extend(_colorize_code(parsed_code))
+        combined_segments.append(("\n```", None))
+    else:
+        combined_segments = [(f"generate_code: {code_status}", None)]
+
+    # Build API calls text
+    apis = _extract_api_calls(parsed_code) if parsed_code else []
+    api_text = ", ".join(apis) if apis else "N/A"
+
+    # Build items list
+    items = [
+        {"text": f"Q: {question}", "image": input_images_grid},
+        {"text": f"GT Answer: {expected_answer}", "image": None},
+        {"text": f"Model: {model_short}", "image": None},
+        {"text": combined_segments, "image": None},
+        {"text": f"execute: {'✓ Success' if execution_success else '✗ Failed'}\nAPIs: {api_text}", "image": None},
+        {"text": f"answer: {'✓ Success' if answer_gen_success else '✗ Failed'}", "image": None},
+        {"text": f"Model Answer: {generated_answer or 'N/A'}", "image": None},
+    ]
+
+    # Last row: correctness
+    correctness_text = f"Correctness: {'✓ Correct' if answer_correct else '✗ Incorrect'}"
+    items.append({"text": correctness_text, "image": None})
+
+    # Save flowchart
+    os.makedirs(save_dir, exist_ok=True)
+    output_path = os.path.join(save_dir, f"{scene_id}_flowchart.png")
+    try:
+        visualize_conversation(items, output_path=output_path, width=1400, image_max_width=650, font_size=20)
+        return output_path
+    except Exception as e:
+        print(f"[{scene_id}] Failed to create flowchart: {e}")
+        return None
+
+
 def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
     """
     Wrapper function for multiprocessing that creates its own agent instance.
-    
+
     Args:
-        args_tuple: Tuple of (entry, api_key)
-        
+        args_tuple: Tuple of (entry, api_key, viz_save_dir)
+
     Returns:
         Dictionary containing the complete pipeline results including type information
     """
-    entry, api_key = args_tuple
-    
+    entry, api_key, viz_save_dir = args_tuple
+
     # Create agent instance for this process
     agent = Agent(api_key=api_key)
-    
-    return process_scene_with_agent(entry, agent)
+
+    return process_scene_with_agent(entry, agent, viz_save_dir=viz_save_dir)
 
 
-def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, Any]:
+def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, viz_save_dir: str = None) -> Dict[str, Any]:
     """
     Process a single JSONL entry through the complete pipeline and extract type information.
-    
+
     Args:
         entry: JSONL entry containing scene information
         agent: pySpatial Agent instance
-        
+        viz_save_dir: Optional directory to save flowchart visualization
+
     Returns:
         Dictionary containing the complete pipeline results including type information
     """
@@ -212,11 +644,10 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
     question = entry.get('question', '')
     images = entry.get('images', [])
     expected_answer = entry.get('gt_answer', '')
-    
+
     # Extract type from image paths
     scene_type = extract_type_from_images(images)
 
-    
     scene = Scene(images, question, scene_id=scene_id)
 
     fallback_used = False
@@ -292,6 +723,16 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
             "fallback_used": fallback_used,
         }
 
+        # Generate flowchart visualization if enabled
+        if viz_save_dir:
+            try:
+                chart_path = create_sample_flowchart(result, viz_save_dir, parsed_code=parsed_code if parse_success else None)
+                if chart_path:
+                    result["flowchart_path"] = chart_path
+                    print(f"[{scene_id}] Flowchart saved: {chart_path}")
+            except Exception as viz_e:
+                print(f"[{scene_id}] Flowchart generation failed: {viz_e}")
+
         return result
 
     except Exception as e:
@@ -315,7 +756,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
                         fallback_correct = False
                     else:
                         fallback_correct = evaluate_answer_correctness(fallback_answer, expected_answer)
-                    
+
             # Second fallback: relaxed QA if basic QA didn't match
             if not fallback_correct and fallback_answer and expected_answer:
                 print(f"[{scene_id}] Basic QA incorrect, attempting relaxed QA")
@@ -348,7 +789,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pySpatial Agent on MindCube dataset with type statistics")
-    parser.add_argument("--jsonl_path", type=str, 
+    parser.add_argument("--jsonl_path", type=str,
                        required=True,
                        help="Path to JSONL file containing scene information")
     parser.add_argument("--output_file", type=str,
@@ -362,7 +803,7 @@ def main():
                        help="OpenAI API key (if not provided, uses OPENAI_API_KEY env var)")
     parser.add_argument("--num_processes", type=int, default=1,
                        help="Number of processes to use (default: number of CPU cores)")
-    parser.add_argument("--disable_multiprocessing", action="store_true", 
+    parser.add_argument("--disable_multiprocessing", action="store_true",
                        help="Disable multiprocessing and run sequentially")
     parser.add_argument("--request_interval", type=float, default=0.1,
                        help="Minimum time between API requests in seconds (default: 0.1)")
@@ -371,6 +812,8 @@ def main():
                        help="Filter to only process specific scene type (among, around, rotation, or unknown)")
     parser.add_argument("--processed_dir", type=str, default=None,
                        help="Base directory for pre-processed scene data (optional)")
+    parser.add_argument("--viz_save_dir", type=str, default=None,
+                       help="Directory to save per-sample flowchart visualizations (optional)")
 
     args = parser.parse_args()
 
@@ -386,14 +829,14 @@ def main():
     if not os.path.isabs(args.jsonl_path):
         args.jsonl_path = os.path.abspath(args.jsonl_path)
     jsonl_dir = os.path.dirname(args.jsonl_path)
-    
+
     # Images are in "other_all_image" subdirectory
     # Try multiple possible locations:
     # 1. Directly in parent directory: ../other_all_image
     # 2. In data subdirectory of parent: ../data/other_all_image
     image_base_dir = None
     parent_dir = os.path.dirname(jsonl_dir)
-    
+
     # Check if other_all_image is directly in parent directory
     if os.path.exists(os.path.join(parent_dir, "other_all_image")):
         image_base_dir = parent_dir
@@ -403,25 +846,41 @@ def main():
     # Fallback: check parent directory itself
     elif os.path.exists(os.path.join(parent_dir, "data", "other_all_image")):
         image_base_dir = os.path.join(parent_dir, "data")
-    
+
     if image_base_dir:
         Scene.IMAGE_BASE_DIR = image_base_dir
         print(f"Set IMAGE_BASE_DIR to: {image_base_dir}")
     else:
         print(f"Warning: Image directory 'other_all_image' not found")
         print("Images will be loaded relative to current working directory")
-    
+
     if not os.path.exists(args.jsonl_path):
         raise ValueError(f"JSONL file not found: {args.jsonl_path}")
-    
+
+    # Generate timestamp-based output directory
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir = Path("output") / timestamp
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Auto-set output file path if not explicitly provided
+    if args.output_file == "pySpatial_mindcube.json":
+        args.output_file = str(output_dir / "pySpatial_mindcube.json")
+
+    # Auto-set viz_save_dir if not explicitly provided
+    viz_save_dir = args.viz_save_dir
+    if viz_save_dir is None:
+        viz_save_dir = str(output_dir / "flowcharts")
+
     # Determine number of processes
     if args.disable_multiprocessing:
         num_processes = 1
     else:
         num_processes = args.num_processes or cpu_count()
-    
+
     print(f"Processing JSONL file: {args.jsonl_path}")
+    print(f"Output directory: {output_dir}")
     print(f"Output file: {args.output_file}")
+    print(f"Flowchart dir: {viz_save_dir}")
     print(f"Max entries: {args.max_entries or 'all'}")
     print(f"Max test samples: {args.max_test_samples or 'all'}")
     print(f"Filter type: {args.filter_type or 'none (processing all types)'}")
@@ -465,7 +924,7 @@ def main():
 
     # Process entries
     start_time = time.time()
-    
+
     if num_processes == 1 or args.disable_multiprocessing:
         # Sequential processing
         print("Running sequentially...")
@@ -473,26 +932,26 @@ def main():
         results = []
         for i, entry in enumerate(entries, 1):
             print(f"Processing entry {i}/{len(entries)}: {entry.get('id', 'unknown')}")
-            result = process_scene_with_agent(entry, agent)
+            result = process_scene_with_agent(entry, agent, viz_save_dir=viz_save_dir)
             results.append(result)
     else:
         # Multiprocessing
         print(f"Running with {num_processes} processes...")
 
         # Prepare arguments for multiprocessing
-        args_list = [(entry, args.api_key) for entry in entries]
+        args_list = [(entry, args.api_key, viz_save_dir) for entry in entries]
 
         pool = Pool(processes=num_processes, maxtasksperchild=4)
         async_result = pool.map_async(process_scene_with_agent_wrapper, args_list)
         results = async_result.get(timeout=3600)
         pool.terminate()
         pool.join()
-    
+
     end_time = time.time()
     processing_time = end_time - start_time
     print(f"\n✓ Processing completed in {processing_time:.2f} seconds")
     print(f"Average time per entry: {processing_time/len(entries):.2f} seconds")
-    
+
     # Calculate statistics
     type_stats = defaultdict(lambda: {
         'total': 0.0,
@@ -503,7 +962,7 @@ def main():
         'evaluable_answers': 0.0,
         'errors': 0.0
     })
-    
+
     overall_stats = {
         'total_processed': 0,
         'parse_success': 0,
@@ -513,7 +972,7 @@ def main():
         'evaluable_answers': 0,
         'errors': 0
     }
-    
+
     for result in results:
         scene_type = result['scene_type']
 
@@ -527,27 +986,26 @@ def main():
             print(f"Error processing scene {scene_type}: {result.get('error')}")
             continue
 
-
         if result['parse_success']:
             type_stats[scene_type]['parse_success'] += 1
             overall_stats['parse_success'] += 1
-        
+
         if result['execution_success']:
             type_stats[scene_type]['execution_success'] += 1
             overall_stats['execution_success'] += 1
-        
+
         if result['answer_generation_success']:
             type_stats[scene_type]['answer_generation_success'] += 1
             overall_stats['answer_generation_success'] += 1
-        
+
         if result['expected_answer'] and result['generated_answer']:
             type_stats[scene_type]['evaluable_answers'] += 1
             overall_stats['evaluable_answers'] += 1
-            
+
             if result['answer_correct']:
                 type_stats[scene_type]['correct_answers'] += 1
                 overall_stats['correct_answers'] += 1
-    
+
     # Calculate rates for each type
     type_metrics = {}
     for scene_type, stats in type_stats.items():
@@ -562,7 +1020,7 @@ def main():
             'evaluable_count': stats['evaluable_answers'],
             'error_count': stats['errors']
         }
-    
+
     # Calculate overall metrics
     total = overall_stats['total_processed']
     overall_metrics = {
@@ -575,10 +1033,10 @@ def main():
         'evaluable_count': overall_stats['evaluable_answers'],
         'error_count': overall_stats['errors']
     }
-    
+
     # Save results
     output_path = Path.cwd() / args.output_file
-    
+
     summary = {
         "processing_timestamp": datetime.now().isoformat(),
         "jsonl_source": args.jsonl_path,
@@ -590,11 +1048,11 @@ def main():
         "raw_statistics": dict(type_stats),
         "results": results
     }
-    
+
     with open(output_path, 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"\n✓ Results saved to: {output_path}")
-    
+
     # Print summary statistics
     print(f"\n=== MindCube Evaluation Results ===")
     print(f"Total entries processed: {total}")
@@ -604,7 +1062,6 @@ def main():
     print(f"Answer generation: {overall_stats['answer_generation_success']}/{total} ({overall_metrics['answer_generation_rate']:.1f}%)")
     print(f"Answer correctness: {overall_stats['correct_answers']}/{overall_stats['evaluable_answers']} ({overall_metrics['correctness_rate']:.1f}%)")
 
-    
     print(f"\n=== Statistics by Type ===")
     for scene_type, metrics in type_metrics.items():
         print(f"\n{scene_type.upper()}:")
@@ -625,11 +1082,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted by user, shutting down...")
         sys.exit(1)
-
-
-
-
-
-
-
-
