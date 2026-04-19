@@ -222,15 +222,25 @@ def _tile_images(image_paths: List[str], cols: int = 4, thumb_size: int = 150, b
     rows = (n + cols - 1) // cols
     actual_cols = min(n, cols)
 
-    grid_w = actual_cols * thumb_size + (actual_cols - 1) * 5
-    grid_h = rows * thumb_size + (rows - 1) * 5
-    grid = Image.new('RGB', (grid_w, grid_h), (255, 255, 255))
+    cell_gap = 8
+    cell_padding = 8
+    grid_w = actual_cols * thumb_size + (actual_cols - 1) * cell_gap + cell_padding * 2
+    grid_h = rows * thumb_size + (rows - 1) * cell_gap + cell_padding * 2
+    grid = Image.new('RGB', (grid_w, grid_h), (248, 248, 248))
+    draw = ImageDraw.Draw(grid)
 
     for idx, img in enumerate(imgs):
         r = idx // cols
         c = idx % cols
-        x = c * (thumb_size + 5)
-        y = r * (thumb_size + 5)
+        x = cell_padding + c * (thumb_size + cell_gap)
+        y = cell_padding + r * (thumb_size + cell_gap)
+        draw.rounded_rectangle(
+            (x, y, x + thumb_size, y + thumb_size),
+            radius=12,
+            fill=(255, 255, 255),
+            outline=(228, 228, 228),
+            width=1,
+        )
         # Center image in its cell
         offset_x = (thumb_size - img.width) // 2
         offset_y = (thumb_size - img.height) // 2
@@ -246,50 +256,159 @@ def _format_code(code: str) -> str:
     return code
 
 
+def _collect_code_patterns(code: str) -> Dict[str, Any]:
+    """
+    Collect lightweight regex-based metadata from generated code.
+    This intentionally stays within the existing regex approach.
+    """
+    patterns: Dict[str, Any] = {
+        "generated_funcs": [],
+        "pyspatial_aliases": set(),
+        "pyspatial_imports": {},
+        "tool_imports": {},
+        "tool_method_names": set(),
+    }
+
+    if not code:
+        return patterns
+
+    # Generated helper definitions: top-level def, excluding program.
+    for match in re.finditer(r'(?m)^def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', code):
+        func_name = match.group(1)
+        if func_name != "program" and func_name not in patterns["generated_funcs"]:
+            patterns["generated_funcs"].append(func_name)
+
+    # pySpatial aliases from import or assignment.
+    patterns["pyspatial_aliases"].add("pySpatial")
+    for match in re.finditer(r'(?m)^\s*import\s+pySpatial\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*)', code):
+        patterns["pyspatial_aliases"].add(match.group(1))
+    for match in re.finditer(r'(?m)^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*pySpatial\b', code):
+        patterns["pyspatial_aliases"].add(match.group(1))
+
+    # from pySpatial import foo / foo as alias
+    for match in re.finditer(r'(?m)^\s*from\s+pySpatial\s+import\s+(.+)$', code):
+        imported_clause = match.group(1)
+        for item in imported_clause.split(","):
+            part = item.strip()
+            if not part:
+                continue
+            alias_match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*)$', part)
+            if alias_match:
+                original, alias = alias_match.groups()
+                patterns["pyspatial_imports"][alias] = original
+            else:
+                patterns["pyspatial_imports"][part] = part
+
+    # from tool.xxx import foo / foo as alias
+    for match in re.finditer(r'(?m)^\s*from\s+tool\.[\w\.]+\s+import\s+(.+)$', code):
+        imported_clause = match.group(1)
+        for item in imported_clause.split(","):
+            part = item.strip()
+            if not part:
+                continue
+            alias_match = re.match(r'([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*)$', part)
+            if alias_match:
+                original, alias = alias_match.groups()
+                patterns["tool_imports"][alias] = original
+            else:
+                patterns["tool_imports"][part] = part
+
+    # Known tool method names from tool/*.py files. Class construction itself is not treated as a local function summary.
+    tool_dir = Path(__file__).resolve().parent / "tool"
+    for tool_file in sorted(tool_dir.glob("*.py")):
+        try:
+            content = tool_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for method_match in re.finditer(r'(?m)^\s+def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', content):
+            method_name = method_match.group(1)
+            if method_name != "__init__":
+                patterns["tool_method_names"].add(method_name)
+
+    return patterns
+
+
 def _colorize_code(code: str) -> List[Tuple[str, Optional[str]]]:
     """
     Colorize code for display in flowchart.
     Returns a list of (text, color) tuples where color is a hex string or None (default color).
-    - PySpatial API calls: blue (#0000FF)
-    - Other function definitions/calls: red (#FF0000)
+    - Local function calls: red (#FF0000)
+    - Generated helper definitions/calls: blue (#0000FF)
     - Everything else: default text color (None)
     """
     if not code:
         return [("N/A", None)]
 
+    code_patterns = _collect_code_patterns(code)
     lines = code.split('\n')
     colored_segments = []
 
-    # Patterns for highlighting
     py_spatial_pattern = re.compile(r'\bpySpatial\.\w+')
-    # Simple pattern for user-defined functions (function name followed by '(')
-    user_func_pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
+    local_patterns = [py_spatial_pattern]
+
+    for alias in sorted(code_patterns["pyspatial_aliases"] - {"pySpatial"}):
+        local_patterns.append(re.compile(rf'\b{re.escape(alias)}\.\w+'))
+
+    for alias in sorted(code_patterns["pyspatial_imports"].keys()):
+        local_patterns.append(re.compile(rf'\b{re.escape(alias)}\s*\('))
+
+    for alias in sorted(code_patterns["tool_imports"].keys()):
+        local_patterns.append(re.compile(rf'\b{re.escape(alias)}\s*\('))
+
+    for method_name in sorted(code_patterns["tool_method_names"]):
+        local_patterns.append(re.compile(rf'\b[a-zA-Z_][a-zA-Z0-9_]*\.{re.escape(method_name)}\s*\('))
+
+    generated_func_pattern = None
+    if code_patterns["generated_funcs"]:
+        generated_union = "|".join(re.escape(name) for name in code_patterns["generated_funcs"])
+        generated_func_pattern = re.compile(rf'\b({generated_union})\s*\(')
 
     for line in lines:
         segments = []
         pos = 0
-        # First pass: mark pySpatial calls blue
-        for match in py_spatial_pattern.finditer(line):
+
+        # Highlight generated helper definitions first.
+        def_match = re.match(r'^(\s*def\s+)([a-zA-Z_][a-zA-Z0-9_]*)(\s*\()', line)
+        if def_match and def_match.group(2) in code_patterns["generated_funcs"]:
+            prefix, func_name, suffix = def_match.groups()
+            rest = line[def_match.end(3) - 1:]
+            segments.append((prefix, None))
+            segments.append((func_name, "#0000FF"))
+            segments.append((rest, None))
+            colored_segments.extend(segments)
+            colored_segments.append(("\n", None))
+            continue
+
+        # First pass: mark local calls red.
+        local_matches = []
+        for pattern in local_patterns:
+            local_matches.extend(pattern.finditer(line))
+        local_matches.sort(key=lambda m: (m.start(), -(m.end() - m.start())))
+
+        accepted_local_matches = []
+        last_end = -1
+        for match in local_matches:
+            if match.start() >= last_end:
+                accepted_local_matches.append(match)
+                last_end = match.end()
+
+        for match in accepted_local_matches:
             start, end = match.span()
             if start > pos:
                 segments.append((line[pos:start], None))
-            segments.append((match.group(), "#0000FF"))  # blue
+            segments.append((line[start:end], "#FF0000"))
             pos = end
 
         if pos < len(line):
             remaining = line[pos:]
-            # Second pass: find user-defined function calls in remaining text
             sub_pos = 0
-            for m in user_func_pattern.finditer(remaining):
-                s, e = m.span()
-                func_name = m.group(1)
-                # Avoid recoloring pySpatial
-                if py_spatial_pattern.fullmatch(m.group(0).rstrip('(')):
-                    continue
-                if s > sub_pos:
-                    segments.append((remaining[sub_pos:s], None))
-                segments.append((m.group(), "#FF0000"))  # red
-                sub_pos = e
+            if generated_func_pattern:
+                for m in generated_func_pattern.finditer(remaining):
+                    s, e = m.span()
+                    if s > sub_pos:
+                        segments.append((remaining[sub_pos:s], None))
+                    segments.append((m.group(), "#0000FF"))
+                    sub_pos = e
             if sub_pos < len(remaining):
                 segments.append((remaining[sub_pos:], None))
 
@@ -311,7 +430,13 @@ def _colorize_code(code: str) -> List[Tuple[str, Optional[str]]]:
 
 
 def _extract_api_calls(code: str) -> List[str]:
-    """Extract pySpatial API calls from code string."""
+    """Extract pySpatial API calls from code string using enhanced regex rules."""
+    if not code:
+        return []
+
+    code_patterns = _collect_code_patterns(code)
+    found_calls: List[str] = []
+
     api_patterns = [
         'pySpatial.reconstruct',
         'pySpatial.describe_camera_motion',
@@ -322,7 +447,23 @@ def _extract_api_calls(code: str) -> List[str]:
         'pySpatial.move_backward',
         'pySpatial.turn_around',
     ]
-    return [api for api in api_patterns if api in code]
+    api_suffixes = {api.split(".", 1)[1]: api for api in api_patterns}
+
+    for api in api_patterns:
+        if re.search(rf'\b{re.escape(api)}\s*\(', code):
+            found_calls.append(api)
+
+    for alias in code_patterns["pyspatial_aliases"] - {"pySpatial"}:
+        for suffix, canonical in api_suffixes.items():
+            if canonical not in found_calls and re.search(rf'\b{re.escape(alias)}\.{re.escape(suffix)}\s*\(', code):
+                found_calls.append(canonical)
+
+    for alias, imported_name in code_patterns["pyspatial_imports"].items():
+        canonical = api_suffixes.get(imported_name)
+        if canonical and canonical not in found_calls and re.search(rf'\b{re.escape(alias)}\s*\(', code):
+            found_calls.append(canonical)
+
+    return found_calls
 
 
 def _rounded_rect(draw, xy, radius, fill):
@@ -563,34 +704,36 @@ def create_sample_flowchart(result: Dict[str, Any], save_dir: str, parsed_code: 
 
     # Tile all input images into one grid
     base_dir = getattr(Scene, 'IMAGE_BASE_DIR', None)
-    input_images_grid = _tile_images(images, cols=4, thumb_size=150, base_dir=base_dir)
+    scene_images_grid = _tile_images(images, cols=4, thumb_size=150, base_dir=base_dir)
 
     # Model name
     model_name = getattr(Agent, '_model_name', 'unknown')
     model_short = os.path.basename(model_name)
 
-    # Build code display with syntax highlighting
     code_status = "✓ Success" if parse_success else "✗ Failed"
+    code_patterns = _collect_code_patterns(parsed_code) if parsed_code and parse_success else None
     if parsed_code and parse_success:
-        # Create colored segments: header + colored code
-        combined_segments = [(f"generate_code: {code_status}\n", None)]
-        combined_segments.append(("```python\n", None))
-        combined_segments.extend(_colorize_code(parsed_code))
-        combined_segments.append(("\n```", None))
+        code_segments = [("Code", None), ("\n", None), ("```python", None), ("\n", None)]
+        code_segments.extend(_colorize_code(parsed_code))
+        code_segments.append(("\n", None))
+        code_segments.append(("```", None))
     else:
-        combined_segments = [(f"generate_code: {code_status}", None)]
+        code_segments = [("Code", None), ("\n", None), ("N/A", None)]
 
     # Build API calls text
     apis = _extract_api_calls(parsed_code) if parsed_code else []
     api_text = ", ".join(apis) if apis else "N/A"
+    generated_funcs = ", ".join(code_patterns["generated_funcs"]) if code_patterns and code_patterns["generated_funcs"] else "N/A"
 
     # Build items list
     items = [
-        {"text": f"Q: {question}", "image": input_images_grid},
+        {"text": f"Q: {question}", "image": None},
         {"text": f"GT Answer: {expected_answer}", "image": None},
         {"text": f"Model: {model_short}", "image": None},
-        {"text": combined_segments, "image": None},
-        {"text": f"execute: {'✓ Success' if execution_success else '✗ Failed'}\nAPIs: {api_text}", "image": None},
+        {"text": "Scene Images", "image": scene_images_grid},
+        {"text": f"generate_code: {code_status}", "image": None},
+        {"text": code_segments, "image": None},
+        {"text": f"execute: {'✓ Success' if execution_success else '✗ Failed'}\nAPIs: {api_text}\nGenerated funcs: {generated_funcs}", "image": None},
         {"text": f"answer: {'✓ Success' if answer_gen_success else '✗ Failed'}", "image": None},
         {"text": f"Model Answer: {generated_answer or 'N/A'}", "image": None},
     ]
