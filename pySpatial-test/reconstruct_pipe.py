@@ -16,6 +16,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
+from scene_layout import build_scene_layout, save_scene_layout
+
 # Support both top-level 'vggt' install and repo-local path
 try:
     from vggt.models.vggt import VGGT
@@ -57,7 +59,7 @@ class VGGTProcessor:
         
         print(f"VGGT Processor initialized on {self.device}")
 
-    def process_images(self, image_paths, output_dir=None, conf_thres_value=5.0):
+    def process_images(self, image_paths, output_dir=None, conf_thres_value=0.0, scene_entry=None):
         """
         Process a list of image paths with VGGT and return camera poses and point cloud.
         
@@ -65,6 +67,7 @@ class VGGTProcessor:
             image_paths: List of paths to images
             output_dir: Directory to save outputs (optional)
             conf_thres_value: Confidence threshold for depth filtering
+            scene_entry: Optional raw dataset entry used to build scene layout metadata
             
         Returns:
             dict: Contains camera poses, point cloud data, and metadata
@@ -111,40 +114,61 @@ class VGGTProcessor:
                 'intrinsic': scaled_intrinsic.tolist()
             },
             'point_cloud': None,
-            'point_cloud_path': None
+            'point_cloud_path': None,
+            'scene_layout_path': None,
+            'scene_orientation_path': None,
+            'main_object_orientation_path': None,
+            'scene_overview_path': None,
         }
-        
-        # Save outputs if output directory is provided
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Save camera matrices
-            camera_path = os.path.join(output_dir, "camera_matrices.npz")
-            np.savez(camera_path, 
-                    extrinsic=scaled_extrinsic, 
-                    intrinsic=scaled_intrinsic,
-                    image_names=[os.path.basename(p) for p in image_paths])
-            
-            # Save point cloud
-            point_cloud_path = os.path.join(output_dir, "points.ply")
-            trimesh.PointCloud(points_3d, colors=points_rgb).export(point_cloud_path)
-            results['point_cloud_path'] = point_cloud_path
-            
-            # Save metadata
-            metadata_path = os.path.join(output_dir, "processing_metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(results, f, indent=2)
-            
-            print(f"Results saved to {output_dir}")
-            print(f"Camera matrices saved to: {camera_path}")
-            print(f"Point cloud saved to: {point_cloud_path}")
-        
+
         # Add point cloud data to results
         results['point_cloud'] = {
             'points': points_3d.tolist(),
             'colors': points_rgb.tolist() if points_rgb is not None else None,
             'num_points': len(points_3d)
         }
+
+        scene_layout = None
+        try:
+            scene_layout_entry = scene_entry or {
+                'id': os.path.basename(output_dir) if output_dir else '',
+                'scene_id': os.path.basename(output_dir) if output_dir else '',
+                'images': image_paths,
+                'question': '',
+            }
+            scene_layout = build_scene_layout(scene_layout_entry)
+        except Exception as e:
+            print(f"Warning: Failed to build scene layout metadata: {e}")
+
+        # Save outputs if output directory is provided
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+            camera_path = os.path.join(output_dir, "camera_matrices.npz")
+            np.savez(
+                camera_path,
+                extrinsic=scaled_extrinsic,
+                intrinsic=scaled_intrinsic,
+                image_names=[os.path.basename(p) for p in image_paths],
+            )
+
+            point_cloud_path = os.path.join(output_dir, "points.ply")
+            trimesh.PointCloud(points_3d, colors=points_rgb).export(point_cloud_path)
+            results['point_cloud_path'] = point_cloud_path
+
+            if scene_layout is not None:
+                scene_paths = save_scene_layout(output_dir, scene_layout)
+                results.update(scene_paths)
+
+            metadata_path = os.path.join(output_dir, "processing_metadata.json")
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+
+            print(f"Results saved to {output_dir}")
+            print(f"Camera matrices saved to: {camera_path}")
+            print(f"Point cloud saved to: {point_cloud_path}")
+            if results['scene_layout_path']:
+                print(f"Scene layout saved to: {results['scene_layout_path']}")
         
         return results
 
@@ -211,9 +235,13 @@ class VGGTProcessor:
         
         return extrinsic, scaled_intrinsic
 
+    def _rescale_camera_matrices(self, extrinsic, intrinsic, original_coords, img_size):
+        """Backward-compatible alias for the original private helper name."""
+        return self.rescale_camera_matrices(extrinsic, intrinsic, original_coords, img_size)
 
 
-def process_jsonl_entry(processor, entry, base_data_path, base_output_path):
+
+def process_jsonl_entry(processor, entry, base_data_path, base_output_path, conf_thres_value=0.0):
     """Process a single JSONL entry"""
     entry_id = entry['id']
     image_paths = entry['images']
@@ -236,7 +264,12 @@ def process_jsonl_entry(processor, entry, base_data_path, base_output_path):
     
     try:
         print(f"Processing entry {entry_id} with {len(full_image_paths)} images")
-        results = processor.process_images(full_image_paths, output_dir)
+        results = processor.process_images(
+            full_image_paths,
+            output_dir,
+            conf_thres_value=conf_thres_value,
+            scene_entry=entry,
+        )
         results['entry_id'] = entry_id
         results['original_entry'] = entry
         results['status'] = 'success'
@@ -271,7 +304,13 @@ def worker_thread(gpu_id, task_queue, result_queue, base_data_path, base_output_
                 break
 
             print(f"[GPU {gpu_id}] Processing entry: {entry['id']}")
-            result = process_jsonl_entry(processor, entry, base_data_path, base_output_path)
+            result = process_jsonl_entry(
+                processor,
+                entry,
+                base_data_path,
+                base_output_path,
+                conf_thres_value=conf_thres_value,
+            )
             result['gpu_id'] = gpu_id
             result_queue.put(result)
             task_queue.task_done()
@@ -550,7 +589,11 @@ def main():
                         pbar.set_description(f"Processing {entry['id']}")
 
                         result = process_jsonl_entry(
-                            processor, entry, base_data_path, base_output_path
+                            processor,
+                            entry,
+                            base_data_path,
+                            base_output_path,
+                            conf_thres_value=args.conf_thres_value,
                         )
 
                         if result['status'] == 'success':

@@ -29,6 +29,7 @@ import numpy as np
 # Add parent directory to Python path to import pySpatial_Interface
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pySpatial_Interface import Agent, Scene, pySpatial
+from scene_layout import get_scene_overview_image
 
 # Rate limiting globals
 last_request_time = 0
@@ -234,13 +235,20 @@ def _tile_images(image_paths: List[str], cols: int = 4, thumb_size: int = 150, b
         c = idx % cols
         x = cell_padding + c * (thumb_size + cell_gap)
         y = cell_padding + r * (thumb_size + cell_gap)
-        draw.rounded_rectangle(
-            (x, y, x + thumb_size, y + thumb_size),
-            radius=12,
-            fill=(255, 255, 255),
-            outline=(228, 228, 228),
-            width=1,
-        )
+        try:
+            draw.rounded_rectangle(
+                (x, y, x + thumb_size, y + thumb_size),
+                radius=12,
+                fill=(255, 255, 255),
+                outline=(228, 228, 228),
+                width=1,
+            )
+        except Exception:
+            draw.rectangle(
+                (x, y, x + thumb_size, y + thumb_size),
+                fill=(255, 255, 255),
+                outline=(228, 228, 228),
+            )
         # Center image in its cell
         offset_x = (thumb_size - img.width) // 2
         offset_y = (thumb_size - img.height) // 2
@@ -249,7 +257,7 @@ def _tile_images(image_paths: List[str], cols: int = 4, thumb_size: int = 150, b
     return grid
 
 
-def _render_scene_image(scene_id: str, width: int = 960, height: int = 600) -> Optional[Image.Image]:
+def _render_point_cloud_scene_image(scene_id: str, width: int = 960, height: int = 600) -> Optional[Image.Image]:
     """
     Render a 3D scene image from preprocessed reconstruction artifacts.
 
@@ -391,6 +399,31 @@ def _render_scene_image(scene_id: str, width: int = 960, height: int = 600) -> O
         return None
 
     return None
+
+
+def _render_scene_image(
+    scene_id: str,
+    result: Optional[Dict[str, Any]] = None,
+    width: int = 960,
+    height: int = 600,
+) -> Optional[Image.Image]:
+    """
+    Render the preferred scene overview for a sample.
+
+    Priority:
+    1. Structured scene layout generated from preprocessing or raw entry metadata.
+    2. Legacy point-cloud overview rendered from reconstruction artifacts.
+    """
+    structured_image = get_scene_overview_image(
+        scene_id=scene_id,
+        result=result,
+        processed_base_dir=pySpatial.PROCESSED_BASE_DIR,
+        width=width,
+        height=height,
+    )
+    if structured_image is not None:
+        return structured_image
+    return _render_point_cloud_scene_image(scene_id, width=width, height=height)
 
 
 def _format_code(code: str) -> str:
@@ -848,8 +881,8 @@ def create_sample_flowchart(result: Dict[str, Any], save_dir: str, parsed_code: 
     answer_correct = result.get("answer_correct", False)
     images = result.get("images", [])
     base_dir = getattr(Scene, 'IMAGE_BASE_DIR', None)
-    input_images_grid = _tile_images(images, cols=4, thumb_size=150, base_dir=base_dir)
-    scene_render_image = _render_scene_image(scene_id)
+    input_images_grid = _tile_images(images, cols=4, thumb_size=190, base_dir=base_dir)
+    scene_render_image = _render_scene_image(scene_id, result=result)
 
     # Model name
     model_name = getattr(Agent, '_model_name', 'unknown')
@@ -872,7 +905,7 @@ def create_sample_flowchart(result: Dict[str, Any], save_dir: str, parsed_code: 
 
     # Build items list
     items = [
-        {"text": f"Q: {question}", "image": input_images_grid},
+        {"text": f"Q: {question}", "image": input_images_grid, "image_max_width": 860},
         {"text": f"GT Answer: {expected_answer}", "image": None},
         {"text": f"Model: {model_short}", "image": None},
         {"text": f"generate_code: {code_status}", "image": None},
@@ -884,7 +917,7 @@ def create_sample_flowchart(result: Dict[str, Any], save_dir: str, parsed_code: 
 
     if scene_render_image is not None:
         items.insert(3, {
-            "text": "3D Scene",
+            "text": "Scene Overview",
             "image": scene_render_image,
             "image_max_width": 900,
             "image_max_height": 560,
@@ -1007,6 +1040,8 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, viz_save_dir: 
         result = {
             "scene_id": scene_id,
             "scene_type": scene_type,
+            "entry_type": entry.get("type"),
+            "meta_info": entry.get("meta_info"),
             "question": question,
             "images": images,
             "expected_answer": expected_answer,
@@ -1016,7 +1051,13 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, viz_save_dir: 
             "generated_answer": generated_answer,
             "answer_correct": answer_correct,
             "fallback_used": fallback_used,
+            "_processed_base_dir": pySpatial.PROCESSED_BASE_DIR,
         }
+
+        if pySpatial.PROCESSED_BASE_DIR:
+            overview_path = os.path.join(pySpatial.PROCESSED_BASE_DIR, scene_id, "scene_overview.png")
+            if os.path.exists(overview_path):
+                result["_scene_overview_path"] = overview_path
 
         # Generate flowchart visualization if enabled
         if viz_save_dir:
@@ -1069,6 +1110,8 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, viz_save_dir: 
         return {
             "scene_id": scene_id,
             "scene_type": scene_type,
+            "entry_type": entry.get("type"),
+            "meta_info": entry.get("meta_info"),
             "question": question,
             "images": images,
             "expected_answer": expected_answer,
@@ -1079,6 +1122,10 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, viz_save_dir: 
             "answer_correct": fallback_correct,
             "fallback_used": fallback_used,
             "error": error_msg,
+            "_processed_base_dir": pySpatial.PROCESSED_BASE_DIR,
+            "_scene_overview_path": os.path.join(pySpatial.PROCESSED_BASE_DIR, scene_id, "scene_overview.png")
+            if pySpatial.PROCESSED_BASE_DIR and os.path.exists(os.path.join(pySpatial.PROCESSED_BASE_DIR, scene_id, "scene_overview.png"))
+            else None,
         }
 
 
