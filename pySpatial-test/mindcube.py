@@ -249,6 +249,150 @@ def _tile_images(image_paths: List[str], cols: int = 4, thumb_size: int = 150, b
     return grid
 
 
+def _render_scene_image(scene_id: str, width: int = 960, height: int = 600) -> Optional[Image.Image]:
+    """
+    Render a 3D scene image from preprocessed reconstruction artifacts.
+
+    Uses:
+    - pySpatial.PROCESSED_BASE_DIR / scene_id / points.ply
+    - pySpatial.PROCESSED_BASE_DIR / scene_id / camera_matrices.npz
+
+    The scene is rendered from a fixed oblique overview camera derived from
+    the point cloud bounds, with a dedicated overview intrinsic matched to the
+    output canvas rather than reusing an input-view camera.
+    Returns a PIL image on success, or None if any required artifact is unavailable.
+    """
+    if not scene_id or not pySpatial.PROCESSED_BASE_DIR:
+        return None
+
+    scene_dir = Path(pySpatial.PROCESSED_BASE_DIR) / scene_id
+    ply_path = scene_dir / "points.ply"
+    npz_path = scene_dir / "camera_matrices.npz"
+
+    if not ply_path.exists() or not npz_path.exists():
+        return None
+
+    try:
+        import trimesh
+        from tool.novel_view_synthesis import render_pcd_with_extrinsics
+        import open3d as o3d
+    except Exception:
+        return None
+
+    try:
+        point_cloud = trimesh.load(str(ply_path))
+        points_xyz = np.asarray(point_cloud.vertices, dtype=np.float32)
+        if points_xyz.size == 0:
+            return None
+        colors_rgb = None
+        if hasattr(point_cloud, "colors") and point_cloud.colors is not None and len(point_cloud.colors) > 0:
+            colors_rgb = np.asarray(point_cloud.colors, dtype=np.float32)
+            if colors_rgb.ndim == 2 and colors_rgb.shape[1] >= 3:
+                colors_rgb = colors_rgb[:, :3]
+                if colors_rgb.max() > 1.0:
+                    colors_rgb = colors_rgb / 255.0
+
+        camera_data = np.load(str(npz_path))
+        if "intrinsic" not in camera_data:
+            return None
+
+        fx = fy = float(max(width, height) * 1.15)
+        cx = width / 2.0
+        cy = height / 2.0
+        intrinsic = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
+
+        mins = points_xyz.min(axis=0)
+        maxs = points_xyz.max(axis=0)
+        center = ((mins + maxs) / 2.0).astype(np.float32)
+        extents = np.maximum(maxs - mins, 1e-3)
+        scale = float(np.max(extents))
+        scale = max(scale, 1.0)
+
+        def build_extrinsic(distance_scale: float, up_vec: np.ndarray) -> Optional[np.ndarray]:
+            eye = center + np.array([1.05, -0.9, 0.85], dtype=np.float32) * (scale * distance_scale)
+            target = center
+
+            forward = target - eye
+            forward_norm = np.linalg.norm(forward)
+            if forward_norm < 1e-6:
+                return None
+            forward = forward / forward_norm
+
+            right = np.cross(up_vec, forward)
+            right_norm = np.linalg.norm(right)
+            if right_norm < 1e-6:
+                return None
+            right = right / right_norm
+
+            cam_up = np.cross(forward, right)
+            cam_up_norm = np.linalg.norm(cam_up)
+            if cam_up_norm < 1e-6:
+                return None
+            cam_up = cam_up / cam_up_norm
+
+            rotation_c2w = np.stack([right, cam_up, forward], axis=1)
+            rotation_w2c = rotation_c2w.T
+            translation_w2c = -rotation_w2c @ eye.reshape(3, 1)
+
+            extrinsic = np.eye(4, dtype=np.float32)
+            extrinsic[:3, :3] = rotation_w2c.astype(np.float32)
+            extrinsic[:3, 3] = translation_w2c[:, 0].astype(np.float32)
+            return extrinsic
+
+        def render_candidate(extrinsic: np.ndarray) -> Optional[Image.Image]:
+            rendered = render_pcd_with_extrinsics(
+                points_xyz,
+                colors_rgb,
+                intrinsic,
+                extrinsic,
+                width,
+                height,
+                point_size=4.0,
+                out_path=None,
+                zoom_out_scale=0.95,
+            )
+
+            rendered_np = np.asarray(rendered)
+            if rendered_np.ndim == 2:
+                rgb_np = np.repeat(rendered_np[..., None], 3, axis=2)
+            elif rendered_np.ndim == 3:
+                rgb_np = rendered_np[..., :3]
+            else:
+                return None
+
+            if rgb_np.size == 0:
+                return None
+
+            near_white_ratio = np.mean(np.all(rgb_np >= 245, axis=2))
+            if near_white_ratio > 0.992:
+                return None
+
+            return Image.fromarray(rgb_np.astype(np.uint8)).convert("RGB")
+
+        candidate_settings = [
+            (1.15, np.array([0.0, 0.0, 1.0], dtype=np.float32)),
+            (1.0, np.array([0.0, 0.0, 1.0], dtype=np.float32)),
+            (1.15, np.array([0.0, 1.0, 0.0], dtype=np.float32)),
+            (1.0, np.array([0.0, 1.0, 0.0], dtype=np.float32)),
+        ]
+
+        for distance_scale, up_vec in candidate_settings:
+            extrinsic = build_extrinsic(distance_scale, up_vec)
+            if extrinsic is None:
+                continue
+            candidate = render_candidate(extrinsic)
+            if candidate is not None:
+                return candidate
+    except Exception:
+        return None
+
+    return None
+
+
 def _format_code(code: str) -> str:
     """Return full code without truncation."""
     if not code:
@@ -568,10 +712,12 @@ def visualize_conversation(
     for idx, item in enumerate(items):
         text_content = item.get("text", "")
         img = load_image(item.get("image"))
+        row_image_max_width = item.get("image_max_width", image_max_width)
+        row_image_max_height = item.get("image_max_height")
 
         # Determine text area width
         if img is not None:
-            left_block_w = image_max_width
+            left_block_w = row_image_max_width
             gutter = 16
             text_area_w = width - (padding * 2) - left_block_w - gutter
         else:
@@ -595,10 +741,10 @@ def visualize_conversation(
         img_w = 0
         if img is not None:
             iw, ih = img.size
-            scale = min(image_max_width / iw, 1.0)
+            scale = min(row_image_max_width / iw, 1.0)
             img_w = int(iw * scale)
             img_h = int(ih * scale)
-            max_img_h = min(400, text_h * 2)
+            max_img_h = row_image_max_height if row_image_max_height is not None else min(400, text_h * 2)
             if img_h > max_img_h:
                 scale = max_img_h / img_h
                 img_w = int(img_w * scale)
@@ -701,10 +847,9 @@ def create_sample_flowchart(result: Dict[str, Any], save_dir: str, parsed_code: 
     answer_gen_success = result.get("answer_generation_success", False)
     answer_correct = result.get("answer_correct", False)
     images = result.get("images", [])
-
-    # Tile all input images into one grid
     base_dir = getattr(Scene, 'IMAGE_BASE_DIR', None)
-    scene_images_grid = _tile_images(images, cols=4, thumb_size=150, base_dir=base_dir)
+    input_images_grid = _tile_images(images, cols=4, thumb_size=150, base_dir=base_dir)
+    scene_render_image = _render_scene_image(scene_id)
 
     # Model name
     model_name = getattr(Agent, '_model_name', 'unknown')
@@ -727,16 +872,23 @@ def create_sample_flowchart(result: Dict[str, Any], save_dir: str, parsed_code: 
 
     # Build items list
     items = [
-        {"text": f"Q: {question}", "image": None},
+        {"text": f"Q: {question}", "image": input_images_grid},
         {"text": f"GT Answer: {expected_answer}", "image": None},
         {"text": f"Model: {model_short}", "image": None},
-        {"text": "Scene Images", "image": scene_images_grid},
         {"text": f"generate_code: {code_status}", "image": None},
         {"text": code_segments, "image": None},
         {"text": f"execute: {'✓ Success' if execution_success else '✗ Failed'}\nAPIs: {api_text}\nGenerated funcs: {generated_funcs}", "image": None},
         {"text": f"answer: {'✓ Success' if answer_gen_success else '✗ Failed'}", "image": None},
         {"text": f"Model Answer: {generated_answer or 'N/A'}", "image": None},
     ]
+
+    if scene_render_image is not None:
+        items.insert(3, {
+            "text": "3D Scene",
+            "image": scene_render_image,
+            "image_max_width": 900,
+            "image_max_height": 560,
+        })
 
     # Last row: correctness
     correctness_text = f"Correctness: {'✓ Correct' if answer_correct else '✗ Incorrect'}"
