@@ -54,9 +54,11 @@ class FakeDepthModule:
         return unproject_to_3D(image, depth, segment_mask, min_depth_points=1)
 
 
-def make_locator(detections, vlm_model=None, use_vlm_refinement=False):
+def make_locator(detections, vlm_model=None, use_vlm_refinement=False, mask_fallback_mode=None):
     cfg = Object3DExtractionConfig(min_mask_area=1, min_depth_points=1)
     cfg.detection.use_vlm_refinement = use_vlm_refinement
+    if mask_fallback_mode is not None:
+        cfg.mask_fallback_mode = mask_fallback_mode
     return Object3DLocator(
         config=cfg,
         device="cpu",
@@ -142,7 +144,7 @@ def test_success_records_sam_mask_usage_fields():
     assert item["mask_fallback_reason"] is None
 
 
-def test_fallback_records_distinct_sam_and_final_mask_areas():
+def test_default_auto_fallback_records_distinct_sam_and_final_mask_areas():
     locator = make_locator(
         {"white coffee table": [{"box2d": [0, 20, 100, 100], "score": 0.9}]}
     )
@@ -154,6 +156,21 @@ def test_fallback_records_distinct_sam_and_final_mask_areas():
     assert item["mask_used_for_3d"] == "fallback"
     assert item["mask_fallback_reason"] == "entity_box_too_large"
     assert item["sam_mask_area"] > item["final_mask_area"]
+
+
+def test_mask_fallback_off_uses_sam_mask_for_large_entity_box():
+    locator = make_locator(
+        {"white coffee table": [{"box2d": [0, 20, 100, 100], "score": 0.9}]},
+        mask_fallback_mode="off",
+    )
+    image = Image.new("RGB", (100, 100), color="white")
+
+    result = locator.extract(image, ["white coffee table"])
+
+    item = result["white coffee table"]
+    assert item["mask_used_for_3d"] == "sam"
+    assert item["mask_fallback_reason"] is None
+    assert item["sam_mask_area"] == item["final_mask_area"]
 
 
 def test_save_debug_visuals_writes_sam_and_final_overlays(tmpdir):
@@ -429,6 +446,16 @@ def test_cli_default_vlm_model_path(monkeypatch):
 
     assert args.vlm_model_path == "/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct"
     assert args.use_vlm_refinement is True
+    assert args.mask_fallback == "auto"
+
+
+def test_cli_mask_fallback_off(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["demo_extract_3d_positions.py", "--mask_fallback", "off"])
+
+    args = demo_extract_3d_positions.parse_args()
+
+    assert args.mask_fallback == "off"
+
 
 def test_qwen_model_class_falls_back_to_auto_model(monkeypatch):
     class FakeTransformers:

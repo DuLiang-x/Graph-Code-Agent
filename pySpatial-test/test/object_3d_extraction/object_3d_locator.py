@@ -74,7 +74,11 @@ class Object3DLocator:
                 )
                 box2d = [int(v) for v in best_detection["box2d"]]
                 sam_mask = self.detection_module.run_segmentation(image_pil, box2d)
-                mask, mask_fallback_reason = maybe_fallback_mask(image_pil, object_name, box2d, sam_mask)
+                if self.config.mask_fallback_mode == "auto":
+                    mask, mask_fallback_reason = maybe_fallback_mask(image_pil, object_name, box2d, sam_mask)
+                else:
+                    mask = sam_mask
+                    mask_fallback_reason = None
                 mask_used_for_3d = "fallback" if mask_fallback_reason else "sam"
                 sam_mask_area = int((sam_mask > 0.5).sum())
                 mask_area = int((mask > 0.5).sum())

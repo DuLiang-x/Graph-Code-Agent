@@ -56,3 +56,4 @@ class Object3DExtractionConfig:
     min_mask_area: int = 10
     min_depth_points: int = 10
     depth_mode_bins: int = 128
+    mask_fallback_mode: str = "auto"

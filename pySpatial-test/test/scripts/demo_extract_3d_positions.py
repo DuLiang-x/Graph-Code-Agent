@@ -145,6 +145,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable VLM refinement and use rule-based candidate ranking.",
     )
     parser.add_argument(
+        "--mask_fallback",
+        choices=("auto", "off"),
+        default="auto",
+        help="Control entity mask fallback. auto enables fallback; off always uses SAM mask for 3D.",
+    )
+    parser.add_argument(
         "--save_dir",
         default="outputs/object_3d_extraction",
         help="Root directory for per-sample JSON outputs and debug visualizations.",
@@ -345,6 +351,7 @@ def main() -> None:
     config.detection.box_threshold = args.box_threshold
     config.detection.text_threshold = args.text_threshold
     config.detection.use_vlm_refinement = args.use_vlm_refinement
+    config.mask_fallback_mode = args.mask_fallback
     vlm_model = build_vlm_refinement_model(args)
     locator = Object3DLocator(config=config, device=args.device, vlm_model=vlm_model)
     output_root = Path(args.save_dir)
