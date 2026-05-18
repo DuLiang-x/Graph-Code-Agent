@@ -17,8 +17,8 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, parse_candidate_index, rank_detection_candidates
-from object_3d_extraction.utils import extract_object_names_from_question_options
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, maybe_fallback_mask, parse_candidate_index, rank_detection_candidates
+from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
 class FakeDetectionModule:
@@ -126,6 +126,57 @@ def test_success_returns_position_orientation_and_3d_box():
     assert len(item["box3d_center"]) == 3
     assert len(item["box3d_min"]) == 3
     assert len(item["box3d_max"]) == 3
+
+
+def test_success_records_sam_mask_usage_fields():
+    locator = make_locator(
+        {"chair": [{"box2d": [4, 4, 12, 12], "score": 0.9}]}
+    )
+    image = Image.new("RGB", (16, 16), color="white")
+
+    result = locator.extract(image, ["chair"])
+
+    item = result["chair"]
+    assert item["mask_used_for_3d"] == "sam"
+    assert item["sam_mask_area"] == item["final_mask_area"] == 64
+    assert item["mask_fallback_reason"] is None
+
+
+def test_fallback_records_distinct_sam_and_final_mask_areas():
+    locator = make_locator(
+        {"white coffee table": [{"box2d": [0, 20, 100, 100], "score": 0.9}]}
+    )
+    image = Image.new("RGB", (100, 100), color="white")
+
+    result = locator.extract(image, ["white coffee table"])
+
+    item = result["white coffee table"]
+    assert item["mask_used_for_3d"] == "fallback"
+    assert item["mask_fallback_reason"] == "entity_box_too_large"
+    assert item["sam_mask_area"] > item["final_mask_area"]
+
+
+def test_save_debug_visuals_writes_sam_and_final_overlays(tmpdir):
+    image = Image.new("RGB", (16, 16), color="white")
+    sam_mask = np.zeros((16, 16), dtype=np.float32)
+    sam_mask[2:14, 2:14] = 1.0
+    final_mask = np.zeros((16, 16), dtype=np.float32)
+    final_mask[5:10, 5:10] = 1.0
+
+    save_debug_visuals(
+        image,
+        "white coffee table",
+        [2, 2, 14, 14],
+        final_mask,
+        str(tmpdir),
+        sam_mask=sam_mask,
+        mask_used_for_3d="fallback",
+    )
+
+    assert tmpdir.join("white_coffee_table_sam_mask.png").check()
+    assert tmpdir.join("white_coffee_table_sam_overlay.png").check()
+    assert tmpdir.join("white_coffee_table_mask.png").check()
+    assert tmpdir.join("white_coffee_table_overlay.png").check()
 
 
 def test_unproject_returns_3d_box_fields():
@@ -263,6 +314,84 @@ def test_rule_ranker_selects_rightmost_candidate():
     assert selected["box2d"] == [70, 10, 95, 40]
 
 
+def test_entity_ranker_prefers_tight_white_coffee_table_over_large_carpet_box():
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [0, 35, 100, 100], "score": 0.9, "prompt": "white coffee table"},
+        {"box2d": [10, 45, 45, 72], "score": 0.58, "prompt": "white table"},
+    ]
+
+    selected = rank_detection_candidates(image, "white coffee table", candidates, {})
+
+    assert selected["box2d"] == [10, 45, 45, 72]
+    assert "large_entity_penalty" not in selected["rank_reasons"]
+
+
+def test_area_ranker_prefers_low_wide_carpet_over_high_platform():
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [45, 20, 75, 42], "score": 0.65, "prompt": "carpet"},
+        {"box2d": [0, 58, 95, 98], "score": 0.4, "prompt": "carpet"},
+    ]
+
+    selected = rank_detection_candidates(image, "carpet", candidates, {})
+
+    assert selected["box2d"] == [0, 58, 95, 98]
+    assert "wide_area_object" in selected["rank_reasons"]
+    assert "low_area_object" in selected["rank_reasons"]
+
+
+def test_black_table_ranker_penalizes_large_fallback_table_box():
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [0, 20, 100, 100], "score": 0.9, "prompt": "table"},
+        {"box2d": [25, 65, 80, 98], "score": 0.62, "prompt": "black table"},
+    ]
+
+    selected = rank_detection_candidates(image, "black table", candidates, {})
+
+    assert selected["box2d"] == [25, 65, 80, 98]
+    assert "color_prompt" in selected["rank_reasons"]
+
+
+class InvalidVLM:
+    def process_messages(self, messages, max_new_tokens=32):
+        assert messages[0]["content"][0]["type"] == "image"
+        assert messages[0]["content"][1]["type"] == "image"
+        return "INVALID"
+
+
+def test_vlm_invalid_response_falls_back_to_rule_ranker(tmpdir):
+    locator = make_locator(
+        {
+            "white coffee table": [
+                {"box2d": [0, 35, 100, 100], "score": 0.9, "prompt": "white coffee table"},
+                {"box2d": [10, 45, 45, 72], "score": 0.58, "prompt": "white coffee table"},
+            ]
+        },
+        vlm_model=InvalidVLM(),
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (100, 100), color="white")
+
+    result = locator.extract(image, ["white coffee table"], visualize=True, save_dir=str(tmpdir))
+
+    item = result["white coffee table"]
+    assert item["box2d"] == [10, 45, 45, 72]
+    assert item["candidate_rank_reason"] == "rule_ranker"
+    assert item["candidate_overlay_path"].endswith("detection_candidates_white_coffee_table_overlay.png")
+
+
+def test_entity_large_box_triggers_mask_fallback():
+    image = Image.new("RGB", (100, 100), color="white")
+    mask = np.ones((100, 100), dtype=np.float32)
+
+    fallback_mask, reason = maybe_fallback_mask(image, "white coffee table", [0, 20, 100, 100], mask)
+
+    assert reason == "entity_box_too_large"
+    assert int((fallback_mask > 0.5).sum()) < int(mask.sum())
+
+
 class FakeVLM:
     def process_messages(self, messages, max_new_tokens=32):
         assert messages[0]["content"][0]["type"] == "image"
@@ -273,8 +402,8 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     locator = make_locator(
         {
             "chair": [
-                {"box2d": [1, 1, 4, 4], "score": 0.9},
-                {"box2d": [8, 8, 14, 14], "score": 0.6},
+                {"box2d": [1, 1, 5, 5], "score": 0.9},
+                {"box2d": [8, 8, 12, 12], "score": 0.75},
             ]
         },
         vlm_model=FakeVLM(),
@@ -285,7 +414,7 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     result = locator.extract(image, ["chair"])
 
     item = result["chair"]
-    assert item["box2d"] == [8, 8, 14, 14]
+    assert item["box2d"] == [8, 8, 12, 12]
     assert item["candidate_rank_reason"] == "vlm_refinement"
 
 def test_vlm_refinement_invalid_response_falls_back_to_first_candidate():

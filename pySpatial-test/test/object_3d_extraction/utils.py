@@ -108,6 +108,8 @@ def save_debug_visuals(
     box2d: Optional[List[int]],
     mask: Optional[np.ndarray],
     save_dir: Optional[Union[str, Path]],
+    sam_mask: Optional[np.ndarray] = None,
+    mask_used_for_3d: Optional[str] = None,
 ) -> None:
     save_path = ensure_save_dir(save_dir)
     safe_name = object_name.replace("/", "_").replace(" ", "_")
@@ -115,17 +117,29 @@ def save_debug_visuals(
     debug_image = image.copy()
     draw = ImageDraw.Draw(debug_image)
     if box2d is not None:
-        draw.rectangle(box2d, outline=(255, 0, 0), width=3)
-        draw.text((box2d[0], max(0, box2d[1] - 12)), object_name, fill=(255, 0, 0))
+        for offset in range(3):
+            draw.rectangle(
+                [box2d[0] + offset, box2d[1] + offset, box2d[2] - offset, box2d[3] - offset],
+                outline=(255, 0, 0),
+            )
+        label = object_name if not mask_used_for_3d else f"{object_name} [{mask_used_for_3d}]"
+        draw.text((box2d[0], max(0, box2d[1] - 12)), label, fill=(255, 0, 0))
     debug_image.save(save_path / f"{safe_name}_box.png")
 
-    if mask is not None:
-        mask_u8 = (mask.astype(np.float32) > 0.5).astype(np.uint8) * 255
-        Image.fromarray(mask_u8, mode="L").save(save_path / f"{safe_name}_mask.png")
+    if sam_mask is not None:
+        _save_mask_visuals(image, sam_mask, save_path, f"{safe_name}_sam")
 
-        overlay = np.array(image).copy()
-        overlay[mask_u8 > 0] = (0.5 * overlay[mask_u8 > 0] + 0.5 * np.array([0, 255, 0])).astype(np.uint8)
-        Image.fromarray(overlay).save(save_path / f"{safe_name}_overlay.png")
+    if mask is not None:
+        _save_mask_visuals(image, mask, save_path, safe_name)
+
+
+def _save_mask_visuals(image: Image.Image, mask: np.ndarray, save_path: Path, prefix: str) -> None:
+    mask_u8 = (mask.astype(np.float32) > 0.5).astype(np.uint8) * 255
+    Image.fromarray(mask_u8, mode="L").save(save_path / f"{prefix}_mask.png")
+
+    overlay = np.array(image).copy()
+    overlay[mask_u8 > 0] = (0.5 * overlay[mask_u8 > 0] + 0.5 * np.array([0, 255, 0])).astype(np.uint8)
+    Image.fromarray(overlay).save(save_path / f"{prefix}_overlay.png")
 
 
 def _clean_object_name(text: str) -> str:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import math
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from PIL import Image, ImageDraw
 
@@ -51,6 +51,9 @@ class Object3DLocator:
         for object_name in names:
             box2d = None
             mask = None
+            sam_mask = None
+            mask_used_for_3d = None
+            mask_fallback_reason = None
             prompts_tried = detection_prompts_for_object(object_name)
             try:
                 candidates = self._collect_detection_candidates(image_pil, object_name, prompts_tried)
@@ -70,7 +73,10 @@ class Object3DLocator:
                     question=question,
                 )
                 box2d = [int(v) for v in best_detection["box2d"]]
-                mask = self.detection_module.run_segmentation(image_pil, box2d)
+                sam_mask = self.detection_module.run_segmentation(image_pil, box2d)
+                mask, mask_fallback_reason = maybe_fallback_mask(image_pil, object_name, box2d, sam_mask)
+                mask_used_for_3d = "fallback" if mask_fallback_reason else "sam"
+                sam_mask_area = int((sam_mask > 0.5).sum())
                 mask_area = int((mask > 0.5).sum())
                 if mask_area < self.config.min_mask_area:
                     results[object_name] = {
@@ -78,8 +84,14 @@ class Object3DLocator:
                         "box2d": box2d,
                         "bbox_wh": bbox_wh(box2d),
                         "mask_area": mask_area,
+                        "sam_mask_area": sam_mask_area,
+                        "final_mask_area": mask_area,
+                        "mask_used_for_3d": mask_used_for_3d,
                         "prompt_used": best_detection.get("prompt"),
                         "candidate_rank_reason": best_detection.get("rank_reason"),
+                        "vlm_response": best_detection.get("vlm_response"),
+                        "mask_fallback_reason": mask_fallback_reason,
+                        "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
                         "candidates_considered": summarize_candidates(candidates),
                     }
                     continue
@@ -101,10 +113,17 @@ class Object3DLocator:
                     "bbox_wh": bbox_wh(box2d),
                     "box2d": box2d,
                     "mask_area": int(unprojected["mask_area"]),
+                    "sam_mask_area": sam_mask_area,
+                    "final_mask_area": int(unprojected["mask_area"]),
+                    "mask_used_for_3d": mask_used_for_3d,
                     "depth_mode": float(unprojected["depth_mode"]),
                     "num_points": int(unprojected["num_points"]),
                     "prompt_used": best_detection.get("prompt"),
                     "candidate_rank_reason": best_detection.get("rank_reason"),
+                    "vlm_response": best_detection.get("vlm_response"),
+                    "mask_fallback_reason": mask_fallback_reason,
+                    "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
+                    "overlap_warnings": overlap_warnings(object_name, box2d, selected_boxes),
                     "candidates_considered": summarize_candidates(candidates),
                 }
 
@@ -116,12 +135,27 @@ class Object3DLocator:
                 if box2d is not None:
                     error_result["box2d"] = box2d
                     error_result["bbox_wh"] = bbox_wh(box2d)
+                if sam_mask is not None:
+                    error_result["sam_mask_area"] = int((sam_mask > 0.5).sum())
                 if mask is not None:
                     error_result["mask_area"] = int((mask > 0.5).sum())
+                    error_result["final_mask_area"] = int((mask > 0.5).sum())
+                if mask_used_for_3d is not None:
+                    error_result["mask_used_for_3d"] = mask_used_for_3d
+                if mask_fallback_reason is not None:
+                    error_result["mask_fallback_reason"] = mask_fallback_reason
                 results[object_name] = error_result
             finally:
-                if visualize and (box2d is not None or mask is not None):
-                    save_debug_visuals(image_pil, object_name, box2d, mask, save_dir)
+                if visualize and (box2d is not None or mask is not None or sam_mask is not None):
+                    save_debug_visuals(
+                        image_pil,
+                        object_name,
+                        box2d,
+                        mask,
+                        save_dir,
+                        sam_mask=sam_mask,
+                        mask_used_for_3d=mask_used_for_3d,
+                    )
 
         return results
 
@@ -136,7 +170,8 @@ class Object3DLocator:
                 candidate["box2d"] = [int(v) for v in candidate["box2d"]]
                 candidates.append(candidate)
         candidates.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
-        return candidates[: max(1, self.config.detection.num_candidates * len(prompts))]
+        candidates = candidates[: max(1, self.config.detection.num_candidates * len(prompts))]
+        return rank_candidates_for_object(image_pil, object_name, candidates, {})
 
     def _select_detection(
         self,
@@ -155,14 +190,18 @@ class Object3DLocator:
                 candidates,
                 save_dir=save_dir,
                 question=question,
+                selected_boxes=selected_boxes,
             )
-            selected["rank_reason"] = "vlm_refinement"
-            return selected
+            if selected is not None and vlm_selection_is_plausible(object_name, selected, candidates):
+                selected["rank_reason"] = "vlm_refinement"
+                return selected
 
         selected = rank_detection_candidates(image_pil, object_name, candidates, selected_boxes)
         selected["rank_reason"] = "rule_ranker"
         if save_dir is not None:
             save_candidate_grid(image_pil, object_name, candidates, save_dir)
+            overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
+            selected["candidate_overlay_path"] = str(overlay_path)
         return selected
 
 
@@ -192,35 +231,107 @@ def rank_detection_candidates(
     candidates: List[Dict[str, object]],
     selected_boxes: Optional[Dict[str, List[int]]] = None,
 ) -> Dict[str, object]:
+    ranked = rank_candidates_for_object(image_pil, object_name, candidates, selected_boxes or {})
+    return ranked[0]
+
+
+def rank_candidates_for_object(
+    image_pil: Image.Image,
+    object_name: str,
+    candidates: List[Dict[str, object]],
+    selected_boxes: Optional[Dict[str, List[int]]] = None,
+) -> List[Dict[str, object]]:
     selected_boxes = selected_boxes or {}
     width, height = image_pil.size
     relation = relation_modifier(object_name)
-    area_kind = is_area_object(object_name)
-    ranked = []
+    scored = []
     for idx, candidate in enumerate(candidates):
-        box = candidate["box2d"]
-        area_ratio = box_area(box) / float(max(1, width * height))
-        score = float(candidate.get("score", 0.0))
-        if not area_kind and area_ratio > 0.35:
-            score -= area_ratio
-        if area_kind and area_ratio > 0.15:
-            score += 0.15
-        if is_color_object(object_name) and prompt_has_color(candidate.get("prompt", ""), object_name):
-            score += 0.05
-        for selected_name, selected_box in selected_boxes.items():
-            if is_area_object(selected_name) and not area_kind:
-                overlap = box_iou(box, selected_box)
-                if overlap > 0.55:
-                    score -= 1.0
-                if box_center_inside(box, selected_box) and box_area(box) < box_area(selected_box) * 0.65:
-                    score += 0.25
-        ranked.append((score, idx, candidate))
+        score, reasons = score_detection_candidate(image_pil, object_name, candidate, selected_boxes)
+        item = dict(candidate)
+        item["rank_score"] = float(score)
+        item["rank_reasons"] = reasons
+        scored.append((score, idx, item))
 
     if relation in {"leftmost", "rightmost", "center", "topmost", "bottommost"}:
-        return select_by_relation(ranked, relation, width, height)
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return ranked[0][2]
+        selected = select_by_relation(scored, relation, width, height)
+        rest = [item for _, _, item in sorted(scored, key=lambda value: value[0], reverse=True) if item is not selected]
+        return [selected] + rest
 
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[2] for item in scored]
+
+
+def score_detection_candidate(
+    image_pil: Image.Image,
+    object_name: str,
+    candidate: Dict[str, object],
+    selected_boxes: Dict[str, List[int]],
+) -> Tuple[float, List[str]]:
+    width, height = image_pil.size
+    box = candidate["box2d"]
+    area_ratio = box_area(box) / float(max(1, width * height))
+    box_w = max(0, int(box[2]) - int(box[0]))
+    box_h = max(0, int(box[3]) - int(box[1]))
+    width_ratio = box_w / float(max(1, width))
+    height_ratio = box_h / float(max(1, height))
+    cx, cy = box_center(box)
+    score = float(candidate.get("score", 0.0))
+    reasons = ["dino_score"]
+    area_kind = is_area_object(object_name)
+
+    prompt = str(candidate.get("prompt", "")).lower()
+    original = object_name.lower()
+    if prompt == original:
+        score += 0.18
+        reasons.append("exact_prompt")
+    elif prompt and prompt in original:
+        score += 0.08
+        reasons.append("specific_prompt")
+    if is_color_object(object_name) and prompt_has_color(prompt, object_name):
+        score += 0.12
+        reasons.append("color_prompt")
+
+    if area_kind:
+        if area_ratio > 0.15:
+            score += 0.25
+            reasons.append("large_area_object")
+        if width_ratio > 0.45:
+            score += 0.15
+            reasons.append("wide_area_object")
+        if cy > height * 0.45:
+            score += 0.15
+            reasons.append("low_area_object")
+        if area_ratio < 0.08:
+            score -= 0.35
+            reasons.append("small_area_penalty")
+        if height_ratio > 0.55 and width_ratio < 0.45:
+            score -= 0.25
+            reasons.append("vertical_area_penalty")
+    else:
+        if area_ratio > 0.22:
+            score -= 1.5 * area_ratio
+            reasons.append("large_entity_penalty")
+        if width_ratio > 0.65 or height_ratio > 0.70:
+            score -= 0.35
+            reasons.append("broad_entity_penalty")
+        if area_ratio < 0.002:
+            score -= 0.15
+            reasons.append("tiny_entity_penalty")
+
+    for selected_name, selected_box in selected_boxes.items():
+        overlap = box_iou(box, selected_box)
+        if overlap > 0.55 and is_area_object(selected_name) and not area_kind:
+            score -= 0.8
+            reasons.append("overlaps_area_object")
+        if overlap > 0.55 and area_kind and not is_area_object(selected_name):
+            score -= 0.15
+            reasons.append("overlaps_entity_object")
+        if is_area_object(selected_name) and not area_kind:
+            if box_center_inside(box, selected_box) and box_area(box) < box_area(selected_box) * 0.65:
+                score += 0.2
+                reasons.append("inside_area_object")
+
+    return score, reasons
 
 def select_candidate_with_vlm(
     vlm_model: Any,
@@ -229,27 +340,56 @@ def select_candidate_with_vlm(
     candidates: List[Dict[str, object]],
     save_dir: Optional[Union[str, Path]] = None,
     question: str = "",
-) -> Dict[str, object]:
+    selected_boxes: Optional[Dict[str, List[int]]] = None,
+) -> Optional[Dict[str, object]]:
     grid = save_candidate_grid(image_pil, object_name, candidates, save_dir)
+    overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
+    overlay_image = Image.open(overlay_path).convert("RGB") if overlay_path is not None else make_candidate_overlay(image_pil, candidates)
+    object_kind = "area" if is_area_object(object_name) else "entity"
     prompt = (
-        "Select the crop index that best matches the target object.\n"
+        "Choose the single numbered bounding box that best matches the target object in the full image.\n"
         f"Target object: {object_name}\n"
+        f"Object kind: {object_kind}\n"
         f"Question context: {question}\n"
-        "Return only one integer index."
+        "Use the full-image overlay first; the crop grid is only supporting evidence.\n"
+        "For entity objects such as white coffee table or black table, avoid boxes that include large carpet/floor regions or multiple objects.\n"
+        "For carpet/rug/floor, prefer the large low horizontal floor covering and do not choose fireplace platforms or tabletops.\n"
+        "Return only one integer index. If none match, return INVALID."
     )
     messages = [
         {
             "role": "user",
             "content": [
+                {"type": "image", "image": overlay_image},
                 {"type": "image", "image": grid},
                 {"type": "text", "text": prompt},
             ],
         }
     ]
     response = vlm_model.process_messages(messages, max_new_tokens=32)
-    selected_idx = parse_candidate_index(response, len(candidates))
-    return candidates[selected_idx]
+    selected_idx = parse_candidate_index_or_none(response, len(candidates))
+    if selected_idx is None:
+        return None
+    selected = dict(candidates[selected_idx])
+    selected["vlm_response"] = str(response)
+    if overlay_path is not None:
+        selected["candidate_overlay_path"] = str(overlay_path)
+    return selected
 
+
+def vlm_selection_is_plausible(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:
+    if not candidates:
+        return False
+    selected_score = float(selected.get("rank_score", selected.get("score", 0.0)))
+    best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
+    if selected_score < best_score - 0.35:
+        return False
+    if not is_area_object(object_name):
+        selected_area = box_area(selected.get("box2d", [0, 0, 0, 0]))
+        best_area = max(1, box_area(candidates[0].get("box2d", [0, 0, 0, 0])))
+        if selected_score < best_score and selected_area > best_area * 2.0:
+            return False
+    return True
 
 def save_candidate_grid(
     image_pil: Image.Image,
@@ -278,6 +418,106 @@ def save_candidate_grid(
     return grid
 
 
+def save_candidate_overlay(
+    image_pil: Image.Image,
+    object_name: str,
+    candidates: List[Dict[str, object]],
+    save_dir: Optional[Union[str, Path]],
+) -> Optional[Path]:
+    if save_dir is None:
+        return None
+    out_dir = Path(save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = object_name.replace("/", "_").replace(" ", "_")
+    overlay = make_candidate_overlay(image_pil, candidates)
+    output_path = out_dir / f"detection_candidates_{safe_name}_overlay.png"
+    overlay.save(output_path)
+    return output_path
+
+
+def make_candidate_overlay(image_pil: Image.Image, candidates: List[Dict[str, object]]) -> Image.Image:
+    overlay = image_pil.copy().convert("RGB")
+    draw = ImageDraw.Draw(overlay)
+    colors = ["red", "lime", "cyan", "yellow", "magenta", "orange", "white", "blue"]
+    for idx, candidate in enumerate(candidates):
+        box = clamp_box_to_image(candidate["box2d"], image_pil.size)
+        color = colors[idx % len(colors)]
+        draw_labeled_box(draw, box, color, width=4)
+        label = str(idx)
+        x1, y1 = box[0], box[1]
+        draw.rectangle([x1, y1, x1 + 34, y1 + 28], fill="black")
+        draw.text((x1 + 8, y1 + 5), label, fill=color)
+    return overlay
+
+
+
+def draw_labeled_box(draw: ImageDraw.ImageDraw, box: List[int], color: str, width: int = 4) -> None:
+    for offset in range(width):
+        draw.rectangle(
+            [box[0] + offset, box[1] + offset, box[2] - offset, box[3] - offset],
+            outline=color,
+        )
+
+def maybe_fallback_mask(
+    image_pil: Image.Image,
+    object_name: str,
+    box2d: List[int],
+    mask,
+) -> Tuple[Any, Optional[str]]:
+    if is_area_object(object_name):
+        return mask, None
+
+    width, height = image_pil.size
+    box = clamp_box_to_image(box2d, image_pil.size)
+    area_ratio = box_area(box) / float(max(1, width * height))
+    box_w = max(0, box[2] - box[0])
+    box_h = max(0, box[3] - box[1])
+    width_ratio = box_w / float(max(1, width))
+    height_ratio = box_h / float(max(1, height))
+    mask_area = int((mask > 0.5).sum())
+    box_area_value = max(1, box_area(box))
+    mask_box_ratio = mask_area / float(box_area_value)
+
+    reason = None
+    if area_ratio > 0.35 or width_ratio > 0.78 or height_ratio > 0.78:
+        reason = "entity_box_too_large"
+    elif mask_box_ratio > 0.9 and area_ratio > 0.30:
+        reason = "entity_mask_too_broad"
+
+    if reason is None:
+        return mask, None
+    return central_box_mask(image_pil, box), reason
+
+
+def central_box_mask(image_pil: Image.Image, box: List[int]):
+    import numpy as np
+
+    mask = np.zeros((image_pil.height, image_pil.width), dtype=np.float32)
+    x1, y1, x2, y2 = box
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    cx1 = x1 + int(w * 0.25)
+    cx2 = x2 - int(w * 0.25)
+    cy1 = y1 + int(h * 0.25)
+    cy2 = y2 - int(h * 0.25)
+    if cx1 >= cx2 or cy1 >= cy2:
+        mask[y1:y2, x1:x2] = 1.0
+    else:
+        mask[cy1:cy2, cx1:cx2] = 1.0
+    return mask
+
+
+def overlap_warnings(object_name: str, box2d: List[int], selected_boxes: Dict[str, List[int]]) -> List[Dict[str, object]]:
+    warnings = []
+    for selected_name, selected_box in selected_boxes.items():
+        overlap = box_iou(box2d, selected_box)
+        if selected_name == object_name:
+            continue
+        if overlap > 0.55 and (is_area_object(object_name) or is_area_object(selected_name)):
+            warnings.append({"object": selected_name, "iou": float(overlap)})
+    return warnings
+
+
 def summarize_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
     summary = []
     for candidate in candidates:
@@ -289,17 +529,26 @@ def summarize_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, 
             item["score"] = float(candidate["score"])
         if "phrase" in candidate:
             item["phrase"] = candidate["phrase"]
+        if "rank_score" in candidate:
+            item["rank_score"] = float(candidate["rank_score"])
+        if "rank_reasons" in candidate:
+            item["rank_reasons"] = list(candidate["rank_reasons"])
         summary.append(item)
     return summary
 
 
 def parse_candidate_index(response: object, num_candidates: int) -> int:
+    selected = parse_candidate_index_or_none(response, num_candidates)
+    return 0 if selected is None else selected
+
+
+def parse_candidate_index_or_none(response: object, num_candidates: int) -> Optional[int]:
     match = re.search(r"\d+", str(response))
     if not match:
-        return 0
+        return None
     idx = int(match.group(0))
     if idx < 0 or idx >= num_candidates:
-        return 0
+        return None
     return idx
 
 
