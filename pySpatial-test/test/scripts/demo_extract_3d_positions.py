@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -12,24 +13,137 @@ REPO_TEST_DIR = Path(__file__).resolve().parents[1]
 if str(REPO_TEST_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_TEST_DIR))
 
-from object_3d_extraction import Object3DLocator
+from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.utils import extract_object_names_from_question_options
 
 
+class QwenVLRefinementModel:
+    def __init__(self, model_path: str, device: str = "cuda"):
+        from transformers import AutoProcessor
+
+        model_cls = _resolve_qwen_vl_model_class()
+        self.device = device
+        self.processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        self.model = model_cls.from_pretrained(
+            model_path,
+            torch_dtype="auto",
+            device_map="auto" if device == "cuda" else device,
+            trust_remote_code=True,
+        )
+
+    def process_messages(self, messages, max_new_tokens=32, do_sample=False, temperature=0.0):
+        from qwen_vl_utils import process_vision_info
+
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self.model.device)
+        generated_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+        )
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        return self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+
+
+
+def _resolve_qwen_vl_model_class():
+    import transformers
+
+    candidates = [
+        "Qwen2_5_VLForConditionalGeneration",
+        "AutoModelForVision2Seq",
+        "AutoModelForImageTextToText",
+        "AutoModelForCausalLM",
+    ]
+    for name in candidates:
+        model_cls = getattr(transformers, name, None)
+        if model_cls is not None:
+            return model_cls
+    raise ImportError(
+        "No compatible Qwen-VL model class found in transformers. "
+        "Please install a transformers version that supports Qwen2.5-VL or AutoModelForVision2Seq."
+    )
+
+def build_vlm_refinement_model(args):
+    if not args.use_vlm_refinement:
+        return None
+    print("Loading Qwen2.5-VL refinement model from {}...".format(args.vlm_model_path))
+    return QwenVLRefinementModel(args.vlm_model_path, device=args.device)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract 3D object positions from MindCube samples.")
+    parser = argparse.ArgumentParser(description="Extract 3D object positions from Omni3D-Bench samples.")
     parser.add_argument("--image", default=None, help="Optional image path override.")
+    parser.add_argument(
+        "--dataset_json",
+        default="/data/datasets/Omni3D-Bench/annotations.json",
+        help="Path to Omni3D-Bench annotations JSON.",
+    )
+    parser.add_argument(
+        "--image_root",
+        default="/data/datasets/Omni3D-Bench/images",
+        help="Root directory for Omni3D-Bench image_filename paths.",
+    )
     parser.add_argument("--sample_json", default=None, help="Path to one JSON sample file.")
     parser.add_argument("--jsonl", default=None, help="Path to a MindCube JSONL file.")
     parser.add_argument("--sample_id", default=None, help="Sample id to select from --jsonl.")
     parser.add_argument("--sample_index", type=int, default=None, help="Sample index to select from --jsonl.")
-    parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of JSONL samples to run.")
+    parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to run.")
     parser.add_argument(
         "--base_data_path",
         default=None,
         help="Base path for relative sample image paths when --image is not provided.",
     )
     parser.add_argument("--device", default="cuda", help="Device for model inference, e.g. cuda or cpu.")
+    parser.add_argument(
+        "--box_threshold",
+        type=float,
+        default=0.05,
+        help="GroundingDINO box threshold. Omni3D-Bench uses APC-VLM-style low-threshold recall.",
+    )
+    parser.add_argument(
+        "--text_threshold",
+        type=float,
+        default=0.05,
+        help="GroundingDINO text threshold. Omni3D-Bench uses APC-VLM-style low-threshold recall.",
+    )
+    parser.add_argument(
+        "--use_vlm_refinement",
+        action="store_true",
+        default=True,
+        help="Enable APC-VLM-style Qwen-VL refinement.",
+    )
+    parser.add_argument(
+        "--vlm_model_path",
+        default="/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct",
+        help="Local Qwen2.5-VL model path for detection candidate refinement.",
+    )
+    parser.add_argument(
+        "--no_vlm_refinement",
+        action="store_false",
+        dest="use_vlm_refinement",
+        help="Disable VLM refinement and use rule-based candidate ranking.",
+    )
     parser.add_argument(
         "--save_dir",
         default="outputs/object_3d_extraction",
@@ -65,12 +179,36 @@ def load_samples(args: argparse.Namespace):
             raise ValueError("sample_index out of range: {}".format(args.sample_index))
         return samples
 
-    return []
+    with open(args.dataset_json, "r", encoding="utf-8") as f:
+        dataset = json.load(f)
+
+    samples = dataset.get("questions", [])
+    if args.sample_id is not None:
+        for sample in samples:
+            if get_sample_key(sample, 0) == args.sample_id:
+                return [sample]
+        raise ValueError("sample_id not found in dataset_json: {}".format(args.sample_id))
+
+    if args.sample_index is not None:
+        if args.sample_index < 0 or args.sample_index >= len(samples):
+            raise ValueError("sample_index out of range: {}".format(args.sample_index))
+        return [samples[args.sample_index]]
+
+    if args.max_samples is not None:
+        samples = samples[: args.max_samples]
+    return samples
 
 
 def resolve_image_path(args: argparse.Namespace, sample) -> str:
     if args.image:
         return args.image
+
+    image_filename = sample.get("image_filename")
+    if image_filename:
+        image_path = Path(image_filename)
+        if image_path.is_absolute():
+            return str(image_path)
+        return str(Path(args.image_root) / image_path)
 
     images = sample.get("images") or []
     if not images:
@@ -86,12 +224,106 @@ def resolve_image_path(args: argparse.Namespace, sample) -> str:
     return str(Path(args.base_data_path) / image_path)
 
 
+def get_sample_key(sample, fallback_index: int) -> str:
+    if "question_index" in sample:
+        return "omni3d_{}".format(sample["question_index"])
+    return sample.get("id", "sample_{}".format(fallback_index))
+
+
 def resolve_object_names(sample) -> list:
     question = sample.get("question", "")
     object_names = extract_object_names_from_question_options(question)
+    if not object_names or any(_looks_like_non_object_phrase(name) for name in object_names):
+        object_names = extract_object_names_from_omni3d_question(question)
     if not object_names:
         raise ValueError("Could not extract object names from sample question/options")
     return object_names
+
+
+def extract_object_names_from_omni3d_question(question: str) -> list:
+    names = []
+    options_match = re.search(r"Options:\s*\{([^}]+)\}", question, flags=re.IGNORECASE)
+    if options_match:
+        names.extend(part.strip().lower() for part in options_match.group(1).split(","))
+
+    question_without_options = re.sub(r"Options:\s*\{[^}]+\}", "", question, flags=re.IGNORECASE)
+    article_pattern = re.compile(
+        r"\b(?:the|a|an)\s+(.+?)(?=\s+(?:is|are|was|were|would|will|could|should|to|of|on|in|under|above|below|behind|before|after|from|with|towards|than|or|and|as|directly|right|left|front|back)\b|[?,.]|$)",
+        flags=re.IGNORECASE,
+    )
+    for match in article_pattern.findall(question_without_options):
+        cleaned = _clean_omni3d_object_name(match)
+        if cleaned and not _looks_like_non_object_phrase(cleaned):
+            names.append(cleaned)
+
+    return _dedupe_preserve_order(names)
+
+
+def _clean_omni3d_object_name(text: str) -> str:
+    text = text.strip().lower()
+    text = text.replace("left-most", "leftmost").replace("top-most", "topmost")
+    text = re.sub(r"\s+", " ", text)
+    text = text.split(":", 1)[0]
+    text = re.split(
+        r"\b(?:would|will|could|should|do|does|did|have to|still|large enough|directly|without|first)\b",
+        text,
+        maxsplit=1,
+    )[0]
+    text = re.sub(r"^(combined|same|double)\s+", "", text)
+    text = re.sub(r"\s+(?:in meters|in centimeters|in kilometers|on top of each other).*$", "", text)
+    return text.strip(" \"'`({[])}.,;:!?")
+
+
+def _looks_like_non_object_phrase(text: str) -> bool:
+    text = str(text).strip().lower()
+    if not text:
+        return True
+    measurement_heads = {
+        "ratio",
+        "height",
+        "width",
+        "length",
+        "radius",
+        "volume",
+        "distance",
+        "color",
+        "number",
+        "objects",
+        "object",
+        "one",
+    }
+    non_objects = {
+        "left",
+        "right",
+        "front",
+        "back",
+        "behind",
+        "above",
+        "below",
+        "up",
+        "down",
+        "yes",
+        "no",
+        "same",
+    }
+    first_word = text.split()[0]
+    return (
+        text in non_objects
+        or first_word in measurement_heads
+        or " of the " in text
+        or " of a " in text
+        or len(text.split()) > 6
+    )
+
+
+def _dedupe_preserve_order(names: list) -> list:
+    seen = set()
+    output = []
+    for name in names:
+        if name and name not in seen:
+            seen.add(name)
+            output.append(name)
+    return output
 
 
 def write_sample_json(sample_dir: Path, sample_key: str, record: dict) -> Path:
@@ -107,32 +339,39 @@ def main() -> None:
     args = parse_args()
     samples = load_samples(args)
     if not samples:
-        raise ValueError("--sample_json or --jsonl must be provided")
+        raise ValueError("No samples found in --dataset_json, --sample_json, or --jsonl")
 
-    locator = Object3DLocator(device=args.device)
+    config = Object3DExtractionConfig()
+    config.detection.box_threshold = args.box_threshold
+    config.detection.text_threshold = args.text_threshold
+    config.detection.use_vlm_refinement = args.use_vlm_refinement
+    vlm_model = build_vlm_refinement_model(args)
+    locator = Object3DLocator(config=config, device=args.device, vlm_model=vlm_model)
     output_root = Path(args.save_dir)
     written_files = []
 
     for idx, sample in enumerate(samples):
-        sample_key = sample.get("id", "sample_{}".format(idx))
-        image = resolve_image_path(args, sample)
-        object_names = resolve_object_names(sample)
-        print(
-            "[{}/{}] {} objects: {}".format(
-                idx + 1,
-                len(samples),
-                sample_key,
-                json.dumps(object_names, ensure_ascii=False),
-            )
-        )
-
+        sample_key = get_sample_key(sample, idx)
         sample_save_dir = output_root / sample_key
+        image = None
+        object_names = []
         try:
+            image = resolve_image_path(args, sample)
+            object_names = resolve_object_names(sample)
+            print(
+                "[{}/{}] {} objects: {}".format(
+                    idx + 1,
+                    len(samples),
+                    sample_key,
+                    json.dumps(object_names, ensure_ascii=False),
+                )
+            )
             result = locator.extract(
                 image=image,
                 object_names=object_names,
                 visualize=not args.no_visualize,
                 save_dir=sample_save_dir,
+                question=sample.get("question", ""),
             )
             record = {
                 "sample_id": sample_key,

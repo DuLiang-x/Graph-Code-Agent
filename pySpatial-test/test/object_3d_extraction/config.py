@@ -18,9 +18,10 @@ class GroundingDINOConfig:
         Path(os.environ.get("GROUNDINGDINO_CKPT", DEFAULT_CHECKPOINT_DIR / "groundingdino_swint_ogc.pth"))
     )
     config_path: Optional[str] = os.environ.get("GROUNDINGDINO_CONFIG")
-    box_threshold: float = 0.35
-    text_threshold: float = 0.25
+    box_threshold: float = 0.05
+    text_threshold: float = 0.05
     num_candidates: int = 5
+    use_vlm_refinement: bool = False
 
 
 @dataclass

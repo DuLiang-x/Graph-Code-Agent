@@ -60,6 +60,7 @@ class DetectionModule:
 
         transform = GT.Compose(
             [
+                GT.RandomResize([800], max_size=1333),
                 GT.ToTensor(),
                 GT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
