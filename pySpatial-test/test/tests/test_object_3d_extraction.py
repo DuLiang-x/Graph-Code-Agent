@@ -196,6 +196,28 @@ def test_save_debug_visuals_writes_sam_and_final_overlays(tmpdir):
     assert tmpdir.join("white_coffee_table_overlay.png").check()
 
 
+def test_extract_visualize_writes_3d_debug_panel(tmpdir):
+    locator = make_locator(
+        {"chair": [{"box2d": [4, 4, 12, 12], "score": 0.9}]},
+        mask_fallback_mode="off",
+    )
+    image = Image.new("RGB", (16, 16), color="white")
+
+    result = locator.extract(
+        image,
+        ["chair"],
+        visualize=True,
+        save_dir=str(tmpdir),
+        question="Where is the chair?",
+    )
+
+    assert "chair" in result
+    assert tmpdir.join("3d_aabb.png").check()
+    assert tmpdir.join("3d_debug_panel.png").check()
+    assert locator.last_3d_visualization_paths["aabb_vis_path"].endswith("3d_aabb.png")
+    assert locator.last_3d_visualization_paths["panel_path"].endswith("3d_debug_panel.png")
+
+
 def test_unproject_returns_3d_box_fields():
     image = Image.new("RGB", (8, 8), color="white")
     depth = np.ones((8, 8), dtype=np.float32)

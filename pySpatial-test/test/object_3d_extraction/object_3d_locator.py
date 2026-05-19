@@ -32,6 +32,7 @@ class Object3DLocator:
         self.depth_module = depth_module or DepthModule(self.config, device=device)
         self.orientation_module = orientation_module or OrientationModule(self.config, device=device)
         self.vlm_model = vlm_model
+        self.last_3d_visualization_paths = None
 
     def extract(
         self,
@@ -160,6 +161,21 @@ class Object3DLocator:
                         sam_mask=sam_mask,
                         mask_used_for_3d=mask_used_for_3d,
                     )
+
+        if visualize and save_dir is not None:
+            panel_question = question or "Objects: " + ", ".join(names)
+            try:
+                from .visualize_3d_aabb import visualize_3d_debug_panel
+
+                self.last_3d_visualization_paths = visualize_3d_debug_panel(
+                    image_path_or_pil=image_pil,
+                    question=panel_question,
+                    results=results,
+                    save_dir=str(save_dir),
+                    prefix="3d_debug",
+                )
+            except Exception as exc:
+                print(f"[WARN] Failed to create 3D debug panel: {exc}")
 
         return results
 
