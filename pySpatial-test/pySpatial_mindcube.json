@@ -1,0 +1,218 @@
+{
+  "processing_timestamp": "2026-04-19T23:23:33.229634",
+  "jsonl_source": "/data/datasets/MindCube/data/raw/MindCube_tinybench.jsonl",
+  "processing_time_seconds": 61.18,
+  "avg_time_per_entry": 6.12,
+  "num_processes_used": 1,
+  "overall_metrics": {
+    "total_count": 10,
+    "parse_rate": 100.0,
+    "execution_rate": 100.0,
+    "answer_generation_rate": 100.0,
+    "correctness_rate": 50.0,
+    "error_rate": 0.0,
+    "evaluable_count": 10,
+    "error_count": 0
+  },
+  "type_metrics": {
+    "among": {
+      "count": 10.0,
+      "parse_rate": 100.0,
+      "execution_rate": 100.0,
+      "answer_generation_rate": 100.0,
+      "correctness_rate": 50.0,
+      "error_rate": 0.0,
+      "evaluable_count": 10.0,
+      "error_count": 0.0
+    }
+  },
+  "raw_statistics": {
+    "among": {
+      "total": 10.0,
+      "parse_success": 10.0,
+      "execution_success": 10.0,
+      "answer_generation_success": 10.0,
+      "correct_answers": 5.0,
+      "evaluable_answers": 10.0,
+      "errors": 0.0
+    }
+  },
+  "results": [
+    {
+      "scene_id": "among_group693_q1_5_2",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the black sneaker from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: From the viewpoint presented in image 2, what is to the right of the black sneaker? A. TV B. Wooden dining table C. Light purple sofa D. Brown curtains and windows",
+      "images": [
+        "other_all_image/among/shoe_216/front_007.jpg",
+        "other_all_image/among/shoe_216/left_084.jpg",
+        "other_all_image/among/shoe_216/back_157.jpg",
+        "other_all_image/among/shoe_216/right_246.jpg"
+      ],
+      "expected_answer": "C",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "C. Light purple sofa",
+      "answer_correct": true,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_group458_q0_2_3",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the pink bottle from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: If I am standing at the same spot and facing the same direction as shown in image 1, then I turn right and move forward, will I get closer to the pink plush toy and headboard? A. Yes B. No",
+      "images": [
+        "other_all_image/among/bottle_211/front_022.jpg",
+        "other_all_image/among/bottle_211/left_083.jpg",
+        "other_all_image/among/bottle_211/back_157.jpg",
+        "other_all_image/among/bottle_211/right_256.jpg"
+      ],
+      "expected_answer": "A",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "B. No",
+      "answer_correct": false,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_group603_q1_1_2",
+      "scene_type": "among",
+      "question": "Based on these two views showing the same scene: in which direction did I move from the first view to the second view? A. Directly left B. Diagonally forward and right C. Directly right D. Diagonally forward and left",
+      "images": [
+        "other_all_image/among/detergent_091/left_172.jpg",
+        "other_all_image/among/detergent_091/front_268.jpg"
+      ],
+      "expected_answer": "B",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "None of the above. The question does not match the provided visual clue.",
+      "answer_correct": true,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_group603_q1_2_2",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the red bottle from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: If I am standing at the same spot and facing the same direction as shown in image 2, then I turn left and move forward, will I get closer to the TV and electric fan? A. No B. Yes",
+      "images": [
+        "other_all_image/among/detergent_091/front_268.jpg",
+        "other_all_image/among/detergent_091/left_172.jpg",
+        "other_all_image/among/detergent_091/back_112.jpg",
+        "other_all_image/among/detergent_091/right_068.jpg"
+      ],
+      "expected_answer": "B",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "A. No",
+      "answer_correct": false,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_35122ec333dc84cf223ea366c3ad968dfece8ca02e57a8c241819837583f76f0_q2_2_1",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the table with black clothes from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: If I am standing at the same spot and facing the same direction as shown in image 3, what is behind me? A. Classroom seating area B. Lectern C. White board D. Door",
+      "images": [
+        "other_all_image/among/35122ec333dc84cf223ea366c3ad968dfece8ca02e57a8c241819837583f76f0/front_138.png",
+        "other_all_image/among/35122ec333dc84cf223ea366c3ad968dfece8ca02e57a8c241819837583f76f0/left_169.png",
+        "other_all_image/among/35122ec333dc84cf223ea366c3ad968dfece8ca02e57a8c241819837583f76f0/back_192.png",
+        "other_all_image/among/35122ec333dc84cf223ea366c3ad968dfece8ca02e57a8c241819837583f76f0/right_218.png"
+      ],
+      "expected_answer": "C",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "A. Classroom seating area",
+      "answer_correct": true,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_group693_q1_1_2",
+      "scene_type": "among",
+      "question": "Based on these two views showing the same scene: in which direction did I move from the first view to the second view? A. Diagonally forward and left B. Directly right C. Directly left D. Diagonally forward and right",
+      "images": [
+        "other_all_image/among/shoe_216/left_084.jpg",
+        "other_all_image/among/shoe_216/front_007.jpg"
+      ],
+      "expected_answer": "D",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "None of the options provided match the context of the question. The question seems unrelated to the visual clue about code generation errors. Please provide a relevant question or clarify the context.",
+      "answer_correct": true,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_group676_q2_2_3",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the black sneaker from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: If I am standing at the same spot and facing the same direction as shown in image 3, then I turn right and move forward, will I get closer to the curtain? A. Yes B. No",
+      "images": [
+        "other_all_image/among/shoe_164/front_350.jpg",
+        "other_all_image/among/shoe_164/left_079.jpg",
+        "other_all_image/among/shoe_164/back_179.jpg",
+        "other_all_image/among/shoe_164/right_247.jpg"
+      ],
+      "expected_answer": "A",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "B. No",
+      "answer_correct": false,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_group279_q1_2_3",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the yellow ball from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: If I am standing at the same spot and facing the same direction as shown in image 2, then I turn right and move forward, will I get closer to the wall? A. No B. Yes",
+      "images": [
+        "other_all_image/among/ball_543/front_036.jpg",
+        "other_all_image/among/ball_543/left_091.jpg",
+        "other_all_image/among/ball_543/back_163.jpg",
+        "other_all_image/among/ball_543/right_229.jpg"
+      ],
+      "expected_answer": "B",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "B. Yes",
+      "answer_correct": true,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_group738_q2_2_1",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the toy train from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: If I am standing at the same spot and facing the same direction as shown in image 3, what is behind me? A. Window B. Printed glass door C. Wall D. Black table",
+      "images": [
+        "other_all_image/among/train_037/front_020.jpg",
+        "other_all_image/among/train_037/left_087.jpg",
+        "other_all_image/among/train_037/back_147.jpg",
+        "other_all_image/among/train_037/right_202.jpg"
+      ],
+      "expected_answer": "B",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "C. Wall",
+      "answer_correct": false,
+      "fallback_used": false
+    },
+    {
+      "scene_id": "among_78d7c094e9caf11f01b33337cc3697724731f15c54e516153694faa0f8101a7e_q1_2_1",
+      "scene_type": "among",
+      "question": "Based on these four images (image 1, 2, 3, and 4) showing the blue table from different viewpoints (front, left, back, and right), with each camera aligned with room walls and partially capturing the surroundings: If I am standing at the same spot and facing the same direction as shown in image 2, what is behind me? A. Wall with an air conditioning unit B. Plain white wall C. Sofa D. Seating bench",
+      "images": [
+        "other_all_image/among/78d7c094e9caf11f01b33337cc3697724731f15c54e516153694faa0f8101a7e/front_150.png",
+        "other_all_image/among/78d7c094e9caf11f01b33337cc3697724731f15c54e516153694faa0f8101a7e/left_174.png",
+        "other_all_image/among/78d7c094e9caf11f01b33337cc3697724731f15c54e516153694faa0f8101a7e/back_198.png",
+        "other_all_image/among/78d7c094e9caf11f01b33337cc3697724731f15c54e516153694faa0f8101a7e/right_222.png"
+      ],
+      "expected_answer": "D",
+      "parse_success": true,
+      "execution_success": true,
+      "answer_generation_success": true,
+      "generated_answer": "B. Plain white wall",
+      "answer_correct": false,
+      "fallback_used": false
+    }
+  ]
+}
