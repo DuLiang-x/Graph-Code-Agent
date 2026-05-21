@@ -7,13 +7,31 @@ TEST_ROOT = Path(__file__).resolve().parents[1]
 if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
-from object_3d_extraction.visualize_3d_aabb import render_3d_aabb_scene, visualize_3d_debug_panel
+from object_3d_extraction.visualize_3d_aabb import (
+    _object_debug_row_height,
+    _object_debug_thumb_size,
+    _plot_box_corners,
+    _sort_3d_objects_for_drawing,
+    _valid_3d_objects,
+    render_3d_aabb_scene,
+    visualize_3d_debug_panel,
+)
 
 
-def _image(tmpdir):
+def _image(tmpdir, size=(160, 100)):
     path = Path(str(tmpdir)) / "input.jpg"
-    Image.new("RGB", (160, 100), color=(230, 235, 240)).save(path)
+    Image.new("RGB", size, color=(230, 235, 240)).save(path)
     return path
+
+
+def _write_object_debug_images(tmpdir, object_name, size=(80, 60)):
+    safe_name = object_name.replace("/", "_").replace(" ", "_")
+    for suffix, color in [
+        ("_box.png", (255, 0, 0)),
+        ("_mask.png", (0, 255, 0)),
+        ("_overlay.png", (0, 0, 255)),
+    ]:
+        Image.new("RGB", size, color=color).save(Path(str(tmpdir)) / f"{safe_name}{suffix}")
 
 
 def _assert_outputs(paths):
@@ -72,6 +90,39 @@ def test_visualization_without_fallback_fields(tmpdir):
     paths = visualize_3d_debug_panel(_image(tmpdir), "Question", _base_results(), str(tmpdir))
 
     _assert_outputs(paths)
+
+
+def test_visualization_with_answer(tmpdir):
+    paths = visualize_3d_debug_panel(_image(tmpdir), "Question", _base_results(), str(tmpdir), answer="A. carpet")
+
+    _assert_outputs(paths)
+
+
+def test_visualization_with_object_debug_images(tmpdir):
+    _write_object_debug_images(tmpdir, "white coffee table")
+    _write_object_debug_images(tmpdir, "carpet")
+
+    paths = visualize_3d_debug_panel(_image(tmpdir), "Question", _base_results(), str(tmpdir), answer="carpet")
+
+    _assert_outputs(paths)
+    with Image.open(paths["panel_path"]) as image:
+        assert image.size[0] == 1400
+        assert image.size[1] > 1260
+
+
+def test_object_debug_images_use_half_input_image_size(tmpdir):
+    input_size = (400, 240)
+    expected_thumb_size = (200, 120)
+    _write_object_debug_images(tmpdir, "white coffee table", size=input_size)
+    _write_object_debug_images(tmpdir, "carpet", size=input_size)
+
+    paths = visualize_3d_debug_panel(_image(tmpdir, size=input_size), "Question", _base_results(), str(tmpdir))
+
+    _assert_outputs(paths)
+    assert _object_debug_thumb_size(input_size) == expected_thumb_size
+    with Image.open(paths["panel_path"]) as image:
+        expected_object_height = 42 + 2 * _object_debug_row_height(expected_thumb_size) + 10
+        assert image.size[1] == 420 + expected_object_height + 780 + 120
 
 
 def test_visualization_with_partial_fallback_fields(tmpdir):
@@ -165,9 +216,24 @@ def test_visualization_with_suspended_object(tmpdir):
 
 
 
+def test_3d_objects_draw_floor_like_then_far_to_near():
+    ordered = _sort_3d_objects_for_drawing(_valid_3d_objects(_base_results()))
+
+    assert [obj["name"] for obj in ordered] == ["carpet", "white coffee table"]
+
+
 def test_render_3d_aabb_scene_default_is_floor_plan(tmpdir):
     output = Path(str(tmpdir)) / "default.png"
 
     render_3d_aabb_scene(_base_results(), str(output))
 
     _assert_outputs({"default": str(output)})
+
+
+def test_floor_like_box_is_displayed_below_table_box():
+    objects = {obj["name"]: obj for obj in _valid_3d_objects(_base_results())}
+
+    carpet_top = max(point[2] for point in _plot_box_corners(objects["carpet"]))
+    table_bottom = min(point[2] for point in _plot_box_corners(objects["white coffee table"]))
+
+    assert carpet_top < table_bottom

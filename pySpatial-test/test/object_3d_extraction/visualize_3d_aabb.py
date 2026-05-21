@@ -29,6 +29,13 @@ PLOT_X_SCALE = 2.2
 PLOT_FORWARD_SCALE = 2.2
 PLOT_HEIGHT_SCALE = 1.15
 MIN_FOOTPRINT_DISPLAY_SIZE = 0.16
+OBJECT_DEBUG_LABEL_WIDTH = 190
+OBJECT_DEBUG_THUMB_GAP = 12
+OBJECT_DEBUG_ROW_GAP = 10
+OBJECT_DEBUG_HEADER_HEIGHT = 26
+OBJECT_DEBUG_MIN_ROW_HEIGHT = 100
+FLOOR_DISPLAY_OFFSET = 0.025
+FLOOR_DISPLAY_THICKNESS = 0.025
 
 
 # The extracted 3D points are in the current camera coordinate system:
@@ -83,8 +90,9 @@ def render_3d_aabb_scene(
         _draw_3d_floor_grid(ax, floor_y, floor_bounds)
         plot_points.extend(_floor_plot_points(floor_y, floor_bounds))
 
+    draw_objects = _sort_3d_objects_for_drawing(objects)
     legend_handles = []
-    for idx, obj in enumerate(objects):
+    for idx, obj in enumerate(draw_objects):
         color = OBJECT_COLORS[idx % len(OBJECT_COLORS)]
         corners = _plot_box_corners(obj)
         plot_points.extend(corners)
@@ -117,17 +125,27 @@ def compose_question_image_3d_visualization(
     question: str,
     aabb_vis_path: str,
     output_path: str,
+    answer: str = "",
+    results: Optional[dict] = None,
+    debug_dir: Optional[str] = None,
     canvas_width: int = 1400,
 ) -> str:
-    """Compose question text, input image, and the 3D AABB render into one panel."""
+    """Compose question text, input image, object debug crops, and the 3D AABB render."""
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    top_height = 420
-    bottom_height = 780
+    source_image = _load_image(image_path_or_pil)
+    object_debug_size = _object_debug_thumb_size(source_image.size)
+    canvas_width = max(canvas_width, _min_canvas_width_for_object_debug(object_debug_size))
+
+    top_height = 600
     padding = 30
     gap = 20
-    canvas_height = top_height + bottom_height + padding * 3
+    object_rows = _count_object_debug_rows(results or {}, debug_dir)
+    object_row_height = _object_debug_row_height(object_debug_size)
+    object_height = max(180, 42 + object_rows * object_row_height + max(0, object_rows - 1) * OBJECT_DEBUG_ROW_GAP)
+    bottom_height = 850
+    canvas_height = top_height + object_height + bottom_height + padding * 4
     left_width = int(canvas_width * 0.42)
     right_width = canvas_width - left_width - padding * 2 - gap
     bottom_width = canvas_width - padding * 2
@@ -136,19 +154,26 @@ def compose_question_image_3d_visualization(
     draw = ImageDraw.Draw(canvas)
     title_font = _load_font(26, bold=True)
     body_font = _load_font(22)
+    small_font = _load_font(16)
 
     question_box = (padding, padding, left_width, top_height)
     image_box = (padding + left_width + gap, padding, right_width, top_height)
-    aabb_box = (padding, padding + top_height + gap, bottom_width, bottom_height)
+    object_box = (padding, padding + top_height + gap, bottom_width, object_height)
+    aabb_box = (padding, object_box[1] + object_height + gap, bottom_width, bottom_height)
 
     _draw_section_title(draw, "Question", question_box[0], question_box[1], title_font)
-    wrapped = _wrap_and_truncate_text(question or "", body_font, question_box[2] - 12, question_box[3] - 58)
+    question_text = question or ""
+    if answer:
+        question_text = f"{question_text}\n\nAnswer\n{answer}"
+    wrapped = _wrap_and_truncate_text(question_text, body_font, question_box[2] - 12, question_box[3] - 58)
     draw.multiline_text((question_box[0], question_box[1] + 42), wrapped, fill=(30, 30, 30), font=body_font, spacing=6)
 
     _draw_section_title(draw, "Input Image", image_box[0], image_box[1], title_font)
-    image = _load_image(image_path_or_pil)
-    image = _fit_image(image, image_box[2], image_box[3] - 42)
+    image = _fit_image(source_image, image_box[2], image_box[3] - 42)
     canvas.paste(image, (image_box[0] + (image_box[2] - image.width) // 2, image_box[1] + 42 + (image_box[3] - 42 - image.height) // 2))
+
+    _draw_section_title(draw, "Object Debug Images", object_box[0], object_box[1], title_font)
+    _draw_object_debug_images(canvas, draw, results or {}, debug_dir, object_box, small_font, object_debug_size)
 
     _draw_section_title(draw, "3D AABB Visualization", aabb_box[0], aabb_box[1], title_font)
     aabb_image = Image.open(aabb_vis_path).convert("RGB")
@@ -165,6 +190,7 @@ def visualize_3d_debug_panel(
     results: dict,
     save_dir: str,
     prefix: str = "3d_debug",
+    answer: str = "",
 ) -> dict:
     """Create the workflow debug outputs: 3d_aabb.png and 3d_debug_panel.png."""
     save_path = Path(save_dir)
@@ -172,7 +198,15 @@ def visualize_3d_debug_panel(
     aabb_path = save_path / "3d_aabb.png"
     panel_path = save_path / f"{prefix}_panel.png"
     render_3d_aabb_scene(results, str(aabb_path))
-    compose_question_image_3d_visualization(image_path_or_pil, question, str(aabb_path), str(panel_path))
+    compose_question_image_3d_visualization(
+        image_path_or_pil,
+        question,
+        str(aabb_path),
+        str(panel_path),
+        answer=answer,
+        results=results,
+        debug_dir=str(save_path),
+    )
     return {"aabb_vis_path": str(aabb_path), "panel_path": str(panel_path)}
 
 
@@ -188,6 +222,24 @@ def _valid_3d_objects(results: dict) -> List[Dict[str, Any]]:
             continue
         objects.append({"name": str(name), "item": item, "box3d_min": min_pt, "box3d_max": max_pt, "position": position})
     return objects
+
+
+def _sort_3d_objects_for_drawing(objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    floor_like = [obj for obj in objects if _is_floor_like_object(obj["name"])]
+    others = [obj for obj in objects if not _is_floor_like_object(obj["name"])]
+    floor_like.sort(key=lambda obj: obj["name"].lower())
+    others.sort(key=_object_forward_depth, reverse=True)
+    return floor_like + others
+
+
+def _is_floor_like_object(name: str) -> bool:
+    lowered = name.lower()
+    return any(keyword in lowered for keyword in FLOOR_KEYWORDS)
+
+
+def _object_forward_depth(obj: Dict[str, Any]) -> float:
+    z_values = [obj["position"][2], obj["box3d_min"][2], obj["box3d_max"][2]]
+    return float(-np.mean(z_values))
 
 
 def _to_float_list(value: Any, length: int) -> Optional[List[float]]:
@@ -271,14 +323,28 @@ def _plot_height(y: float) -> float:
     return float(y) * PLOT_HEIGHT_SCALE
 
 
+def _plot_object_bottom_height(obj: Dict[str, Any]) -> float:
+    y = min(obj["box3d_min"][1], obj["box3d_max"][1])
+    if _is_floor_like_object(obj["name"]):
+        y -= FLOOR_DISPLAY_OFFSET + FLOOR_DISPLAY_THICKNESS
+    return _plot_height(y)
+
+
+def _plot_object_top_height(obj: Dict[str, Any]) -> float:
+    y = max(obj["box3d_min"][1], obj["box3d_max"][1])
+    if _is_floor_like_object(obj["name"]):
+        y = min(obj["box3d_min"][1], obj["box3d_max"][1]) - FLOOR_DISPLAY_OFFSET
+    return _plot_height(y)
+
+
 def _plot_point(point: List[float]) -> List[float]:
     return [_plot_x(point[0]), _plot_forward(point[2]), _plot_height(point[1])]
 
 
 def _plot_box_corners(obj: Dict[str, Any]) -> List[List[float]]:
     x0, x1, forward0, forward1 = _object_footprint(obj)
-    y0 = _plot_height(min(obj["box3d_min"][1], obj["box3d_max"][1]))
-    y1 = _plot_height(max(obj["box3d_min"][1], obj["box3d_max"][1]))
+    y0 = _plot_object_bottom_height(obj)
+    y1 = _plot_object_top_height(obj)
     return [
         [x0, forward0, y0], [x1, forward0, y0], [x1, forward0, y1], [x0, forward0, y1],
         [x0, forward1, y0], [x1, forward1, y0], [x1, forward1, y1], [x0, forward1, y1],
@@ -306,8 +372,8 @@ def _draw_3d_box(ax, corners: List[List[float]], color: str) -> None:
 
 
 def _draw_3d_number_label(ax, obj: Dict[str, Any], center: List[float], number: int, color: str) -> None:
-    top_z = _plot_height(max(obj["box3d_min"][1], obj["box3d_max"][1]))
-    bottom_z = _plot_height(min(obj["box3d_min"][1], obj["box3d_max"][1]))
+    top_z = _plot_object_top_height(obj)
+    bottom_z = _plot_object_bottom_height(obj)
     label_z = top_z + max(0.04, abs(top_z - bottom_z) * 0.12)
     ax.text(
         center[0], center[1], label_z, str(number),
@@ -418,6 +484,85 @@ def _style_3d_axes(ax) -> None:
     ax.tick_params(colors="#6B7280", labelsize=7, pad=2)
 
 
+def _count_object_debug_rows(results: dict, debug_dir: Optional[str]) -> int:
+    if not debug_dir:
+        return 0
+    debug_path = Path(debug_dir)
+    count = 0
+    for name, item in (results or {}).items():
+        if not isinstance(item, dict):
+            continue
+        safe_name = _safe_debug_name(str(name))
+        if any((debug_path / f"{safe_name}{suffix}").exists() for suffix in ("_box.png", "_mask.png", "_overlay.png")):
+            count += 1
+    return count
+
+
+def _draw_object_debug_images(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    results: dict,
+    debug_dir: Optional[str],
+    box: Tuple[int, int, int, int],
+    font: ImageFont.ImageFont,
+    thumb_size: Tuple[int, int],
+) -> None:
+    if not debug_dir:
+        return
+    debug_path = Path(debug_dir)
+    x, y, width, height = box
+    content_y = y + 42
+    row_height = _object_debug_row_height(thumb_size)
+    label_width = OBJECT_DEBUG_LABEL_WIDTH
+    thumb_gap = OBJECT_DEBUG_THUMB_GAP
+    thumb_width, thumb_height = thumb_size
+    columns = [("box", "_box.png"), ("sam", "_mask.png"), ("overlay", "_overlay.png")]
+
+    row = 0
+    for name, item in (results or {}).items():
+        if not isinstance(item, dict):
+            continue
+        safe_name = _safe_debug_name(str(name))
+        image_paths = [(label, debug_path / f"{safe_name}{suffix}") for label, suffix in columns]
+        if not any(path.exists() for _, path in image_paths):
+            continue
+        row_top = content_y + row * (row_height + OBJECT_DEBUG_ROW_GAP)
+        if row_top + row_height > y + height:
+            break
+        draw.text((x, row_top + 4), _truncate_line(str(name), font, label_width - 8), fill=(30, 30, 30), font=font)
+        for col_idx, (label, image_path) in enumerate(image_paths):
+            col_x = x + label_width + col_idx * (thumb_width + thumb_gap)
+            draw.text((col_x, row_top + 4), label, fill=(80, 80, 80), font=font)
+            if not image_path.exists():
+                continue
+            try:
+                thumb = Image.open(image_path).convert("RGB")
+            except Exception:
+                continue
+            thumb = _fit_image_allow_upscale(thumb, thumb_width, thumb_height)
+            paste_x = col_x + (thumb_width - thumb.width) // 2
+            paste_y = row_top + OBJECT_DEBUG_HEADER_HEIGHT + (thumb_height - thumb.height) // 2
+            canvas.paste(thumb, (paste_x, paste_y))
+        row += 1
+
+
+def _object_debug_thumb_size(image_size: Tuple[int, int]) -> Tuple[int, int]:
+    width, height = image_size
+    return (max(1, width // 4), max(1, height // 4))
+
+
+def _object_debug_row_height(thumb_size: Tuple[int, int]) -> int:
+    return max(OBJECT_DEBUG_MIN_ROW_HEIGHT, OBJECT_DEBUG_HEADER_HEIGHT + thumb_size[1])
+
+
+def _min_canvas_width_for_object_debug(thumb_size: Tuple[int, int]) -> int:
+    return 60 + OBJECT_DEBUG_LABEL_WIDTH + OBJECT_DEBUG_THUMB_GAP * 2 + 3 * thumb_size[0]
+
+
+def _safe_debug_name(name: str) -> str:
+    return name.replace("/", "_").replace(" ", "_")
+
+
 def _load_image(image_path_or_pil) -> Image.Image:
     if isinstance(image_path_or_pil, Image.Image):
         return image_path_or_pil.convert("RGB")
@@ -428,6 +573,13 @@ def _fit_image(image: Image.Image, max_width: int, max_height: int) -> Image.Ima
     image = image.copy()
     image.thumbnail((max_width, max_height), Image.LANCZOS)
     return image
+
+
+def _fit_image_allow_upscale(image: Image.Image, max_width: int, max_height: int) -> Image.Image:
+    scale = min(max_width / image.width, max_height / image.height)
+    width = max(1, int(round(image.width * scale)))
+    height = max(1, int(round(image.height * scale)))
+    return image.resize((width, height), Image.LANCZOS)
 
 
 def _draw_section_title(draw: ImageDraw.ImageDraw, title: str, x: int, y: int, font: ImageFont.ImageFont) -> None:

@@ -379,6 +379,7 @@ def main() -> None:
                 visualize=not args.no_visualize,
                 save_dir=sample_save_dir,
                 question=sample.get("question", ""),
+                answer=sample.get("answer", ""),
             )
             record = {
                 "sample_id": sample_key,

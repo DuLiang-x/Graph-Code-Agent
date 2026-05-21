@@ -41,6 +41,7 @@ class Object3DLocator:
         visualize: bool = False,
         save_dir: Optional[Union[str, Path]] = None,
         question: str = "",
+        answer: str = "",
     ) -> Dict[str, Dict[str, object]]:
         image_pil = load_rgb_image(image)
         names = validate_object_names(object_names)
@@ -173,6 +174,7 @@ class Object3DLocator:
                     results=results,
                     save_dir=str(save_dir),
                     prefix="3d_debug",
+                    answer=answer,
                 )
             except Exception as exc:
                 print(f"[WARN] Failed to create 3D debug panel: {exc}")
