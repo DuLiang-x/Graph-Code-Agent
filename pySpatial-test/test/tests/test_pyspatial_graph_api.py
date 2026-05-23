@@ -266,3 +266,68 @@ def test_extract_objects_default_cache_still_skips_wrapper(monkeypatch, tmpdir):
     result = pySpatial.extract_objects(scene, mask_fallback="auto", save_dir=str(custom_root))
 
     assert result == sample_result()
+
+
+class FakeObjectExtractor:
+    def __init__(self):
+        self.calls = []
+
+    def extract_sample(self, sample, output_root, **kwargs):
+        self.calls.append({"sample": sample, "output_root": Path(output_root), "kwargs": kwargs})
+        return {"result": sample_result()}, str(Path(output_root) / sample["id"] / "object_3d_positions.json")
+
+
+def test_extract_objects_uses_reusable_extractor_when_cache_missing(monkeypatch, tmpdir):
+    scene_id = "scene_runner_missing"
+    output_root = Path(str(tmpdir)) / "default"
+    monkeypatch.setitem(OBJECT_OUTPUT_ROOTS, "auto", output_root)
+
+    extractor = FakeObjectExtractor()
+    scene = Scene(["image.jpg"], "Where is the chair?", scene_id=scene_id)
+    result = pySpatial.extract_objects(scene, mask_fallback="auto", extractor=extractor)
+
+    assert result == sample_result()
+    assert len(extractor.calls) == 1
+    assert extractor.calls[0]["sample"]["id"] == scene_id
+    assert extractor.calls[0]["output_root"] == output_root
+
+
+def test_extract_objects_cache_hit_does_not_use_reusable_extractor(monkeypatch, tmpdir):
+    scene_id = "scene_runner_cache"
+    output_root = Path(str(tmpdir)) / "default"
+    sample_dir = output_root / scene_id
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "object_3d_positions.json").write_text(
+        json.dumps({scene_id: {"result": sample_result()}})
+    )
+    monkeypatch.setitem(OBJECT_OUTPUT_ROOTS, "auto", output_root)
+
+    extractor = FakeObjectExtractor()
+    scene = Scene(["image.jpg"], "Where is the chair?", scene_id=scene_id)
+    result = pySpatial.extract_objects(scene, mask_fallback="auto", extractor=extractor)
+
+    assert result == sample_result()
+    assert extractor.calls == []
+
+
+def test_extract_objects_force_extract_uses_reusable_extractor(monkeypatch, tmpdir):
+    scene_id = "scene_runner_force"
+    output_root = Path(str(tmpdir)) / "default"
+    sample_dir = output_root / scene_id
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "object_3d_positions.json").write_text(
+        json.dumps({scene_id: {"result": {"stale": {"position": [1, 2, 3]}}}})
+    )
+    monkeypatch.setitem(OBJECT_OUTPUT_ROOTS, "auto", output_root)
+
+    extractor = FakeObjectExtractor()
+    scene = Scene(["image.jpg"], "Where is the chair?", scene_id=scene_id)
+    result = pySpatial.extract_objects(
+        scene,
+        mask_fallback="auto",
+        extractor=extractor,
+        force_extract=True,
+    )
+
+    assert result == sample_result()
+    assert len(extractor.calls) == 1

@@ -28,8 +28,12 @@ def test_local_qwen_parse_keeps_non_choice_answer():
 
 def test_omni3d_float_and_string_evaluation():
     assert evaluate_answer_correctness("0.95", 0.948, "float")
+    assert evaluate_answer_correctness("It requires two stools to match or exceed the height of the leftmost chair", 2.0, "float")
     assert evaluate_answer_correctness(" yes. ", "yes", "str")
+    assert evaluate_answer_correctness("Yes, the fireplace would still be visible", "yes", "str")
+    assert evaluate_answer_correctness("No, the fireplace would not be visible", "no", "str")
     assert not evaluate_answer_correctness("no", "yes", "str")
+    assert not evaluate_answer_correctness("The answer is probably yes", "yes", "str")
 
 
 def test_load_omni3d_entries_builds_scene_fields(tmpdir):

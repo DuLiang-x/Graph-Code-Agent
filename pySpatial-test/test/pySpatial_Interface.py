@@ -250,17 +250,21 @@ class pySpatial:
         api_key: str = None,
         base_url: str = None,
         force_extract: bool = False,
+        extractor=None,
     ):
         if not force_extract:
             for json_path in _object_json_paths(scene, mask_fallback, save_dir=save_dir):
                 cached = _load_object_boxes_from_json(json_path, scene.scene_id)
                 if cached is not None:
+                    print(f"[{scene.scene_id}] Loaded cached object 3D positions from {json_path}")
                     scene.object_3d_boxes = cached
                     return cached
 
         from scripts.demo_extract_3d_positions import extract_objects_for_sample
 
         output_root = Path(save_dir) if save_dir else _object_output_root(mask_fallback)
+        if extractor is not None:
+            print(f"[{scene.scene_id}] Running object extraction with reusable extractor")
         record, _ = extract_objects_for_sample(
             _scene_to_sample(scene),
             output_root=output_root,
@@ -275,6 +279,7 @@ class pySpatial:
             api_model=api_model,
             api_key=api_key,
             base_url=resolve_openai_base_url(base_url),
+            extractor=extractor,
         )
         scene.object_3d_boxes = record.get("result", {})
         return scene.object_3d_boxes

@@ -135,6 +135,80 @@ def build_vlm_refinement_model(args):
     return QwenVLRefinementModel(args.vlm_model_path, device=args.device)
 
 
+class ObjectExtractionRunner:
+    def __init__(
+        self,
+        device: str = "cuda",
+        mask_fallback: str = "auto",
+        use_vlm_refinement: bool = True,
+        vlm_model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH,
+        vlm_model=None,
+        backend: str = "local_qwen",
+        api_model: str = "gpt-4.1",
+        api_key: str = None,
+        base_url: str = None,
+    ):
+        print("Initializing reusable object extractor...")
+        self.device = device
+        self.mask_fallback = mask_fallback
+        self.args = argparse.Namespace(
+            image=None,
+            image_root="/data/datasets/Omni3D-Bench/images",
+            base_data_path=None,
+            device=device,
+            box_threshold=0.05,
+            text_threshold=0.05,
+            use_vlm_refinement=use_vlm_refinement,
+            vlm_model_path=vlm_model_path,
+            mask_fallback=mask_fallback,
+        )
+        config = Object3DExtractionConfig()
+        config.detection.box_threshold = self.args.box_threshold
+        config.detection.text_threshold = self.args.text_threshold
+        config.detection.use_vlm_refinement = use_vlm_refinement
+        config.mask_fallback_mode = mask_fallback
+
+        if vlm_model is None and use_vlm_refinement:
+            if backend == "openai":
+                vlm_model = OpenAIVLRefinementModel(api_key=api_key, model=api_model, base_url=base_url)
+            else:
+                vlm_model = QwenVLRefinementModel(vlm_model_path, device=device)
+
+        self.locator = Object3DLocator(config=config, device=device, vlm_model=vlm_model)
+
+    def extract_sample(
+        self,
+        sample: dict,
+        output_root,
+        visualize: bool = True,
+        image: str = None,
+        base_data_path: str = None,
+    ):
+        args = argparse.Namespace(**vars(self.args))
+        args.image = image
+        args.base_data_path = base_data_path
+        sample_key = get_sample_key(sample, 0)
+        resolved_image = resolve_image_path(args, sample)
+        object_names = resolve_object_names(sample)
+        sample_save_dir = Path(output_root) / sample_key
+        result = self.locator.extract(
+            image=resolved_image,
+            object_names=object_names,
+            visualize=visualize,
+            save_dir=sample_save_dir,
+            question=sample.get("question", ""),
+            answer=sample.get("answer", sample.get("gt_answer", "")),
+        )
+        record = {
+            "sample_id": sample_key,
+            "image": resolved_image,
+            "objects": object_names,
+            "result": result,
+        }
+        output_path = write_sample_json(sample_save_dir, sample_key, record)
+        return record, str(output_path)
+
+
 def extract_objects_for_sample(
     sample: dict,
     output_root,
@@ -150,52 +224,35 @@ def extract_objects_for_sample(
     api_model: str = "gpt-4.1",
     api_key: str = None,
     base_url: str = None,
+    extractor=None,
 ):
-    args = argparse.Namespace(
-        image=image,
-        image_root="/data/datasets/Omni3D-Bench/images",
-        base_data_path=base_data_path,
+    if extractor is not None:
+        return extractor.extract_sample(
+            sample,
+            output_root=output_root,
+            visualize=visualize,
+            image=image,
+            base_data_path=base_data_path,
+        )
+
+    runner = ObjectExtractionRunner(
         device=device,
-        box_threshold=0.05,
-        text_threshold=0.05,
+        mask_fallback=mask_fallback,
         use_vlm_refinement=use_vlm_refinement,
         vlm_model_path=vlm_model_path,
-        mask_fallback=mask_fallback,
+        vlm_model=vlm_model,
+        backend=backend,
+        api_model=api_model,
+        api_key=api_key,
+        base_url=base_url,
     )
-    sample_key = get_sample_key(sample, 0)
-    resolved_image = resolve_image_path(args, sample)
-    object_names = resolve_object_names(sample)
-
-    config = Object3DExtractionConfig()
-    config.detection.box_threshold = args.box_threshold
-    config.detection.text_threshold = args.text_threshold
-    config.detection.use_vlm_refinement = use_vlm_refinement
-    config.mask_fallback_mode = mask_fallback
-
-    if vlm_model is None and use_vlm_refinement:
-        if backend == "openai":
-            vlm_model = OpenAIVLRefinementModel(api_key=api_key, model=api_model, base_url=base_url)
-        else:
-            vlm_model = QwenVLRefinementModel(vlm_model_path, device=device)
-
-    locator = Object3DLocator(config=config, device=device, vlm_model=vlm_model)
-    sample_save_dir = Path(output_root) / sample_key
-    result = locator.extract(
-        image=resolved_image,
-        object_names=object_names,
+    return runner.extract_sample(
+        sample,
+        output_root=output_root,
         visualize=visualize,
-        save_dir=sample_save_dir,
-        question=sample.get("question", ""),
-        answer=sample.get("answer", sample.get("gt_answer", "")),
+        image=image,
+        base_data_path=base_data_path,
     )
-    record = {
-        "sample_id": sample_key,
-        "image": resolved_image,
-        "objects": object_names,
-        "result": result,
-    }
-    output_path = write_sample_json(sample_save_dir, sample_key, record)
-    return record, str(output_path)
 
 
 def parse_args() -> argparse.Namespace:

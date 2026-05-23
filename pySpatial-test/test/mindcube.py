@@ -123,9 +123,47 @@ def normalize_answer_text(value) -> str:
     return text
 
 
+_NUMBER_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+
+
 def _extract_number(value):
-    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", str(value))
-    return float(match.group(0)) if match else None
+    text = str(value)
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
+    if match:
+        return float(match.group(0))
+    normalized = normalize_answer_text(text)
+    for token in re.findall(r"[a-z]+", normalized):
+        if token in _NUMBER_WORDS:
+            return float(_NUMBER_WORDS[token])
+    return None
+
+
+def _extract_yes_no(value):
+    normalized = normalize_answer_text(value)
+    match = re.match(r"^(yes|no)\b", normalized)
+    return match.group(1) if match else None
 
 
 def evaluate_answer_correctness(generated_answer, expected_answer, answer_type: str = None, abs_tol: float = 0.05, rel_tol: float = 0.05) -> bool:
@@ -137,7 +175,13 @@ def evaluate_answer_correctness(generated_answer, expected_answer, answer_type: 
         if expected is None or generated is None:
             return False
         return math.isclose(generated, expected, abs_tol=abs_tol, rel_tol=rel_tol)
-    return normalize_answer_text(generated_answer) == normalize_answer_text(expected_answer)
+
+    expected_text = normalize_answer_text(expected_answer)
+    if expected_text in {"yes", "no"}:
+        generated_yes_no = _extract_yes_no(generated_answer)
+        return generated_yes_no == expected_text
+
+    return normalize_answer_text(generated_answer) == expected_text
 
 
 def _load_flowchart_font(size: int, mono: bool = False):
@@ -354,6 +398,92 @@ def load_omni3d_entries(dataset_json: str, image_root: str, max_entries: int = N
     return entries[:max_entries] if max_entries is not None else entries
 
 
+_WORKER_OBJECT_EXTRACTORS = {}
+
+
+class LazyObjectExtractor:
+    def __init__(
+        self,
+        device: str,
+        mask_fallback: str,
+        model_path: str,
+        backend: str,
+        api_model: str,
+        api_key: str = None,
+        base_url: str = None,
+    ):
+        self.kwargs = {
+            "device": device,
+            "mask_fallback": mask_fallback,
+            "use_vlm_refinement": True,
+            "vlm_model_path": model_path,
+            "backend": backend,
+            "api_model": api_model,
+            "api_key": api_key,
+            "base_url": base_url,
+        }
+        self._runner = None
+
+    def _get_runner(self):
+        if self._runner is None:
+            from scripts.demo_extract_3d_positions import ObjectExtractionRunner
+
+            self._runner = ObjectExtractionRunner(**self.kwargs)
+        return self._runner
+
+    def extract_sample(self, *args, **kwargs):
+        return self._get_runner().extract_sample(*args, **kwargs)
+
+
+def build_object_extractor(
+    mode: str,
+    device: str,
+    mask_fallback: str,
+    model_path: str,
+    backend: str,
+    api_model: str,
+    api_key: str = None,
+    base_url: str = None,
+):
+    if mode != "graph":
+        return None
+    return LazyObjectExtractor(
+        device=device,
+        mask_fallback=mask_fallback,
+        model_path=model_path,
+        backend=backend,
+        api_model=api_model,
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+
+def get_worker_object_extractor(config: Dict[str, Any]):
+    if config.get("mode", "reconstruct") != "graph":
+        return None
+    key = (
+        config.get("device", "cuda"),
+        config.get("mask_fallback", "auto"),
+        config.get("model_path", DEFAULT_LOCAL_QWEN_MODEL_PATH),
+        config.get("backend", "local_qwen"),
+        config.get("api_model", "gpt-4.1"),
+        config.get("api_key"),
+        config.get("base_url"),
+    )
+    if key not in _WORKER_OBJECT_EXTRACTORS:
+        _WORKER_OBJECT_EXTRACTORS[key] = build_object_extractor(
+            mode=config.get("mode", "reconstruct"),
+            device=config.get("device", "cuda"),
+            mask_fallback=config.get("mask_fallback", "auto"),
+            model_path=config.get("model_path", DEFAULT_LOCAL_QWEN_MODEL_PATH),
+            backend=config.get("backend", "local_qwen"),
+            api_model=config.get("api_model", "gpt-4.1"),
+            api_key=config.get("api_key"),
+            base_url=config.get("base_url"),
+        )
+    return _WORKER_OBJECT_EXTRACTORS[key]
+
+
 def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
     """
     Wrapper function for multiprocessing that creates its own agent instance.
@@ -377,6 +507,8 @@ def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
         device=config.get("device", "cuda"),
     )
 
+    extractor = get_worker_object_extractor(config)
+
     return process_scene_with_agent(
         entry,
         agent,
@@ -389,10 +521,11 @@ def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
         base_url=config.get("base_url"),
         extract_output_dir=config.get("extract_output_dir"),
         force_extract=config.get("force_extract", False),
+        extractor=extractor,
     )
 
 
-def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "reconstruct", mask_fallback: str = "auto", device: str = "cuda", model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH, api_model: str = "gpt-4.1", api_key: str = None, base_url: str = None, extract_output_dir: str = None, force_extract: bool = False) -> Dict[str, Any]:
+def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "reconstruct", mask_fallback: str = "auto", device: str = "cuda", model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH, api_model: str = "gpt-4.1", api_key: str = None, base_url: str = None, extract_output_dir: str = None, force_extract: bool = False, extractor=None) -> Dict[str, Any]:
     """
     Process a single JSONL entry through the complete pipeline and extract type information.
     
@@ -439,6 +572,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
                 base_url=base_url,
                 save_dir=extract_output_dir,
                 force_extract=force_extract,
+                extractor=extractor,
             )
             pySpatial.build_graph(scene)
 
@@ -703,6 +837,16 @@ def main():
             base_url=args.base_url,
             device=args.device,
         )
+        extractor = build_object_extractor(
+            mode=args.mode,
+            device=args.device,
+            mask_fallback=args.mask_fallback,
+            model_path=args.model_path,
+            backend=args.backend,
+            api_model=args.api_model,
+            api_key=args.api_key,
+            base_url=args.base_url,
+        )
         results = []
         for i, entry in enumerate(entries, 1):
             print(f"Processing entry {i}/{len(entries)}: {entry.get('id', 'unknown')}")
@@ -718,6 +862,7 @@ def main():
                 base_url=args.base_url,
                 extract_output_dir=args.extract_output_dir,
                 force_extract=args.force_extract,
+                extractor=extractor,
             )
             results.append(result)
     else:
