@@ -16,6 +16,8 @@ if str(REPO_TEST_DIR) not in sys.path:
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.utils import extract_object_names_from_question_options
 
+DEFAULT_LOCAL_QWEN_MODEL_PATH = "/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct"
+
 
 class QwenVLRefinementModel:
     def __init__(self, model_path: str, device: str = "cuda"):
@@ -66,6 +68,45 @@ class QwenVLRefinementModel:
 
 
 
+class OpenAIVLRefinementModel:
+    def __init__(self, api_key: str = None, model: str = "gpt-4.1", base_url: str = None):
+        import os
+        from openai import OpenAI
+
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        base_url = base_url or os.getenv("CLOSEAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        if not api_key:
+            raise ValueError("OpenAI API key not provided. Set OPENAI_API_KEY or pass api_key.")
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.client = OpenAI(**client_kwargs)
+        self.model = model
+
+    def process_messages(self, messages, max_new_tokens=32):
+        import base64
+        from io import BytesIO
+
+        def image_to_url(image):
+            buf = BytesIO()
+            image.convert("RGB").save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            return "data:image/png;base64," + b64
+
+        content = []
+        for item in messages[0].get("content", []):
+            if item.get("type") == "text":
+                content.append({"type": "input_text", "text": item.get("text", "")})
+            elif item.get("type") == "image":
+                content.append({"type": "input_image", "image_url": image_to_url(item.get("image"))})
+        response = self.client.responses.create(
+            model=self.model,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=max_new_tokens,
+        )
+        return response.output_text.strip()
+
+
 def _resolve_qwen_vl_model_class():
     import transformers
 
@@ -87,8 +128,74 @@ def _resolve_qwen_vl_model_class():
 def build_vlm_refinement_model(args):
     if not args.use_vlm_refinement:
         return None
+    if getattr(args, "backend", "local_qwen") == "openai":
+        print("Loading OpenAI refinement model {}...".format(args.api_model))
+        return OpenAIVLRefinementModel(api_key=args.api_key, model=args.api_model, base_url=getattr(args, "base_url", None))
     print("Loading Qwen2.5-VL refinement model from {}...".format(args.vlm_model_path))
     return QwenVLRefinementModel(args.vlm_model_path, device=args.device)
+
+
+def extract_objects_for_sample(
+    sample: dict,
+    output_root,
+    device: str = "cuda",
+    mask_fallback: str = "auto",
+    use_vlm_refinement: bool = True,
+    vlm_model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH,
+    vlm_model=None,
+    visualize: bool = True,
+    image: str = None,
+    base_data_path: str = None,
+    backend: str = "local_qwen",
+    api_model: str = "gpt-4.1",
+    api_key: str = None,
+    base_url: str = None,
+):
+    args = argparse.Namespace(
+        image=image,
+        image_root="/data/datasets/Omni3D-Bench/images",
+        base_data_path=base_data_path,
+        device=device,
+        box_threshold=0.05,
+        text_threshold=0.05,
+        use_vlm_refinement=use_vlm_refinement,
+        vlm_model_path=vlm_model_path,
+        mask_fallback=mask_fallback,
+    )
+    sample_key = get_sample_key(sample, 0)
+    resolved_image = resolve_image_path(args, sample)
+    object_names = resolve_object_names(sample)
+
+    config = Object3DExtractionConfig()
+    config.detection.box_threshold = args.box_threshold
+    config.detection.text_threshold = args.text_threshold
+    config.detection.use_vlm_refinement = use_vlm_refinement
+    config.mask_fallback_mode = mask_fallback
+
+    if vlm_model is None and use_vlm_refinement:
+        if backend == "openai":
+            vlm_model = OpenAIVLRefinementModel(api_key=api_key, model=api_model, base_url=base_url)
+        else:
+            vlm_model = QwenVLRefinementModel(vlm_model_path, device=device)
+
+    locator = Object3DLocator(config=config, device=device, vlm_model=vlm_model)
+    sample_save_dir = Path(output_root) / sample_key
+    result = locator.extract(
+        image=resolved_image,
+        object_names=object_names,
+        visualize=visualize,
+        save_dir=sample_save_dir,
+        question=sample.get("question", ""),
+        answer=sample.get("answer", sample.get("gt_answer", "")),
+    )
+    record = {
+        "sample_id": sample_key,
+        "image": resolved_image,
+        "objects": object_names,
+        "result": result,
+    }
+    output_path = write_sample_json(sample_save_dir, sample_key, record)
+    return record, str(output_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,7 +214,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample_json", default=None, help="Path to one JSON sample file.")
     parser.add_argument("--jsonl", default=None, help="Path to a MindCube JSONL file.")
     parser.add_argument("--sample_id", default=None, help="Sample id to select from --jsonl.")
-    parser.add_argument("--sample_index", type=int, default=None, help="Sample index to select from --jsonl.")
+    parser.add_argument("--sample_index", type=int, default=None, help="Single sample index to run.")
+    parser.add_argument("--sample_start_index", type=int, default=None, help="Inclusive start index for a sample range.")
+    parser.add_argument("--sample_end_index", type=int, default=None, help="Inclusive end index for a sample range.")
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to run.")
     parser.add_argument(
         "--base_data_path",
@@ -135,9 +244,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--vlm_model_path",
-        default="/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct",
+        default=DEFAULT_LOCAL_QWEN_MODEL_PATH,
         help="Local Qwen2.5-VL model path for detection candidate refinement.",
     )
+    parser.add_argument("--backend", choices=("local_qwen", "openai"), default="local_qwen", help="VLM refinement backend.")
+    parser.add_argument("--api_model", default="gpt-4.1", help="OpenAI model for VLM refinement when --backend openai.")
+    parser.add_argument("--api_key", default=None, help="OpenAI API key for VLM refinement; falls back to OPENAI_API_KEY.")
+    parser.add_argument("--base_url", default=None, help="OpenAI-compatible base URL; falls back to CLOSEAI_BASE_URL or OPENAI_BASE_URL.")
     parser.add_argument(
         "--no_vlm_refinement",
         action="store_false",
@@ -165,25 +278,19 @@ def load_samples(args: argparse.Namespace):
             return [json.load(f)]
 
     if args.jsonl:
-        samples = []
+        all_samples = []
         with open(args.jsonl, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                if not line.strip():
-                    continue
-                sample = json.loads(line)
-                if args.sample_id is not None and sample.get("id") == args.sample_id:
-                    return [sample]
-                if args.sample_id is None and args.sample_index is not None and idx == args.sample_index:
-                    return [sample]
-                if args.sample_id is None and args.sample_index is None:
-                    samples.append(sample)
-                    if args.max_samples is not None and len(samples) >= args.max_samples:
-                        break
+            for line in f:
+                if line.strip():
+                    all_samples.append(json.loads(line))
+
         if args.sample_id is not None:
+            for sample in all_samples:
+                if sample.get("id") == args.sample_id:
+                    return [sample]
             raise ValueError("sample_id not found in jsonl: {}".format(args.sample_id))
-        if args.sample_index is not None:
-            raise ValueError("sample_index out of range: {}".format(args.sample_index))
-        return samples
+
+        return _select_samples_by_index_args(all_samples, args)
 
     with open(args.dataset_json, "r", encoding="utf-8") as f:
         dataset = json.load(f)
@@ -195,13 +302,30 @@ def load_samples(args: argparse.Namespace):
                 return [sample]
         raise ValueError("sample_id not found in dataset_json: {}".format(args.sample_id))
 
+    return _select_samples_by_index_args(samples, args)
+
+
+def _select_samples_by_index_args(samples, args):
+    if args.sample_index is not None and (args.sample_start_index is not None or args.sample_end_index is not None):
+        raise ValueError("Use either --sample_index or --sample_start_index/--sample_end_index, not both")
+
     if args.sample_index is not None:
         if args.sample_index < 0 or args.sample_index >= len(samples):
             raise ValueError("sample_index out of range: {}".format(args.sample_index))
         return [samples[args.sample_index]]
 
+    if args.sample_start_index is not None or args.sample_end_index is not None:
+        start = args.sample_start_index if args.sample_start_index is not None else 0
+        end = args.sample_end_index if args.sample_end_index is not None else len(samples) - 1
+        if start < 0 or end < start or start >= len(samples):
+            raise ValueError("sample index range out of range: {}-{}".format(start, end))
+        selected = samples[start : min(end, len(samples) - 1) + 1]
+        if args.max_samples is not None:
+            selected = selected[: args.max_samples]
+        return selected
+
     if args.max_samples is not None:
-        samples = samples[: args.max_samples]
+        return samples[: args.max_samples]
     return samples
 
 
@@ -238,11 +362,13 @@ def get_sample_key(sample, fallback_index: int) -> str:
 
 def resolve_object_names(sample) -> list:
     question = sample.get("question", "")
-    object_names = extract_object_names_from_question_options(question)
-    if not object_names or any(_looks_like_non_object_phrase(name) for name in object_names):
-        object_names = extract_object_names_from_omni3d_question(question)
+    object_names = extract_object_names_from_omni3d_question(question)
     if not object_names:
-        raise ValueError("Could not extract object names from sample question/options")
+        object_names = extract_object_names_from_question_options(question)
+    if not object_names or any(_looks_like_non_object_phrase(name) for name in object_names):
+        object_names = [name for name in object_names if not _looks_like_non_object_phrase(name)]
+    if not object_names:
+        raise ValueError("Could not extract object names from sample question")
     return object_names
 
 

@@ -1,3 +1,5 @@
+import argparse
+import json
 import importlib.util
 import sys
 from pathlib import Path
@@ -487,3 +489,71 @@ def test_qwen_model_class_falls_back_to_auto_model(monkeypatch):
 
     assert demo_extract_3d_positions._resolve_qwen_vl_model_class() is object
 
+
+
+def test_cli_sample_index_range(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "demo_extract_3d_positions.py",
+        "--sample_start_index",
+        "400",
+        "--sample_end_index",
+        "500",
+    ])
+
+    args = demo_extract_3d_positions.parse_args()
+
+    assert args.sample_start_index == 400
+    assert args.sample_end_index == 500
+
+
+def test_load_samples_selects_inclusive_index_range(tmpdir):
+    dataset_path = tmpdir.join("annotations.json")
+    samples = [
+        {"question_index": idx, "question": "Where is the chair?", "answer": "yes", "image_filename": "x.jpg"}
+        for idx in range(6)
+    ]
+    dataset_path.write('{"questions": ' + json.dumps(samples) + '}')
+
+    args = argparse.Namespace(
+        sample_json=None,
+        jsonl=None,
+        dataset_json=str(dataset_path),
+        sample_id=None,
+        sample_index=None,
+        sample_start_index=2,
+        sample_end_index=4,
+        max_samples=None,
+    )
+
+    selected = demo_extract_3d_positions.load_samples(args)
+
+    assert [sample["question_index"] for sample in selected] == [2, 3, 4]
+
+
+def test_openai_refinement_model_uses_base_url(monkeypatch):
+    calls = {}
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            class Response:
+                output_text = "0"
+            return Response()
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+            self.responses = FakeResponses()
+
+    class FakeOpenAIModule:
+        OpenAI = FakeOpenAI
+
+    monkeypatch.setitem(sys.modules, "openai", FakeOpenAIModule)
+
+    model = demo_extract_3d_positions.OpenAIVLRefinementModel(
+        api_key="test-key",
+        model="gpt-4.1",
+        base_url="https://closeai.example/v1",
+    )
+
+    assert calls == {"api_key": "test-key", "base_url": "https://closeai.example/v1"}
+    assert model.model == "gpt-4.1"

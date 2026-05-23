@@ -11,19 +11,39 @@ import os
 import sys
 import json
 import argparse
+import math
+import re
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 from collections import defaultdict
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import time
 import threading
-import backoff
+import textwrap
+import tempfile
+try:
+    import backoff
+except ImportError:
+    class _BackoffFallback:
+        full_jitter = None
+
+        @staticmethod
+        def expo(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def on_exception(*args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+    backoff = _BackoffFallback()
 
 # Add parent directory to Python path to import pySpatial_Interface
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from pySpatial_Interface import Agent, Scene, pySpatial
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pySpatial_Interface import Agent, Scene, pySpatial, DEFAULT_LOCAL_QWEN_MODEL_PATH, OBJECT_OUTPUT_ROOTS, LEGACY_OBJECT_OUTPUT_ROOTS
 
 # Rate limiting globals
 last_request_time = 0
@@ -96,9 +116,241 @@ def extract_type_from_images(images: List[str]) -> str:
     return 'unknown'
 
 
-def evaluate_answer_correctness(generated_answer: str, expected_answer: str) -> bool:
-    """Check if generated answer matches expected answer."""
-    return generated_answer == expected_answer
+def normalize_answer_text(value) -> str:
+    text = str(value).strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^[\s\.,;:!?]+|[\s\.,;:!?]+$", "", text)
+    return text
+
+
+def _extract_number(value):
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", str(value))
+    return float(match.group(0)) if match else None
+
+
+def evaluate_answer_correctness(generated_answer, expected_answer, answer_type: str = None, abs_tol: float = 0.05, rel_tol: float = 0.05) -> bool:
+    if expected_answer is None or generated_answer is None:
+        return False
+    if answer_type == "float" or isinstance(expected_answer, float):
+        expected = _extract_number(expected_answer)
+        generated = _extract_number(generated_answer)
+        if expected is None or generated is None:
+            return False
+        return math.isclose(generated, expected, abs_tol=abs_tol, rel_tol=rel_tol)
+    return normalize_answer_text(generated_answer) == normalize_answer_text(expected_answer)
+
+
+def _load_flowchart_font(size: int, mono: bool = False):
+    from PIL import ImageFont
+
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf" if mono else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSansMono.ttf" if mono else "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return ImageFont.truetype(candidate, size)
+    return ImageFont.load_default()
+
+
+def _wrap_flowchart_text(text: str, width: int = 110, max_lines: int = 180) -> List[str]:
+    lines = []
+    for raw_line in str(text or "").splitlines() or [""]:
+        wrapped = textwrap.wrap(raw_line, width=width, replace_whitespace=False, drop_whitespace=False)
+        lines.extend(wrapped or [""])
+        if len(lines) >= max_lines:
+            return lines[:max_lines] + ["... truncated ..."]
+    return lines
+
+
+def _blank_debug_panel(result: Dict[str, Any], width: int = 1400, height: int = 900):
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = _load_flowchart_font(28)
+    body_font = _load_flowchart_font(22)
+    draw.text((30, 30), "3D Debug Panel", fill=(20, 20, 20), font=title_font)
+    draw.text((30, 85), "No object_3d_boxes were available for this sample.", fill=(60, 60, 60), font=body_font)
+    y = 140
+    for line in _wrap_flowchart_text("Question: " + str(result.get("question", "")), width=90, max_lines=16):
+        draw.text((30, y), line, fill=(30, 30, 30), font=body_font)
+        y += 30
+    return image
+
+
+def _append_flowchart_footer(panel_path: str, output_path: Path, result: Dict[str, Any]) -> str:
+    from PIL import Image, ImageDraw
+
+    base = Image.open(panel_path).convert("RGB")
+    title_font = _load_flowchart_font(24)
+    mono_font = _load_flowchart_font(18, mono=True)
+    body_font = _load_flowchart_font(20)
+    padding = 30
+    line_height = 24
+
+    code = result.get("generated_code") or "N/A"
+    answer = result.get("generated_answer") or "N/A"
+    reasoning = result.get("answer_reasoning") or "N/A"
+    correctness = "Correct" if result.get("answer_correct") else "Incorrect"
+    fallback = "yes" if result.get("fallback_used") else "no"
+    error = result.get("error") or "N/A"
+
+    sections = [
+        ("CodeAgent Generated Code", _wrap_flowchart_text(code, width=120, max_lines=120), mono_font),
+        ("Generated Answer", _wrap_flowchart_text(answer, width=120, max_lines=20), body_font),
+        ("Answer Reasoning", _wrap_flowchart_text(reasoning, width=120, max_lines=35), body_font),
+        ("Evaluation", _wrap_flowchart_text(f"Expected: {result.get('expected_answer')} | Correctness: {correctness} | Fallback used: {fallback} | Error: {error}", width=120, max_lines=12), body_font),
+    ]
+
+    footer_height = padding
+    for _, lines, _ in sections:
+        footer_height += 34 + max(1, len(lines)) * line_height + 18
+    footer_height += padding
+
+    canvas = Image.new("RGB", (base.width, base.height + footer_height), "white")
+    canvas.paste(base, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    y = base.height + padding
+    draw.rectangle((0, base.height, base.width, base.height + footer_height), fill=(248, 248, 248))
+
+    for title, lines, font in sections:
+        draw.text((padding, y), title, fill=(20, 20, 20), font=title_font)
+        y += 34
+        for line in lines:
+            draw.text((padding, y), line, fill=(35, 35, 35), font=font)
+            y += line_height
+        y += 18
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+    return str(output_path)
+
+
+def _sample_extract_debug_dir(scene_id: str, mask_fallback: str = "auto", extract_output_dir: str = None) -> Optional[Path]:
+    if not scene_id:
+        return None
+    candidates = []
+    if extract_output_dir:
+        candidates.append(Path(extract_output_dir) / scene_id)
+    root = OBJECT_OUTPUT_ROOTS.get(mask_fallback)
+    if root is not None:
+        candidates.append(Path(root) / scene_id)
+    legacy_root = LEGACY_OBJECT_OUTPUT_ROOTS.get(mask_fallback)
+    if legacy_root is not None:
+        candidates.append(Path(legacy_root) / scene_id)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else None
+
+
+def create_sample_flowchart(result: Dict[str, Any], flowcharts_dir: Path, extract_output_dir: str = None) -> Optional[str]:
+    scene_id = result.get("scene_id", "unknown")
+    output_path = flowcharts_dir / f"{scene_id}_flowchart.png"
+    object_boxes = result.get("object_3d_boxes") or {}
+    images = result.get("images") or []
+    image_path = next((image for image in images if image and os.path.exists(image)), None)
+    sample_debug_dir = _sample_extract_debug_dir(scene_id, result.get("mask_fallback", "auto"), extract_output_dir or result.get("extract_output_dir"))
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if object_boxes and image_path:
+                from object_3d_extraction.visualize_3d_aabb import compose_question_image_3d_visualization, render_3d_aabb_scene
+
+                tmp_path = Path(tmpdir)
+                existing_aabb_path = sample_debug_dir / "3d_aabb.png" if sample_debug_dir else None
+                if existing_aabb_path and existing_aabb_path.exists():
+                    aabb_path = existing_aabb_path
+                else:
+                    aabb_path = tmp_path / "3d_aabb.png"
+                    render_3d_aabb_scene(object_boxes, str(aabb_path))
+
+                panel_path = tmp_path / "3d_debug_panel.png"
+                answer_text = "GT: {}\nGenerated: {}".format(result.get("expected_answer"), result.get("generated_answer"))
+                compose_question_image_3d_visualization(
+                    image_path,
+                    result.get("question", ""),
+                    str(aabb_path),
+                    str(panel_path),
+                    answer=answer_text,
+                    results=object_boxes,
+                    debug_dir=str(sample_debug_dir) if sample_debug_dir and sample_debug_dir.exists() else None,
+                )
+            else:
+                blank = _blank_debug_panel(result)
+                panel_path = os.path.join(tmpdir, "3d_debug_panel.png")
+                blank.save(panel_path)
+            return _append_flowchart_footer(str(panel_path), output_path, result)
+    except Exception as exc:
+        print(f"[{scene_id}] Failed to create flowchart: {exc}")
+        return None
+
+
+SUMMARY_RESULT_KEYS = [
+    "scene_id",
+    "question",
+    "images",
+    "expected_answer",
+    "answer_type",
+    "generated_answer",
+    "answer_reasoning",
+    "answer_source",
+    "answer_correct",
+    "parse_success",
+    "execution_success",
+    "answer_generation_success",
+    "fallback_used",
+    "generated_code",
+    "flowchart_path",
+    "error",
+    "mode",
+    "mask_fallback",
+    "extract_output_dir",
+]
+
+
+def summarize_result_for_output(result: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: result.get(key) for key in SUMMARY_RESULT_KEYS if key in result}
+
+
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    if hasattr(value, "tolist"):
+        return make_json_safe(value.tolist())
+    if hasattr(value, "item"):
+        return make_json_safe(value.item())
+    return value
+
+
+def omni3d_entry_to_pipeline_entry(sample: Dict[str, Any], image_root: str) -> Dict[str, Any]:
+    question_index = sample.get("question_index", sample.get("id", "unknown"))
+    image_filename = sample.get("image_filename")
+    images = sample.get("images") or []
+    if image_filename:
+        image_path = Path(image_filename)
+        if not image_path.is_absolute():
+            image_path = Path(image_root) / image_path
+        images = [str(image_path)]
+    return {
+        "id": "omni3d_{}".format(question_index),
+        "question": sample.get("question", ""),
+        "images": images,
+        "answer": sample.get("answer"),
+        "answer_type": sample.get("answer_type"),
+        "raw_sample": sample,
+    }
+
+
+def load_omni3d_entries(dataset_json: str, image_root: str, max_entries: int = None) -> List[Dict[str, Any]]:
+    with open(dataset_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    samples = data.get("questions", data if isinstance(data, list) else [])
+    entries = [omni3d_entry_to_pipeline_entry(sample, image_root) for sample in samples]
+    return entries[:max_entries] if max_entries is not None else entries
 
 
 def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
@@ -111,15 +363,34 @@ def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
     Returns:
         Dictionary containing the complete pipeline results including type information
     """
-    entry, api_key = args_tuple
-    
-    # Create agent instance for this process
-    agent = Agent(api_key=api_key)
-    
-    return process_scene_with_agent(entry, agent)
+    entry, config = args_tuple
+
+    agent = Agent(
+        api_key=config.get("api_key"),
+        backend=config.get("backend", "local_qwen"),
+        model_path=config.get("model_path", DEFAULT_LOCAL_QWEN_MODEL_PATH),
+        api_model=config.get("api_model", "gpt-4.1"),
+        code_model=config.get("code_model"),
+        answer_model=config.get("answer_model"),
+        base_url=config.get("base_url"),
+        device=config.get("device", "cuda"),
+    )
+
+    return process_scene_with_agent(
+        entry,
+        agent,
+        mode=config.get("mode", "reconstruct"),
+        mask_fallback=config.get("mask_fallback", "auto"),
+        device=config.get("device", "cuda"),
+        model_path=config.get("model_path", DEFAULT_LOCAL_QWEN_MODEL_PATH),
+        api_model=config.get("api_model", "gpt-4.1"),
+        api_key=config.get("api_key"),
+        base_url=config.get("base_url"),
+        extract_output_dir=config.get("extract_output_dir"),
+    )
 
 
-def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, Any]:
+def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "reconstruct", mask_fallback: str = "auto", device: str = "cuda", model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH, api_model: str = "gpt-4.1", api_key: str = None, base_url: str = None, extract_output_dir: str = None) -> Dict[str, Any]:
     """
     Process a single JSONL entry through the complete pipeline and extract type information.
     
@@ -133,7 +404,8 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
     scene_id = entry['id']
     question = entry.get('question', '')
     images = entry.get('images', [])
-    expected_answer = entry.get('gt_answer', '')
+    expected_answer = entry.get('answer', entry.get('gt_answer'))
+    answer_type = entry.get('answer_type')
     
     # Extract type from image paths
     scene_type = extract_type_from_images(images)
@@ -142,19 +414,37 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
     scene = Scene(images, question, scene_id=scene_id)
 
     fallback_used = False
+    generated_response = None
+    parsed_code = None
+    visual_clue = None
+    generated_answer = None
+    answer_reasoning = None
+    answer_source = None
+    answer_correct = False
+    execution_success = False
+    answer_generation_success = False
+    parse_success = False
     try:
+        if mode == "graph":
+            pySpatial.extract_objects(
+                scene,
+                device=device,
+                mask_fallback=mask_fallback,
+                vlm_model_path=model_path,
+                backend=agent.backend,
+                api_model=api_model,
+                api_key=api_key,
+                base_url=base_url,
+                save_dir=extract_output_dir,
+            )
+            pySpatial.build_graph(scene)
+
         # Step 1: Generate code using the agent (with retry)
         generated_response = call_agent_with_retry(agent, 'generate_code', scene)
 
         # Parse the response to extract code patterns
         parsed_code = agent.parse_LLM_response(scene, generated_response)
         parse_success = parsed_code is not None and parsed_code.strip() != ""
-
-        visual_clue = None
-        generated_answer = None
-        answer_correct = False
-        execution_success = False
-        answer_generation_success = False
 
         # Step 2: Execute code to get visual clue (if parsing was successful)
         if parse_success:
@@ -168,10 +458,12 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
 
                 if answer_generation_success:
                     generated_answer = answer_response.answer
+                    answer_reasoning = getattr(answer_response, "reasoning", None)
+                    answer_source = "graph"
 
                     # Step 4: Evaluate correctness
-                    if expected_answer and generated_answer:
-                        answer_correct = evaluate_answer_correctness(generated_answer, expected_answer)
+                    if expected_answer is not None and generated_answer is not None:
+                        answer_correct = evaluate_answer_correctness(generated_answer, expected_answer, answer_type)
 
         # --- Fallback to basic QA if pySpatial pipeline didn't produce an answer ---
         if not answer_generation_success or generated_answer is None:
@@ -180,9 +472,11 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
             if fallback_response is not None:
                 fallback_used = True
                 generated_answer = fallback_response.answer
+                answer_reasoning = getattr(fallback_response, "reasoning", None)
+                answer_source = "basic_qa"
                 answer_generation_success = True
-                if expected_answer and generated_answer:
-                    answer_correct = evaluate_answer_correctness(generated_answer, expected_answer)
+                if expected_answer is not None and generated_answer is not None:
+                    answer_correct = evaluate_answer_correctness(generated_answer, expected_answer, answer_type)
 
         result = {
             "scene_id": scene_id,
@@ -190,12 +484,22 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
             "question": question,
             "images": images,
             "expected_answer": expected_answer,
+            "answer_type": answer_type,
             "parse_success": parse_success,
             "execution_success": execution_success,
             "answer_generation_success": answer_generation_success,
             "generated_answer": generated_answer,
+            "answer_reasoning": answer_reasoning,
+            "answer_source": answer_source,
             "answer_correct": answer_correct,
+            "generated_code": parsed_code,
+            "generated_response": generated_response,
+            "visual_clue": visual_clue,
+            "object_3d_boxes": scene.object_3d_boxes,
             "fallback_used": fallback_used,
+            "mode": mode,
+            "mask_fallback": mask_fallback,
+            "extract_output_dir": extract_output_dir,
         }
 
         return result
@@ -213,10 +517,12 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
             fallback_response = call_agent_with_retry(agent, 'basic_qa', scene)
             if fallback_response is not None:
                 fallback_answer = fallback_response.answer
+                answer_reasoning = getattr(fallback_response, "reasoning", None)
+                answer_source = "basic_qa"
                 fallback_success = True
                 fallback_used = True
-                if expected_answer and fallback_answer:
-                    fallback_correct = evaluate_answer_correctness(fallback_answer, expected_answer)
+                if expected_answer is not None and fallback_answer is not None:
+                    fallback_correct = evaluate_answer_correctness(fallback_answer, expected_answer, answer_type)
         except Exception as fallback_e:
             print(f"[{scene_id}] Basic QA fallback also failed: {fallback_e}")
 
@@ -226,24 +532,37 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent) -> Dict[str, A
             "question": question,
             "images": images,
             "expected_answer": expected_answer,
+            "answer_type": answer_type,
             "parse_success": False,
             "execution_success": False,
             "answer_generation_success": fallback_success,
             "generated_answer": fallback_answer,
+            "answer_reasoning": answer_reasoning,
+            "answer_source": answer_source,
             "answer_correct": fallback_correct,
+            "generated_code": parsed_code,
+            "generated_response": generated_response,
+            "visual_clue": visual_clue,
+            "object_3d_boxes": scene.object_3d_boxes,
             "fallback_used": fallback_used,
+            "mode": mode,
+            "mask_fallback": mask_fallback,
+            "extract_output_dir": extract_output_dir,
             "error": error_msg,
         }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pySpatial Agent on MindCube dataset with type statistics")
-    parser.add_argument("--jsonl_path", type=str, 
-                       required=True,
+    parser.add_argument("--jsonl_path", type=str, default=None,
                        help="Path to JSONL file containing scene information")
+    parser.add_argument("--dataset_json", type=str, default=None,
+                       help="Path to Omni3D-Bench annotations.json")
+    parser.add_argument("--image_root", type=str, default="/data/datasets/Omni3D-Bench/images",
+                       help="Root directory for Omni3D-Bench images")
     parser.add_argument("--output_file", type=str,
-                       default="pySpatial_mindcube.json",
-                       help="Output file path for results")
+                       default="pySpatial_mindcube_outputs",
+                       help="Output directory for timestamped results and flowcharts")
     parser.add_argument("--max_entries", type=int, default=None,
                        help="Maximum number of entries to process")
     parser.add_argument("--api_key", type=str, default=os.getenv("OPENAI_API_KEY"),
@@ -259,6 +578,28 @@ def main():
                        help="Filter to only process specific scene type (among, around, rotation, or unknown)")
     parser.add_argument("--processed_dir", type=str, default=None,
                        help="Base directory for pre-processed scene data (optional)")
+    parser.add_argument("--mode", choices=["reconstruct", "graph"], default="reconstruct",
+                       help="Pipeline mode: legacy reconstruction or SpatialGraph")
+    parser.add_argument("--mask_fallback", choices=["auto", "off"], default="auto",
+                       help="Object extraction mask fallback mode used by graph mode")
+    parser.add_argument("--backend", choices=["local_qwen", "openai"], default="local_qwen",
+                       help="Model backend for code generation and answering")
+    parser.add_argument("--model_path", type=str, default=DEFAULT_LOCAL_QWEN_MODEL_PATH,
+                       help="Unified local model path for extraction, code generation, and answering")
+    parser.add_argument("--local_model_path", type=str, default=None,
+                       help="Deprecated alias for --model_path")
+    parser.add_argument("--api_model", type=str, default="gpt-4.1",
+                       help="Unified OpenAI model for extraction, code generation, and answering")
+    parser.add_argument("--base_url", type=str, default=None,
+                       help="OpenAI-compatible API base URL; falls back to CLOSEAI_BASE_URL or OPENAI_BASE_URL")
+    parser.add_argument("--code_model", type=str, default=None,
+                       help="Optional override for code generation model")
+    parser.add_argument("--answer_model", type=str, default=None,
+                       help="Optional override for answer model")
+    parser.add_argument("--device", type=str, default="cuda",
+                       help="Device for local model and object extraction")
+    parser.add_argument("--extract_output_dir", type=str, default=None,
+                       help="Object extraction/debug output root; defaults to mask_fallback output root")
 
     args = parser.parse_args()
     
@@ -269,8 +610,15 @@ def main():
     # Set the pre-processed scene base directory
     pySpatial.PROCESSED_BASE_DIR = args.processed_dir
     
-    if not os.path.exists(args.jsonl_path):
+    if args.local_model_path:
+        args.model_path = args.local_model_path
+    args.base_url = args.base_url or os.getenv("CLOSEAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    if args.jsonl_path is None and args.dataset_json is None:
+        args.dataset_json = "/data/datasets/Omni3D-Bench/annotations.json"
+    if args.jsonl_path and not os.path.exists(args.jsonl_path):
         raise ValueError(f"JSONL file not found: {args.jsonl_path}")
+    if args.dataset_json and not os.path.exists(args.dataset_json):
+        raise ValueError(f"Dataset JSON file not found: {args.dataset_json}")
     
     # Determine number of processes
     if args.disable_multiprocessing:
@@ -278,25 +626,41 @@ def main():
     else:
         num_processes = args.num_processes or cpu_count()
     
-    print(f"Processing JSONL file: {args.jsonl_path}")
-    print(f"Output file: {args.output_file}")
+    print(f"Processing JSONL file: {args.jsonl_path or 'none'}")
+    print(f"Processing dataset JSON: {args.dataset_json or 'none'}")
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = Path(args.output_file)
+    output_dir = output_root / run_timestamp
+    flowcharts_dir = output_dir / "flowcharts"
+    flowcharts_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Output root: {output_root}")
+    print(f"Run output directory: {output_dir}")
     print(f"Max entries: {args.max_entries or 'all'}")
     print(f"Filter type: {args.filter_type or 'none (processing all types)'}")
     print(f"Number of processes: {num_processes}")
     print(f"Request interval: {min_request_interval}s")
+    print(f"Mode: {args.mode}")
+    print(f"Backend: {args.backend}")
+    print(f"Base URL: {args.base_url or 'default OpenAI SDK'}")
+    print(f"Mask fallback: {args.mask_fallback}")
+    print(f"Extract output dir: {args.extract_output_dir or 'default mask_fallback output root'}")
     print("="*60)
     
     # Load all entries first
-    entries = []
-    with open(args.jsonl_path, 'r') as f:
-        for line_num, line in enumerate(f, 1):
-            if args.max_entries and len(entries) >= args.max_entries:
-                print(f"Reached maximum entries limit: {args.max_entries}")
-                break
-            
-            entry = json.loads(line.strip())
-            entries.append(entry)
-    
+    if args.dataset_json:
+        entries = load_omni3d_entries(args.dataset_json, args.image_root, max_entries=args.max_entries)
+    else:
+        entries = []
+        with open(args.jsonl_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                if args.max_entries and len(entries) >= args.max_entries:
+                    print(f"Reached maximum entries limit: {args.max_entries}")
+                    break
+                if not line.strip():
+                    continue
+                entries.append(json.loads(line.strip()))
+
     print(f"Loaded {len(entries)} entries for processing")
 
     # Filter entries by type if specified
@@ -321,18 +685,51 @@ def main():
     if num_processes == 1 or args.disable_multiprocessing:
         # Sequential processing
         print("Running sequentially...")
-        agent = Agent(api_key=args.api_key)
+        agent = Agent(
+            api_key=args.api_key,
+            backend=args.backend,
+            model_path=args.model_path,
+            api_model=args.api_model,
+            code_model=args.code_model,
+            answer_model=args.answer_model,
+            base_url=args.base_url,
+            device=args.device,
+        )
         results = []
         for i, entry in enumerate(entries, 1):
             print(f"Processing entry {i}/{len(entries)}: {entry.get('id', 'unknown')}")
-            result = process_scene_with_agent(entry, agent)
+            result = process_scene_with_agent(
+                entry,
+                agent,
+                mode=args.mode,
+                mask_fallback=args.mask_fallback,
+                device=args.device,
+                model_path=args.model_path,
+                api_model=args.api_model,
+                api_key=args.api_key,
+                base_url=args.base_url,
+                extract_output_dir=args.extract_output_dir,
+            )
             results.append(result)
     else:
         # Multiprocessing
         print(f"Running with {num_processes} processes...")
 
         # Prepare arguments for multiprocessing
-        args_list = [(entry, args.api_key) for entry in entries]
+        worker_config = {
+            "api_key": args.api_key,
+            "backend": args.backend,
+            "model_path": args.model_path,
+            "api_model": args.api_model,
+            "code_model": args.code_model,
+            "answer_model": args.answer_model,
+            "base_url": args.base_url,
+            "mode": args.mode,
+            "mask_fallback": args.mask_fallback,
+            "device": args.device,
+            "extract_output_dir": args.extract_output_dir,
+        }
+        args_list = [(entry, worker_config) for entry in entries]
 
         pool = Pool(processes=num_processes, maxtasksperchild=4)
         async_result = pool.map_async(process_scene_with_agent_wrapper, args_list)
@@ -344,7 +741,12 @@ def main():
     processing_time = end_time - start_time
     print(f"\n✓ Processing completed in {processing_time:.2f} seconds")
     print(f"Average time per entry: {processing_time/len(entries):.2f} seconds")
-    
+
+    for result in results:
+        flowchart_path = create_sample_flowchart(result, flowcharts_dir, extract_output_dir=args.extract_output_dir)
+        if flowchart_path:
+            result["flowchart_path"] = flowchart_path
+
     # Calculate statistics
     type_stats = defaultdict(lambda: {
         'total': 0.0,
@@ -374,20 +776,9 @@ def main():
         overall_stats['total_processed'] += 1
         
         if result.get('error'):
-            type_stats[scene_type]['parse_success'] += 1
-            overall_stats['parse_success'] += 1
-            type_stats[scene_type]['execution_success']+= 1
-            overall_stats['execution_success'] += 1
-            type_stats[scene_type]['answer_generation_success'] += 1
-            overall_stats['answer_generation_success'] += 1
-            type_stats[scene_type]['evaluable_answers'] += 2
-            overall_stats['evaluable_answers'] += 2
-            type_stats[scene_type]['correct_answers'] += 2
-            overall_stats['correct_answers'] += 2
-            print(f"Error: There is an error here ")
-            continue
+            type_stats[scene_type]['errors'] += 1
+            overall_stats['errors'] += 1
 
-        
         if result['parse_success']:
             type_stats[scene_type]['parse_success'] += 1
             overall_stats['parse_success'] += 1
@@ -400,7 +791,7 @@ def main():
             type_stats[scene_type]['answer_generation_success'] += 1
             overall_stats['answer_generation_success'] += 1
         
-        if result['expected_answer'] and result['generated_answer']:
+        if result.get('expected_answer') is not None and result.get('generated_answer') is not None:
             type_stats[scene_type]['evaluable_answers'] += 1
             overall_stats['evaluable_answers'] += 1
             
@@ -437,22 +828,34 @@ def main():
     }
     
     # Save results
-    output_path = Path.cwd() / args.output_file
-    
+    output_path = output_dir / "summary.json"
+
     summary = {
         "processing_timestamp": datetime.now().isoformat(),
+        "run_timestamp": run_timestamp,
+        "output_dir": str(output_dir),
+        "flowcharts_dir": str(flowcharts_dir),
         "jsonl_source": args.jsonl_path,
+        "dataset_json_source": args.dataset_json,
+        "image_root": args.image_root,
         "processing_time_seconds": round(processing_time, 2),
         "avg_time_per_entry": round(processing_time/len(entries), 2),
         "num_processes_used": num_processes,
+        "mode": args.mode,
+        "backend": args.backend,
+        "model_path": args.model_path,
+        "api_model": args.api_model,
+        "base_url": args.base_url,
+        "mask_fallback": args.mask_fallback,
+        "extract_output_dir": args.extract_output_dir,
         "overall_metrics": overall_metrics,
         "type_metrics": type_metrics,
         "raw_statistics": dict(type_stats),
-        "results": results
+        "results": [summarize_result_for_output(result) for result in results]
     }
     
     with open(output_path, 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(make_json_safe(summary), f, indent=2)
     print(f"\n✓ Results saved to: {output_path}")
     
     # Print summary statistics

@@ -2,17 +2,11 @@ import os
 import glob
 import json
 import numpy as np
-from typing import List, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
-from tool.recontruct import reconstruct_3d
 # from tool.segment import segment_image, segment_automatic
 # from tool.estimate_depth import estimate_depth
-from tool.camera_understanding import analyze_camera_trajectory
-from tool.novel_view_synthesis import (
-    novel_view_synthesis, rotate_right, rotate_left,
-    move_forward, move_backward, turn_around,
-    average_look_at_directions,
-)
 import re
 
 
@@ -33,6 +27,8 @@ class Scene:
         self.reconstruction : Reconstruction = None
         self.code : str = None
         self.visual_clue = None
+        self.object_3d_boxes: dict = None
+        self.spatial_graph = None
 
     def _load_images(self, path_to_images: Union[str, List[str]]) -> List[str]:
         """Load image paths from directory or list."""
@@ -109,6 +105,62 @@ def _load_processed_scene(processed_dir):
     return None
 
 
+OBJECT_OUTPUT_ROOTS = {
+    "auto": Path("/data/duliang/pySpatial-test/outputs/Omni3D-Bench"),
+    "off": Path("/data/duliang/pySpatial-test/outputs/Omni3D-Benchnomask"),
+}
+LEGACY_OBJECT_OUTPUT_ROOTS = {
+    "off": Path("/data/duliang/pySpatial-test/outputs/Omni3D-Bench-nomask"),
+}
+DEFAULT_LOCAL_QWEN_MODEL_PATH = "/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct"
+
+
+def resolve_openai_base_url(base_url: str = None) -> str:
+    return base_url or os.getenv("CLOSEAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+
+
+def _object_output_root(mask_fallback: str) -> Path:
+    if mask_fallback not in OBJECT_OUTPUT_ROOTS:
+        raise ValueError("mask_fallback must be 'auto' or 'off'")
+    return OBJECT_OUTPUT_ROOTS[mask_fallback]
+
+
+def _object_json_paths(scene: "Scene", mask_fallback: str, save_dir: str = None) -> List[Path]:
+    if not scene.scene_id:
+        return []
+    paths = []
+    if save_dir:
+        paths.append(Path(save_dir) / scene.scene_id / "object_3d_positions.json")
+    paths.append(_object_output_root(mask_fallback) / scene.scene_id / "object_3d_positions.json")
+    legacy_root = LEGACY_OBJECT_OUTPUT_ROOTS.get(mask_fallback)
+    if legacy_root is not None:
+        paths.append(legacy_root / scene.scene_id / "object_3d_positions.json")
+    return paths
+
+
+def _load_object_boxes_from_json(json_path: Path, scene_id: str = None) -> Optional[Dict[str, dict]]:
+    if not json_path or not json_path.exists():
+        return None
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    record = data.get(scene_id) if scene_id and isinstance(data, dict) else None
+    if record is None and isinstance(data, dict) and len(data) == 1:
+        record = next(iter(data.values()))
+    if record is None and isinstance(data, dict) and "result" in data:
+        record = data
+    if isinstance(record, dict):
+        return record.get("result", record)
+    return None
+
+
+def _scene_to_sample(scene: "Scene") -> Dict[str, Any]:
+    return {
+        "id": scene.scene_id or "scene",
+        "question": scene.question,
+        "images": scene.images,
+    }
+
+
 class pySpatial:
     """Simple interface for 3D vision tools."""
 
@@ -144,6 +196,8 @@ class pySpatial:
             return recon
 
         # --- no cached result found, run reconstruction ---
+        from tool.recontruct import reconstruct_3d
+
         result = reconstruct_3d(scene.images, scene_id=scene.scene_id)
 
         # Convert the raw result dictionary to a Reconstruction object
@@ -181,11 +235,71 @@ class pySpatial:
         return reconstruction
     
     @staticmethod
+    def extract_objects(
+        scene: Scene,
+        device: str = "cuda",
+        mask_fallback: str = "auto",
+        use_vlm_refinement: bool = True,
+        vlm_model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH,
+        vlm_model=None,
+        visualize: bool = True,
+        save_dir: str = None,
+        base_data_path: str = None,
+        backend: str = "local_qwen",
+        api_model: str = "gpt-4.1",
+        api_key: str = None,
+        base_url: str = None,
+    ):
+        for json_path in _object_json_paths(scene, mask_fallback, save_dir=save_dir):
+            cached = _load_object_boxes_from_json(json_path, scene.scene_id)
+            if cached is not None:
+                scene.object_3d_boxes = cached
+                return cached
+
+        from scripts.demo_extract_3d_positions import extract_objects_for_sample
+
+        output_root = Path(save_dir) if save_dir else _object_output_root(mask_fallback)
+        record, _ = extract_objects_for_sample(
+            _scene_to_sample(scene),
+            output_root=output_root,
+            device=device,
+            mask_fallback=mask_fallback,
+            use_vlm_refinement=use_vlm_refinement,
+            vlm_model_path=vlm_model_path,
+            vlm_model=vlm_model,
+            visualize=visualize,
+            base_data_path=base_data_path,
+            backend=backend,
+            api_model=api_model,
+            api_key=api_key,
+            base_url=resolve_openai_base_url(base_url),
+        )
+        scene.object_3d_boxes = record.get("result", {})
+        return scene.object_3d_boxes
+
+    @staticmethod
+    def build_graph(scene: Scene):
+        from spatial_graph import SpatialGraph
+
+        if scene.object_3d_boxes is None:
+            pySpatial.extract_objects(scene)
+        scene.spatial_graph = SpatialGraph(scene.object_3d_boxes or {})
+        return scene.spatial_graph
+
+    @staticmethod
+    def visualize_graph(graph, output_path, width=1200, height=700):
+        from spatial_graph.visualization import visualize_graph
+
+        return visualize_graph(graph, output_path, width=width, height=height)
+
+    @staticmethod
     def describe_camera_motion(recon: Reconstruction):
         """Describe camera motion from reconstruction results.
         Args:
         """
         extrinsics = recon.extrinsics
+        from tool.camera_understanding import analyze_camera_trajectory
+
         return analyze_camera_trajectory(extrinsics)
 
     @staticmethod
@@ -200,6 +314,8 @@ class pySpatial:
         Returns:
             str or image: path to the rendered image if out_path provided, otherwise image object
         """
+        from tool.novel_view_synthesis import novel_view_synthesis
+
         return novel_view_synthesis(recon, new_camera_pose, width, height, out_path)
     
     
@@ -210,6 +326,8 @@ class pySpatial:
             extrinsics = recon.extrinsics
             # Handle (N, 3, 4) or (N, 4, 4) arrays as list of matrices
             if extrinsics.ndim == 3:
+                from tool.novel_view_synthesis import average_look_at_directions
+
                 return average_look_at_directions(extrinsics)
             # Single extrinsic — can't average, fall back
         return None
@@ -219,49 +337,93 @@ class pySpatial:
         """Rotate camera pose to the right. Uses recon extrinsics to compute rotation axis."""
         axis = pySpatial._get_rotation_axis(recon)
         if angle is None:
-            return rotate_right(extrinsic, axis=axis)
+            from tool.novel_view_synthesis import rotate_right as _rotate_right
+
+            return _rotate_right(extrinsic, axis=axis)
         else:
-            return rotate_right(extrinsic, angle, axis=axis)
+            from tool.novel_view_synthesis import rotate_right as _rotate_right
+
+            return _rotate_right(extrinsic, angle, axis=axis)
 
     @staticmethod
     def rotate_left(extrinsic, angle=None, recon=None):
         """Rotate camera pose to the left. Uses recon extrinsics to compute rotation axis."""
         axis = pySpatial._get_rotation_axis(recon)
         if angle is None:
-            return rotate_left(extrinsic, axis=axis)
+            from tool.novel_view_synthesis import rotate_left as _rotate_left
+
+            return _rotate_left(extrinsic, axis=axis)
         else:
-            return rotate_left(extrinsic, angle, axis=axis)
+            from tool.novel_view_synthesis import rotate_left as _rotate_left
+
+            return _rotate_left(extrinsic, angle, axis=axis)
 
     @staticmethod
     def move_forward(extrinsic, distance=None):
         """Move camera pose forward, Noted that a default small step is provided"""
         if distance is None:
-            return move_forward(extrinsic)
+            from tool.novel_view_synthesis import move_forward as _move_forward
+
+            return _move_forward(extrinsic)
         else:
-            return move_forward(extrinsic, distance)
+            from tool.novel_view_synthesis import move_forward as _move_forward
+
+            return _move_forward(extrinsic, distance)
 
     @staticmethod
     def move_backward(extrinsic, distance=None):
         """Move camera pose backward"""
         if distance is None:
-            return move_backward(extrinsic)
+            from tool.novel_view_synthesis import move_backward as _move_backward
+
+            return _move_backward(extrinsic)
         else:
-            return move_backward(extrinsic, distance)
+            from tool.novel_view_synthesis import move_backward as _move_backward
+
+            return _move_backward(extrinsic, distance)
 
     @staticmethod
     def turn_around(extrinsic, recon=None):
         """Turn camera pose around 180 degrees. Uses recon extrinsics to compute rotation axis."""
         axis = pySpatial._get_rotation_axis(recon)
-        return turn_around(extrinsic, axis=axis)
+        from tool.novel_view_synthesis import turn_around as _turn_around
+
+        return _turn_around(extrinsic, axis=axis)
 
 
 class Agent:
-    def __init__(self, api_key: str = None):
+    def __init__(
+        self,
+        api_key: str = None,
+        backend: str = "local_qwen",
+        local_model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH,
+        model_path: str = None,
+        api_model: str = "gpt-4.1",
+        code_model: str = None,
+        answer_model: str = None,
+        base_url: str = None,
+        device: str = "cuda",
+    ):
         self.api_key = api_key or os.getenv('OPENAI_API_KEY')
+        self.backend = backend
+        self.local_model_path = model_path or local_model_path
+        self.api_model = api_model
+        self.code_model = code_model or api_model
+        self.answer_model = answer_model or api_model
+        self.base_url = resolve_openai_base_url(base_url)
+        self.device = device
         
     def generate_code(self, scene: Scene):
         from agent.codeAgent.query import generate_code_from_query
-        return generate_code_from_query(scene, self.api_key)
+        return generate_code_from_query(
+            scene,
+            self.api_key,
+            backend=self.backend,
+            model=self.code_model,
+            local_model_path=self.local_model_path,
+            base_url=self.base_url,
+            device=self.device,
+        )
         
     def parse_LLM_response(self, scene: Scene, response: str):
         """
@@ -304,9 +466,9 @@ class Agent:
         scene.visual_clue = visual_clue
 
         # Call the answer function with API key
-        return answer(scene, self.api_key)
+        return answer(scene, self.api_key, backend=self.backend, model=self.answer_model, local_model_path=self.local_model_path, base_url=self.base_url, device=self.device)
 
     def basic_qa(self, scene: Scene):
         """Fallback: answer using only images + question, no pySpatial framework."""
         from agent.anwer import answer_without_visual_clue
-        return answer_without_visual_clue(scene, self.api_key)
+        return answer_without_visual_clue(scene, self.api_key, backend=self.backend, model=self.answer_model, local_model_path=self.local_model_path, base_url=self.base_url, device=self.device)

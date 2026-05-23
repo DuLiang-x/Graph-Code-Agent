@@ -37,6 +37,7 @@ def execute_code(code_str: str):
     import os
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
     from pySpatial_Interface import Scene, Reconstruction, pySpatial
+    from spatial_graph import Observer, SpatialGraph, SpatialNode
     import numpy as np
     
     # Create execution context with necessary imports
@@ -44,6 +45,9 @@ def execute_code(code_str: str):
         'Scene': Scene,
         'Reconstruction': Reconstruction, 
         'pySpatial': pySpatial,
+        'SpatialGraph': SpatialGraph,
+        'SpatialNode': SpatialNode,
+        'Observer': Observer,
         'np': np,
         'numpy': np,
         '__builtins__': __builtins__

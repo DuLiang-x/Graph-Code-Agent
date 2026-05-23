@@ -9,96 +9,138 @@ task_description = """
 """
 
 api_specification = """
-    In the PySpatial API, we explicitly introduce the 3D inductive bias.
-    We provide a Scene class that contains the image(s) and a question.
-    Further, we also provide a 3D reconstruction process that can be used to generate a 3D point cloud and camera parameters.
-    
-    class Reconstruction:
-        def __init__(self, point_cloud, extrinsics, intrinsics):
-            self.point_cloud = point_cloud
-            self.extrinsics = extrinsics
-            self.intrinsics = intrinsics
-        
-    class Scene:
-        "Simple scene class that holds image data."
-        
-        def __init__(self, path_to_images: Union[str, List[str]], question: str = ""):
-            self.question = question
-            self.images = self._load_images(path_to_images)
-            self.reconstruction : Reconstruction = None
-        
-        def _load_images(self, path_to_images: Union[str, List[str]]) -> List[str]:
-            "Load image paths from directory or list."
-            if isinstance(path_to_images, str):
-                if os.path.isdir(path_to_images):
-                    # Load all images from directory
-                    image_extensions = ['*.png', '*.jpg', '*.jpeg']
-                    images = []
-                    for ext in image_extensions:
-                        images.extend(glob.glob(os.path.join(path_to_images, ext)))
-                    return sorted(images)
-                else:
-                    # Single image file
-                    return [path_to_images]
-            else:
-                # List of image paths
-                return list(path_to_images)
+    PySpatial exposes two compatible reasoning paths.
 
-    class pySpatial:
-        "Simple interface for 3D vision tools."
-        # we disable other function for now
-        
-        @staticmethod
-        def reconstruct(scene: Scene):
-            "3D reconstruction from scene images."
-            
-            return reconstruct_3d(scene.images)
-        
-        @staticmethod
-        def describe_camera_motion(recon: Reconstruction):
-            "Describe camera motion from reconstruction results.
-            Args:
-            "
-            extrinsics = recon.extrinsics
-            return describe_camera_motion(extrinsics)
+    Graph path (preferred for spatial reasoning):
+        pySpatial.extract_objects(scene, device="cuda", mask_fallback="auto")
+            Extracts question-relevant objects into scene.object_3d_boxes.
+            The implementation uses the local object_3d_extraction package at
+            /data/duliang/pySpatial-test/test/object_3d_extraction.
+            mask_fallback="auto" reads/writes /data/duliang/pySpatial-test/outputs/Omni3D-Bench.
+            mask_fallback="off" reads/writes /data/duliang/pySpatial-test/outputs/Omni3D-Benchnomask.
 
-        @staticmethod
-        def synthesize_novel_view(recon: Reconstruction, new_camera_pose):
-            "Generate novel view synthesis from reconstruction results.
-            Args:
-            "
-            return novel_view_synthesis(recon)
-        
-        # methods to manipulate camera pose
-        # rotate_right/rotate_left/turn_around accept an optional recon argument
-        # to compute the rotation axis from all camera views (recommended)
-        def rotate_right(extrinsic, angle=np.pi/2, recon=None):
+        graph = pySpatial.build_graph(scene)
+            Builds a SpatialGraph from scene.object_3d_boxes.
+            Use graph.list_nodes() to inspect the exact object names available in the graph.
+            Prefer those exact names in all graph calls; do not rewrite object names into snake_case.
 
-        def rotate_left(extrinsic, angle=np.pi/2, recon=None):
+        observer = graph.observer_from_camera()
+        observer = graph.observer_from_object("object_name")
+        observer = graph.observer_from_to("from_object", "to_object")
 
-        def move_forward(extrinsic, distance=0.1):
+        For Omni3D-Bench single-image questions, interpret left/right/front/back spatial language from the camera/image viewpoint by default.
+        Use graph.observer_from_camera() unless the question explicitly says it is from an object's own perspective.
 
-        def move_backward(extrinsic, distance=0.1):
+        SpatialGraph query APIs:
+            graph.distance(a, b) -> float
+            graph.is_above(a, b), graph.is_below(a, b)
+            graph.is_inside(inner, outer), graph.is_on_top(a, b)
+            graph.size_ratio(a, b) -> float
+            graph.height(obj) -> float
+            graph.width(obj) -> float
+            graph.depth(obj) -> float
+            graph.length(obj, axis="auto") -> float
+            graph.ratio(numerator, denominator, eps=1e-9) -> float
+            graph.compare_height(a, b) -> float
+            graph.compare_width(a, b) -> float
+            graph.compare_depth(a, b) -> float
+                These compare_* APIs return signed size differences: size(a) - size(b).
+                They may be negative and must not be used as an object's own height, width, depth, or length.
+            graph.closest_object(target, candidates=None)
+                Returns the nearest object name. It does not accept an observer argument.
+                Do not write graph.closest_object(..., observer=camera).
+            graph.relative_position(a, b, observer)
+            graph.is_left_of(a, b, observer), graph.is_right_of(a, b, observer)
+            graph.is_in_front_of(a, b, observer), graph.is_behind(a, b, observer)
+            graph.angular_offset(a, b, observer) -> float
+            graph.objects_in_view(observer, max_distance=None)
 
-        def turn_around(extrinsic, recon=None):
+        Float-returning APIs produce numbers, not arrays or dictionaries. Do not subscript them:
+            Correct: ratio = graph.size_ratio("tv", "table")
+            Wrong: graph.size_ratio("tv", "table")[0]
 
-        
+        Dimension and ratio rules:
+            For "height of X", use graph.height("X").
+            For "length of X", use graph.length("X").
+            For "width/depth of X", use graph.width("X") or graph.depth("X").
+            For ratio questions, use graph.ratio(numerator, denominator) instead of direct division.
+            Do not use graph.compare_height/width/depth as an object's own size; they are signed differences between two objects.
 
+        Hypothetical reasoning APIs:
+            graph.move_object(name, delta)
+            graph.copy_object(name, new_name)
+            graph.scale_object(name, factor)
+            graph.rotate_object(name, angle, axis="y")
+            graph.snapshot(), graph.restore(snapshot), graph.with_state()
+
+        Visualization:
+            pySpatial.visualize_graph(graph, output_path) returns a PNG path.
+
+    Legacy reconstruction path remains available for comparison:
+        reconstruction = pySpatial.reconstruct(scene)
+        camera_motion = pySpatial.describe_camera_motion(reconstruction)
+        pySpatial.synthesize_novel_view(reconstruction, new_camera_pose)
+
+    Return a compact visual clue. For graph reasoning, prefer returning a dict:
+        {
+            "computed_results": {"answer": ..., "evidence": ...},
+            "visualization_path": optional_png_path
+        }
 
     please follow the instructions to generate the code in the ```python ``` block.
-    
-    ```python
-    def program(input_scene: Scene):
-        reconstruction3D = pySpatial.reconstruct(input_scene)
-        camera_motion = pySpatial.describe_camera_motion(reconstruction3D)
-        return camera_motion
-    ```
-
 """
 
 # in-context learning exmaples
-example_problems = """    
-"""
+example_problems = """
+    Example 1: left/right from camera view
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        camera = graph.observer_from_camera()
+        result = graph.is_left_of("chair", "table", camera)
+        return {"computed_results": {"chair_left_of_table": result}}
+    ```
+
+    Example 2: hypothetical move
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        camera = graph.observer_from_camera()
+        with graph.with_state():
+            graph.move_object("sofa", [2.0, 0.0, 0.0])
+            result = graph.is_right_of("sofa", "tv", camera)
+        return {"computed_results": {"after_move_sofa_right_of_tv": result}}
+    ```
+
+    Example 3: closest object
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nearest = graph.closest_object("table")
+        return {"computed_results": {"closest_to_table": nearest}}
+    ```
+
+    Example 4: height ratio
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        fireplace_h = graph.height("fireplace")
+        table_h = graph.height("coffee table")
+        sofa_h = graph.height("sofa")
+        ratio = graph.ratio(fireplace_h, table_h + sofa_h)
+        return {"computed_results": {"answer": ratio}}
+    ```
+
+    Example 5: object to the right in an image
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        camera = graph.observer_from_camera()
+        result = graph.is_right_of("sofa", "coffee table", camera)
+        return {"computed_results": {"sofa_right_of_coffee_table": result}}
+    ```
+"""    
+
 
 
 code_generation_prompt = f"""
