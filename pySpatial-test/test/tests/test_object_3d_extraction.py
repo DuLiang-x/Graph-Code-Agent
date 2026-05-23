@@ -457,6 +457,60 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     item = result["chair"]
     assert item["box2d"] == [8, 8, 12, 12]
     assert item["candidate_rank_reason"] == "vlm_refinement"
+    assert item["rule_selected_index"] == 0
+    assert item["vlm_selected_index"] == 1
+    assert item["final_selected_index"] == 1
+    assert item["selection_decision"] == "vlm_refinement"
+
+
+def test_vlm_refinement_rejects_small_unclear_black_table():
+    locator = make_locator(
+        {
+            "black table": [
+                {"box2d": [27, 72, 71, 98], "score": 0.47, "prompt": "black table"},
+                {"box2d": [38, 35, 48, 45], "score": 0.20, "prompt": "black table"},
+            ]
+        },
+        vlm_model=FakeVLM(),
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (100, 100), color="white")
+
+    result = locator.extract(image, ["black table"])
+
+    item = result["black table"]
+    assert item["box2d"] == [27, 72, 71, 98]
+    assert item["candidate_rank_reason"] == "rule_ranker"
+    assert item["rule_selected_index"] == 0
+    assert item["vlm_selected_index"] == 1
+    assert item["final_selected_index"] == 0
+    assert item["selection_decision"] == "rule_ranker_vlm_rejected"
+    assert item["selection_reject_reason"] in {"rank_score_too_low", "partial_entity_box"}
+
+
+def test_vlm_refinement_rejects_partial_cabinet_box():
+    locator = make_locator(
+        {
+            "cabinet": [
+                {"box2d": [40, 0, 75, 60], "score": 0.54, "prompt": "cabinet"},
+                {"box2d": [41, 0, 75, 31], "score": 0.35, "prompt": "cabinet"},
+            ]
+        },
+        vlm_model=FakeVLM(),
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (100, 100), color="white")
+
+    result = locator.extract(image, ["cabinet"])
+
+    item = result["cabinet"]
+    assert item["box2d"] == [40, 0, 75, 60]
+    assert item["candidate_rank_reason"] == "rule_ranker"
+    assert item["rule_selected_index"] == 0
+    assert item["vlm_selected_index"] == 1
+    assert item["final_selected_index"] == 0
+    assert item["selection_decision"] == "rule_ranker_vlm_rejected"
+    assert item["selection_reject_reason"] in {"rank_score_too_low", "partial_entity_box"}
 
 def test_vlm_refinement_invalid_response_falls_back_to_first_candidate():
     assert parse_candidate_index("not an index", 3) == 0

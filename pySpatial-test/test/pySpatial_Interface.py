@@ -249,12 +249,14 @@ class pySpatial:
         api_model: str = "gpt-4.1",
         api_key: str = None,
         base_url: str = None,
+        force_extract: bool = False,
     ):
-        for json_path in _object_json_paths(scene, mask_fallback, save_dir=save_dir):
-            cached = _load_object_boxes_from_json(json_path, scene.scene_id)
-            if cached is not None:
-                scene.object_3d_boxes = cached
-                return cached
+        if not force_extract:
+            for json_path in _object_json_paths(scene, mask_fallback, save_dir=save_dir):
+                cached = _load_object_boxes_from_json(json_path, scene.scene_id)
+                if cached is not None:
+                    scene.object_3d_boxes = cached
+                    return cached
 
         from scripts.demo_extract_3d_positions import extract_objects_for_sample
 

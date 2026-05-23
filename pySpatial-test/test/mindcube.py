@@ -307,6 +307,7 @@ SUMMARY_RESULT_KEYS = [
     "mode",
     "mask_fallback",
     "extract_output_dir",
+    "force_extract",
 ]
 
 
@@ -387,10 +388,11 @@ def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
         api_key=config.get("api_key"),
         base_url=config.get("base_url"),
         extract_output_dir=config.get("extract_output_dir"),
+        force_extract=config.get("force_extract", False),
     )
 
 
-def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "reconstruct", mask_fallback: str = "auto", device: str = "cuda", model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH, api_model: str = "gpt-4.1", api_key: str = None, base_url: str = None, extract_output_dir: str = None) -> Dict[str, Any]:
+def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "reconstruct", mask_fallback: str = "auto", device: str = "cuda", model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH, api_model: str = "gpt-4.1", api_key: str = None, base_url: str = None, extract_output_dir: str = None, force_extract: bool = False) -> Dict[str, Any]:
     """
     Process a single JSONL entry through the complete pipeline and extract type information.
     
@@ -436,6 +438,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
                 api_key=api_key,
                 base_url=base_url,
                 save_dir=extract_output_dir,
+                force_extract=force_extract,
             )
             pySpatial.build_graph(scene)
 
@@ -500,6 +503,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
             "mode": mode,
             "mask_fallback": mask_fallback,
             "extract_output_dir": extract_output_dir,
+            "force_extract": force_extract,
         }
 
         return result
@@ -548,6 +552,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
             "mode": mode,
             "mask_fallback": mask_fallback,
             "extract_output_dir": extract_output_dir,
+            "force_extract": force_extract,
             "error": error_msg,
         }
 
@@ -600,6 +605,8 @@ def main():
                        help="Device for local model and object extraction")
     parser.add_argument("--extract_output_dir", type=str, default=None,
                        help="Object extraction/debug output root; defaults to mask_fallback output root")
+    parser.add_argument("--force_extract", action="store_true",
+                       help="Always rerun object extraction instead of reading cached object_3d_positions.json")
 
     args = parser.parse_args()
     
@@ -645,6 +652,7 @@ def main():
     print(f"Base URL: {args.base_url or 'default OpenAI SDK'}")
     print(f"Mask fallback: {args.mask_fallback}")
     print(f"Extract output dir: {args.extract_output_dir or 'default mask_fallback output root'}")
+    print(f"Force extract: {args.force_extract}")
     print("="*60)
     
     # Load all entries first
@@ -709,6 +717,7 @@ def main():
                 api_key=args.api_key,
                 base_url=args.base_url,
                 extract_output_dir=args.extract_output_dir,
+                force_extract=args.force_extract,
             )
             results.append(result)
     else:
@@ -728,6 +737,7 @@ def main():
             "mask_fallback": args.mask_fallback,
             "device": args.device,
             "extract_output_dir": args.extract_output_dir,
+            "force_extract": args.force_extract,
         }
         args_list = [(entry, worker_config) for entry in entries]
 
@@ -848,6 +858,7 @@ def main():
         "base_url": args.base_url,
         "mask_fallback": args.mask_fallback,
         "extract_output_dir": args.extract_output_dir,
+        "force_extract": args.force_extract,
         "overall_metrics": overall_metrics,
         "type_metrics": type_metrics,
         "raw_statistics": dict(type_stats),

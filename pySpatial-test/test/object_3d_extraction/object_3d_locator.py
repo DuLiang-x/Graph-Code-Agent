@@ -95,10 +95,15 @@ class Object3DLocator:
                         "mask_used_for_3d": mask_used_for_3d,
                         "prompt_used": best_detection.get("prompt"),
                         "candidate_rank_reason": best_detection.get("rank_reason"),
+                        "rule_selected_index": best_detection.get("rule_selected_index"),
+                        "vlm_selected_index": best_detection.get("vlm_selected_index"),
+                        "final_selected_index": best_detection.get("final_selected_index"),
+                        "selection_decision": best_detection.get("selection_decision"),
+                        "selection_reject_reason": best_detection.get("selection_reject_reason"),
                         "vlm_response": best_detection.get("vlm_response"),
                         "mask_fallback_reason": mask_fallback_reason,
                         "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
-                        "candidates_considered": summarize_candidates(candidates),
+                        "candidates_considered": summarize_candidates(best_detection.get("_ranked_candidates", candidates)),
                     }
                     continue
 
@@ -126,11 +131,16 @@ class Object3DLocator:
                     "num_points": int(unprojected["num_points"]),
                     "prompt_used": best_detection.get("prompt"),
                     "candidate_rank_reason": best_detection.get("rank_reason"),
+                    "rule_selected_index": best_detection.get("rule_selected_index"),
+                    "vlm_selected_index": best_detection.get("vlm_selected_index"),
+                    "final_selected_index": best_detection.get("final_selected_index"),
+                    "selection_decision": best_detection.get("selection_decision"),
+                    "selection_reject_reason": best_detection.get("selection_reject_reason"),
                     "vlm_response": best_detection.get("vlm_response"),
                     "mask_fallback_reason": mask_fallback_reason,
                     "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
                     "overlap_warnings": overlap_warnings(object_name, box2d, selected_boxes),
-                    "candidates_considered": summarize_candidates(candidates),
+                    "candidates_considered": summarize_candidates(best_detection.get("_ranked_candidates", candidates)),
                 }
 
                 if "score" in best_detection:
@@ -204,27 +214,55 @@ class Object3DLocator:
         save_dir: Optional[Union[str, Path]],
         question: str,
     ) -> Dict[str, object]:
+        rule_ranked = rank_candidates_for_object(image_pil, object_name, candidates, selected_boxes)
+        rule_selected = dict(rule_ranked[0])
+        rule_selected["_ranked_candidates"] = rule_ranked
+        rule_selected["rule_selected_index"] = 0
+        rule_selected["vlm_selected_index"] = None
+        rule_selected["final_selected_index"] = 0
+        rule_selected["selection_decision"] = "rule_ranker"
+        rule_selected["selection_reject_reason"] = None
+
         if self.config.detection.use_vlm_refinement and self.vlm_model is not None:
             selected = select_candidate_with_vlm(
                 self.vlm_model,
                 image_pil,
                 object_name,
-                candidates,
+                rule_ranked,
                 save_dir=save_dir,
                 question=question,
                 selected_boxes=selected_boxes,
             )
-            if selected is not None and vlm_selection_is_plausible(object_name, selected, candidates):
-                selected["rank_reason"] = "vlm_refinement"
-                return selected
+            if selected is None:
+                rule_selected["selection_decision"] = "rule_ranker_vlm_invalid"
+                rule_selected["selection_reject_reason"] = "invalid_vlm_response"
+            else:
+                allowed, reject_reason = validate_vlm_selection(object_name, selected, rule_ranked)
+                rule_selected["vlm_selected_index"] = selected.get("candidate_index")
+                if allowed:
+                    selected = dict(selected)
+                    selected["_ranked_candidates"] = rule_ranked
+                    selected["rule_selected_index"] = 0
+                    selected["vlm_selected_index"] = selected.get("candidate_index")
+                    selected["final_selected_index"] = selected.get("candidate_index")
+                    selected["selection_decision"] = "vlm_refinement"
+                    selected["selection_reject_reason"] = None
+                    selected["rank_reason"] = "vlm_refinement"
+                    return selected
+                rule_selected["selection_decision"] = "rule_ranker_vlm_rejected"
+                rule_selected["selection_reject_reason"] = reject_reason
 
-        selected = rank_detection_candidates(image_pil, object_name, candidates, selected_boxes)
-        selected["rank_reason"] = "rule_ranker"
-        if save_dir is not None:
-            save_candidate_grid(image_pil, object_name, candidates, save_dir)
-            overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
-            selected["candidate_overlay_path"] = str(overlay_path)
-        return selected
+            if save_dir is not None:
+                rule_selected["candidate_overlay_path"] = str(
+                    save_candidate_overlay(image_pil, object_name, rule_ranked, save_dir)
+                )
+
+        rule_selected["rank_reason"] = "rule_ranker"
+        if save_dir is not None and "candidate_overlay_path" not in rule_selected:
+            save_candidate_grid(image_pil, object_name, rule_ranked, save_dir)
+            overlay_path = save_candidate_overlay(image_pil, object_name, rule_ranked, save_dir)
+            rule_selected["candidate_overlay_path"] = str(overlay_path)
+        return rule_selected
 
 
 def detection_prompts_for_object(object_name: str) -> List[str]:
@@ -270,6 +308,7 @@ def rank_candidates_for_object(
     for idx, candidate in enumerate(candidates):
         score, reasons = score_detection_candidate(image_pil, object_name, candidate, selected_boxes)
         item = dict(candidate)
+        item["candidate_index"] = idx
         item["rank_score"] = float(score)
         item["rank_reasons"] = reasons
         scored.append((score, idx, item))
@@ -373,8 +412,10 @@ def select_candidate_with_vlm(
         f"Target object: {object_name}\n"
         f"Object kind: {object_kind}\n"
         f"Question context: {question}\n"
+        "Candidate 0 is the rule-ranked best candidate. Prefer candidate 0 unless another candidate is clearly better.\n"
         "Use the full-image overlay first; the crop grid is only supporting evidence.\n"
         "For entity objects such as white coffee table or black table, avoid boxes that include large carpet/floor regions or multiple objects.\n"
+        "For complete objects such as cabinet, table, sofa, or chair, prefer the full visible object and avoid partial boxes that only cover the top, seat, or one component.\n"
         "For carpet/rug/floor, prefer the large low horizontal floor covering and do not choose fireplace platforms or tabletops.\n"
         "Return only one integer index. If none match, return INVALID."
     )
@@ -393,6 +434,7 @@ def select_candidate_with_vlm(
     if selected_idx is None:
         return None
     selected = dict(candidates[selected_idx])
+    selected["candidate_index"] = selected_idx
     selected["vlm_response"] = str(response)
     if overlay_path is not None:
         selected["candidate_overlay_path"] = str(overlay_path)
@@ -400,18 +442,24 @@ def select_candidate_with_vlm(
 
 
 def vlm_selection_is_plausible(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:
+    return validate_vlm_selection(object_name, selected, candidates)[0]
+
+
+def validate_vlm_selection(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> Tuple[bool, Optional[str]]:
     if not candidates:
-        return False
+        return False, "no_candidates"
     selected_score = float(selected.get("rank_score", selected.get("score", 0.0)))
     best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
-    if selected_score < best_score - 0.35:
-        return False
+    if selected_score < best_score - 0.20:
+        return False, "rank_score_too_low"
     if not is_area_object(object_name):
         selected_area = box_area(selected.get("box2d", [0, 0, 0, 0]))
         best_area = max(1, box_area(candidates[0].get("box2d", [0, 0, 0, 0])))
+        if selected_score < best_score and selected_area < best_area * 0.70 and _prefers_complete_entity(object_name):
+            return False, "partial_entity_box"
         if selected_score < best_score and selected_area > best_area * 2.0:
-            return False
-    return True
+            return False, "entity_box_too_large"
+    return True, None
 
 def save_candidate_grid(
     image_pil: Image.Image,
@@ -551,6 +599,8 @@ def summarize_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, 
             item["score"] = float(candidate["score"])
         if "phrase" in candidate:
             item["phrase"] = candidate["phrase"]
+        if "candidate_index" in candidate:
+            item["candidate_index"] = int(candidate["candidate_index"])
         if "rank_score" in candidate:
             item["rank_score"] = float(candidate["rank_score"])
         if "rank_reasons" in candidate:
@@ -619,6 +669,11 @@ def select_by_relation(ranked, relation: str, width: int, height: int) -> Dict[s
 def is_area_object(object_name: str) -> bool:
     base = _remove_leading_color(_remove_relation_words(object_name.lower()))
     return base in {"carpet", "rug", "floor", "wall", "ceiling"}
+
+
+def _prefers_complete_entity(object_name: str) -> bool:
+    base = _remove_leading_color(_remove_relation_words(object_name.lower()))
+    return any(word in base for word in ("cabinet", "table", "sofa", "chair"))
 
 
 def is_color_object(object_name: str) -> bool:

@@ -209,3 +209,60 @@ def test_extract_objects_writes_missing_save_dir_cache_to_custom_root(monkeypatc
     assert calls["sample"]["id"] == scene_id
     assert calls["output_root"] == custom_root
 
+
+
+def test_extract_objects_force_extract_skips_existing_cache(monkeypatch, tmpdir):
+    scene_id = "scene_force_extract"
+    default_root = Path(str(tmpdir)) / "default"
+    custom_root = Path(str(tmpdir)) / "custom"
+    sample_dir = custom_root / scene_id
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "object_3d_positions.json").write_text(
+        json.dumps({scene_id: {"result": {"stale": {"position": [1, 2, 3]}}}})
+    )
+    monkeypatch.setitem(OBJECT_OUTPUT_ROOTS, "auto", default_root)
+
+    import scripts.demo_extract_3d_positions as demo
+
+    calls = {}
+
+    def fake_extract(sample, output_root, **kwargs):
+        calls["sample"] = sample
+        calls["output_root"] = Path(output_root)
+        return {"result": sample_result()}, str(Path(output_root) / sample["id"] / "object_3d_positions.json")
+
+    monkeypatch.setattr(demo, "extract_objects_for_sample", fake_extract)
+
+    scene = Scene(["image.jpg"], "Where is the chair?", scene_id=scene_id)
+    result = pySpatial.extract_objects(
+        scene,
+        mask_fallback="auto",
+        save_dir=str(custom_root),
+        force_extract=True,
+    )
+
+    assert result == sample_result()
+    assert calls["sample"]["id"] == scene_id
+    assert calls["output_root"] == custom_root
+
+
+def test_extract_objects_default_cache_still_skips_wrapper(monkeypatch, tmpdir):
+    scene_id = "scene_force_extract_off"
+    custom_root = Path(str(tmpdir)) / "custom"
+    sample_dir = custom_root / scene_id
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "object_3d_positions.json").write_text(
+        json.dumps({scene_id: {"result": sample_result()}})
+    )
+
+    import scripts.demo_extract_3d_positions as demo
+
+    def fail_extract(*args, **kwargs):
+        raise AssertionError("extract wrapper should not be called without force_extract")
+
+    monkeypatch.setattr(demo, "extract_objects_for_sample", fail_extract)
+
+    scene = Scene(["image.jpg"], "Where is the chair?", scene_id=scene_id)
+    result = pySpatial.extract_objects(scene, mask_fallback="auto", save_dir=str(custom_root))
+
+    assert result == sample_result()
