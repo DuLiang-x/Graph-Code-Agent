@@ -50,7 +50,8 @@ def test_graph_api_prompt_documents_closest_object_and_float_returns():
 def test_graph_api_prompt_defaults_spatial_directions_to_camera_viewpoint():
     assert "camera/image viewpoint by default" in api_specification
     assert "Use graph.observer_from_camera() unless the question explicitly says" in api_specification
-    assert 'graph.is_right_of("sofa", "coffee table", camera)' in api_specification or 'graph.is_right_of("sofa", "coffee table", camera)' in __import__("agent.prompt.template", fromlist=["example_problems"]).example_problems
+    examples = __import__("agent.prompt.template", fromlist=["example_problems"]).example_problems
+    assert 'graph.is_right_of("sofa", "coffee table", camera)' in api_specification or "graph.is_right_of(target, reference, camera)" in examples
 
 def test_graph_api_prompt_documents_dimension_apis_and_safe_ratio():
     assert "graph.height(obj) -> float" in api_specification
@@ -70,4 +71,14 @@ def test_graph_examples_include_height_ratio_pattern():
     assert 'fireplace_h = graph.height("fireplace")' in example_problems
     assert 'table_h = graph.height("coffee table")' in example_problems
     assert 'ratio = graph.ratio(fireplace_h, table_h + sofa_h)' in example_problems
+
+def test_prompt_documents_known_size_calibration_rule():
+    from agent.prompt.template import example_problems
+
+    assert "Raw graph dimensions are 3D AABB units" in api_specification
+    assert 'If the question gives a known real size such as "X is 2m long"' in api_specification
+    assert "scale = known_real_size / graph.length(reference_object)" in api_specification
+    assert "Do not directly return raw graph.length(target_object) as meters" in api_specification
+    assert "table_length_m = 2.0" in example_problems
+    assert "answer = graph.ratio(sofa_raw * table_length_m, table_raw)" in example_problems
 

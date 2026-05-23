@@ -65,6 +65,11 @@ api_specification = """
             For "width/depth of X", use graph.width("X") or graph.depth("X").
             For ratio questions, use graph.ratio(numerator, denominator) instead of direct division.
             Do not use graph.compare_height/width/depth as an object's own size; they are signed differences between two objects.
+            Raw graph dimensions are 3D AABB units, not guaranteed real meters.
+            If the question gives a known real size such as "X is 2m long", use it as a scale reference:
+                scale = known_real_size / graph.length(reference_object)
+                answer = graph.length(target_object) * scale
+            Do not directly return raw graph.length(target_object) as meters when a known reference size is provided.
 
         Hypothetical reasoning APIs:
             graph.move_object(name, delta)
@@ -131,13 +136,19 @@ example_problems = """
         return {"computed_results": {"answer": ratio}}
     ```
 
-    Example 5: object to the right in an image
+    Example 5: known-size length calibration
     ```python
     def program(input_scene: Scene):
         graph = pySpatial.build_graph(input_scene)
         camera = graph.observer_from_camera()
-        result = graph.is_right_of("sofa", "coffee table", camera)
-        return {"computed_results": {"sofa_right_of_coffee_table": result}}
+        reference = "coffee table"
+        target = "sofa"
+        table_length_m = 2.0
+        table_raw = graph.length(reference)
+        sofa_raw = graph.length(target)
+        target_is_right = graph.is_right_of(target, reference, camera)
+        answer = graph.ratio(sofa_raw * table_length_m, table_raw)
+        return {"computed_results": {"answer": answer, "target_is_right": target_is_right}}
     ```
 """    
 

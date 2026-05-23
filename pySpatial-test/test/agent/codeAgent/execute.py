@@ -39,6 +39,7 @@ def execute_code(code_str: str):
     from pySpatial_Interface import Scene, Reconstruction, pySpatial
     from spatial_graph import Observer, SpatialGraph, SpatialNode
     import numpy as np
+    import math
     
     # Create execution context with necessary imports
     execution_globals = {
@@ -50,6 +51,7 @@ def execute_code(code_str: str):
         'Observer': Observer,
         'np': np,
         'numpy': np,
+        'math': math,
         '__builtins__': __builtins__
     }
     
