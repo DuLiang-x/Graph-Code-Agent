@@ -98,6 +98,8 @@ def test_summarize_result_for_output_removes_large_intermediate_fields():
         "generated_answer": "yes",
         "generated_code": "def program(input_scene): pass",
         "answer_correct": True,
+        "float_relative_error": 0.01,
+        "float_mra": 1.0,
         "flowchart_path": "flowcharts/omni3d_0_flowchart.png",
         "object_3d_boxes": {"tv": _box()},
         "visual_clue": {"computed_results": {"answer": "yes"}},
@@ -110,6 +112,8 @@ def test_summarize_result_for_output_removes_large_intermediate_fields():
     assert summary["generated_answer"] == "yes"
     assert summary["generated_code"] == "def program(input_scene): pass"
     assert summary["flowchart_path"] == "flowcharts/omni3d_0_flowchart.png"
+    assert summary["float_relative_error"] == 0.01
+    assert summary["float_mra"] == 1.0
     assert "object_3d_boxes" not in summary
     assert "visual_clue" not in summary
     assert "generated_response" not in summary

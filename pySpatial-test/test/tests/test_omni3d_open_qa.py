@@ -8,7 +8,7 @@ if str(TEST_ROOT) not in sys.path:
 
 from agent.anwer import SpatialAnswer
 from agent.model_backend.local_qwen import parse_spatial_answer_text
-from mindcube import evaluate_answer_correctness, load_omni3d_entries
+from mindcube import compute_acc_mar, compute_float_mra, compute_float_relative_error, evaluate_answer_correctness, load_omni3d_entries
 from scripts.demo_extract_3d_positions import extract_object_names_from_omni3d_question
 
 
@@ -34,6 +34,25 @@ def test_omni3d_float_and_string_evaluation():
     assert evaluate_answer_correctness("No, the fireplace would not be visible", "no", "str")
     assert not evaluate_answer_correctness("no", "yes", "str")
     assert not evaluate_answer_correctness("The answer is probably yes", "yes", "str")
+
+
+def test_float_mra_metrics():
+    assert compute_float_relative_error("1.1", 1.0) == 0.10000000000000009
+    assert compute_float_mra("0.948", 0.948) == 1.0
+    assert compute_float_mra("1.1", 1.0) == 0.8
+    assert compute_float_mra("no number", 1.0) is None
+    assert compute_float_mra("1.0", 0.0) is None
+
+
+def test_acc_mar_uses_mra_for_float_and_accuracy_for_other_types():
+    results = [
+        {"answer_type": "float", "expected_answer": 1.0, "generated_answer": "1.0", "float_mra": 1.0, "answer_correct": True},
+        {"answer_type": "float", "expected_answer": 1.0, "generated_answer": "1.1", "float_mra": 0.8, "answer_correct": False},
+        {"answer_type": "str", "expected_answer": "yes", "generated_answer": "yes", "answer_correct": True},
+        {"answer_type": "int", "expected_answer": 2, "generated_answer": "3", "answer_correct": False},
+    ]
+
+    assert compute_acc_mar(results) == {"acc_mar": 0.7, "acc_mar_count": 4}
 
 
 def test_load_omni3d_entries_builds_scene_fields(tmpdir):
