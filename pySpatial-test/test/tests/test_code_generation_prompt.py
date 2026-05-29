@@ -5,7 +5,13 @@ TEST_ROOT = Path(__file__).resolve().parents[1]
 if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 from agent.codeAgent.query import _available_graph_objects_prompt
-from agent.prompt.template import api_specification
+from agent.prompt.template import (
+    ANSWER_FORMAT_RULES,
+    answer_prompt,
+    api_specification,
+    code_generation_prompt,
+    code_repair_prompt,
+)
 from pySpatial_Interface import Scene
 from spatial_graph import SpatialGraph
 
@@ -82,3 +88,70 @@ def test_prompt_documents_known_size_calibration_rule():
     assert "table_length_m = 2.0" in example_problems
     assert "answer = graph.ratio(sofa_raw * table_length_m, table_raw)" in example_problems
 
+
+def test_answer_prompt_includes_final_format_rules():
+    assert "Final answer formatting rules" in ANSWER_FORMAT_RULES
+    assert "computed_results" in ANSWER_FORMAT_RULES
+    assert 'answer exactly "yes" or "no"' in ANSWER_FORMAT_RULES
+    assert "answer with a single numeric value" in ANSWER_FORMAT_RULES
+    assert "Do not output Python code" in ANSWER_FORMAT_RULES
+    assert "Final answer formatting rules" in answer_prompt
+
+
+def test_graph_api_prompt_documents_observer_selection_rules():
+    assert "Observer selection rules for Omni3D-Bench" in api_specification
+    assert "Always decide the observer before calling left/right/front/back APIs" in api_specification
+    assert "For single-image Omni3D-Bench questions, use graph.observer_from_camera() by default" in api_specification
+    assert 'Use graph.observer_from_object("object_name")' in api_specification
+    assert 'Use graph.observer_from_to("from_object", "to_object")' in api_specification
+    assert "do not call graph.is_left_of, graph.is_right_of, graph.is_in_front_of, or graph.is_behind without an observer" in api_specification
+
+
+def test_code_generation_prompt_reminds_observer_choice():
+    assert "Before writing code for left/right/front/back relations, first choose the observer" in code_generation_prompt
+    assert "default to graph.observer_from_camera()" in code_generation_prompt
+    assert "explicit object perspective or from-to perspective" in code_generation_prompt
+
+
+def test_code_repair_prompt_documents_common_execution_fixes():
+    assert "The previously generated code failed during execution" in code_repair_prompt
+    assert "Keep the function signature as: def program(input_scene: Scene):" in code_repair_prompt
+    assert "object name mismatch" in code_repair_prompt
+    assert "graph.list_nodes()" in code_repair_prompt
+    assert "Do not rewrite object names into snake_case" in code_repair_prompt
+    assert "graph.closest_object" in code_repair_prompt
+    assert "subscripting a float result" in code_repair_prompt
+    assert "do not call pySpatial.extract_objects again" in code_repair_prompt
+
+
+def test_graph_examples_include_omni3d_common_patterns():
+    from agent.prompt.template import example_problems
+
+    assert "Example 6: above/below relation" in example_problems
+    assert 'graph.is_above("lamp", "table")' in example_problems
+    assert 'graph.is_in_front_of("chair", "desk", camera)' in example_problems
+    assert 'graph.distance("chair", "table")' in example_problems
+    assert 'chair_h = graph.height("chair")' in example_problems
+    assert 'observer = graph.observer_from_object("car")' in example_problems
+    assert 'observer = graph.observer_from_to("person", "tv")' in example_problems
+    assert "use the real node names that exist in graph.list_nodes()" in example_problems
+
+
+def test_camera_semantics_are_documented_for_graph_prompt():
+    from agent.prompt.template import example_problems
+
+    assert "Camera semantics" in api_specification
+    assert 'Do not detect, segment, or localize "camera" as an object' in api_specification
+    assert 'Do not expect "camera" to appear in graph.list_nodes()' in api_specification
+    assert 'Do not call graph.observer_from_object("camera")' in api_specification
+    assert 'Never use graph.observer_from_object("camera") for camera perspective' in api_specification
+    assert "the question says \"from the camera's perspective\"" in api_specification
+    assert 'the question says "from the image perspective"' in api_specification
+    assert "the question says \"from the viewer's perspective\"" in api_specification
+    assert "visible object's own perspective" in api_specification
+    assert 'Do not call graph.observer_from_object("camera").' in code_generation_prompt
+    assert "Do not treat camera as a graph node" in code_generation_prompt
+    assert "Example 12: camera perspective is not a graph node" in example_problems
+    assert 'camera = graph.observer_from_camera()' in example_problems
+    assert 'graph.is_left_of("chair", "table", camera)' in example_problems
+    assert 'Do not use graph.observer_from_object("camera"). The camera is the current image viewpoint, not an object node.' in example_problems

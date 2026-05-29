@@ -251,6 +251,7 @@ class pySpatial:
         base_url: str = None,
         force_extract: bool = False,
         extractor=None,
+        use_vlm_object_extraction: bool = True,
     ):
         if not force_extract:
             for json_path in _object_json_paths(scene, mask_fallback, save_dir=save_dir):
@@ -280,6 +281,7 @@ class pySpatial:
             api_key=api_key,
             base_url=resolve_openai_base_url(base_url),
             extractor=extractor,
+            use_vlm_object_extraction=use_vlm_object_extraction,
         )
         scene.object_3d_boxes = record.get("result", {})
         return scene.object_3d_boxes
@@ -425,6 +427,21 @@ class Agent:
         return generate_code_from_query(
             scene,
             self.api_key,
+            backend=self.backend,
+            model=self.code_model,
+            local_model_path=self.local_model_path,
+            base_url=self.base_url,
+            device=self.device,
+        )
+        
+    def repair_code(self, scene: Scene, previous_response: str = None, previous_code: str = None, error: str = None):
+        from agent.codeAgent.query import repair_code_from_error
+        return repair_code_from_error(
+            scene,
+            previous_response=previous_response,
+            previous_code=previous_code,
+            error=error,
+            api_key=self.api_key,
             backend=self.backend,
             model=self.code_model,
             local_model_path=self.local_model_path,

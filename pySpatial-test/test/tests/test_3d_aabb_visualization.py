@@ -8,6 +8,7 @@ if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
 from object_3d_extraction.visualize_3d_aabb import (
+    _format_spatial_info_for_panel,
     _object_debug_row_height,
     _object_debug_thumb_size,
     _plot_box_corners,
@@ -52,6 +53,7 @@ def _base_results():
             "box3d_min": [-0.1, -0.3, -1.7],
             "box3d_max": [0.3, 0.0, -1.3],
             "box3d_size": [0.4, 0.3, 0.4],
+            "box3d_center": [0.1, -0.15, -1.5],
             "depth_mode": 1.5,
             "num_points": 120,
         },
@@ -60,10 +62,21 @@ def _base_results():
             "box3d_min": [-1.0, -0.55, -2.8],
             "box3d_max": [1.0, -0.45, -1.2],
             "box3d_size": [2.0, 0.1, 1.6],
+            "box3d_center": [0.0, -0.5, -2.0],
             "depth_mode": 2.0,
             "num_points": 500,
         },
     }
+
+
+def test_spatial_info_panel_text_includes_agent_3d_fields():
+    text = _format_spatial_info_for_panel(_base_results())
+
+    assert "Extracted 3D Objects" in text
+    assert "white coffee table" in text
+    assert "pos=[0.100, -0.200, -1.500]" in text
+    assert "center=[0.100, -0.150, -1.500]" in text
+    assert "size=[0.400, 0.300, 0.400]" in text
 
 
 def test_visualization_with_fallback_fields(tmpdir):
@@ -112,7 +125,7 @@ def test_visualization_with_object_debug_images(tmpdir):
 
 def test_object_debug_images_use_half_input_image_size(tmpdir):
     input_size = (400, 240)
-    expected_thumb_size = (200, 120)
+    expected_thumb_size = (100, 60)
     _write_object_debug_images(tmpdir, "white coffee table", size=input_size)
     _write_object_debug_images(tmpdir, "carpet", size=input_size)
 
@@ -122,7 +135,7 @@ def test_object_debug_images_use_half_input_image_size(tmpdir):
     assert _object_debug_thumb_size(input_size) == expected_thumb_size
     with Image.open(paths["panel_path"]) as image:
         expected_object_height = 42 + 2 * _object_debug_row_height(expected_thumb_size) + 10
-        assert image.size[1] == 420 + expected_object_height + 780 + 120
+        assert image.size[1] == 600 + expected_object_height + 850 + 120
 
 
 def test_visualization_with_partial_fallback_fields(tmpdir):

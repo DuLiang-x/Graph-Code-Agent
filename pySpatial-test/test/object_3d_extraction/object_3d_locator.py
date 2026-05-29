@@ -407,18 +407,53 @@ def select_candidate_with_vlm(
     overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
     overlay_image = Image.open(overlay_path).convert("RGB") if overlay_path is not None else make_candidate_overlay(image_pil, candidates)
     object_kind = "area" if is_area_object(object_name) else "entity"
-    prompt = (
-        "Choose the single numbered bounding box that best matches the target object in the full image.\n"
-        f"Target object: {object_name}\n"
-        f"Object kind: {object_kind}\n"
-        f"Question context: {question}\n"
-        "Candidate 0 is the rule-ranked best candidate. Prefer candidate 0 unless another candidate is clearly better.\n"
-        "Use the full-image overlay first; the crop grid is only supporting evidence.\n"
-        "For entity objects such as white coffee table or black table, avoid boxes that include large carpet/floor regions or multiple objects.\n"
-        "For complete objects such as cabinet, table, sofa, or chair, prefer the full visible object and avoid partial boxes that only cover the top, seat, or one component.\n"
-        "For carpet/rug/floor, prefer the large low horizontal floor covering and do not choose fireplace platforms or tabletops.\n"
-        "Return only one integer index. If none match, return INVALID."
-    )
+    prompt = f"""
+Choose the single numbered bounding box that best matches the target object in the full image.
+
+Target object: {object_name}
+Object kind: {object_kind}
+Question context: {question}
+
+Candidate 0 is the rule-ranked best candidate, but you may choose another candidate if it better matches the exact target object category and question context.
+
+Selection rules:
+- Select the candidate that corresponds to the object referred to in the question, not just the most visually obvious object of the category.
+- Use spatial/contextual clues in the question, such as color, material, relative position, nearby objects, and role in the scene.
+- If the question distinguishes similar objects, choose the candidate matching the distinguishing phrase, such as "white coffee table", "black table", "person wearing a hat", "left chair", or "closer sofa".
+- Use the full-image overlay first to understand the object's position in the whole scene.
+- Use the crop grid only as supporting evidence for object identity and box quality.
+- Prefer complete visible objects over partial parts when the target is a complete object.
+- Avoid boxes that include multiple unrelated objects or large background regions unless the target is an area object such as carpet, rug, floor, wall, or ceiling.
+
+Object-specific rules:
+- For entity objects such as white coffee table, black table, cabinet, chair, sofa, bed, plant, person, or car, avoid boxes that include large carpet/floor/background regions or multiple objects.
+- For complete objects such as cabinet, table, sofa, bed, or chair, prefer the full visible object and avoid partial boxes that only cover the top, seat, backrest, leg, or one component.
+- For carpet/rug/floor, prefer the large low horizontal floor-covering region and do not choose fireplace platforms, tabletops, beds, sofas, or other flat surfaces.
+- For entity objects, avoid overly large boxes that mostly cover floor/carpet/background.
+
+Similar-object rules:
+- For visually similar but different categories such as chair, stool, bench, sofa, couch, ottoman, and seat, choose the candidate that matches the exact target category in the question.
+- Do not select a stool for "chair" if a chair candidate is available.
+- Do not select a chair for "stool" if a stool candidate is available.
+- Do not select a chair for "bench", "sofa", "couch", or "ottoman" unless the target object in the question is actually "chair".
+- Do not select an ottoman for "stool" or a stool for "ottoman" unless the question uses a generic phrase such as "seat" and no exact candidate exists.
+- Use visual cues to distinguish them:
+  - chair: usually has a backrest and may have arms;
+  - stool: usually has no backrest and is smaller/taller as a simple seat;
+  - bench: usually elongated and can seat multiple people;
+  - sofa/couch: usually larger, padded, and designed for multiple people;
+  - ottoman: usually a low padded seat or footrest, often without a backrest.
+- If the question contains an attribute such as color, material, size, or relative location, prefer the candidate matching both the category and the attribute.
+
+Relation modifier rules:
+- Treat words such as rightmost, leftmost, topmost, and bottommost as part of the target object phrase, not as optional context.
+- For "rightmost chair" or similar targets, choose the rightmost complete candidate among candidates that match the target category.
+- Do not choose a larger, clearer, or more central candidate if it violates the explicit rightmost/leftmost/topmost/bottommost modifier.
+
+Return format:
+- Return only one integer index.
+- If none of the numbered candidates match the target object, return INVALID.
+"""
     messages = [
         {
             "role": "user",
@@ -452,6 +487,8 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
     best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
     if selected_score < best_score - 0.20:
         return False, "rank_score_too_low"
+    if not _selection_matches_relation(object_name, selected, candidates):
+        return False, "relation_mismatch"
     if not is_area_object(object_name):
         selected_area = box_area(selected.get("box2d", [0, 0, 0, 0]))
         best_area = max(1, box_area(candidates[0].get("box2d", [0, 0, 0, 0])))
@@ -650,7 +687,7 @@ def relation_modifier(object_name: str) -> str:
 
 
 def select_by_relation(ranked, relation: str, width: int, height: int) -> Dict[str, object]:
-    candidates = [item[2] for item in ranked]
+    candidates = _reasonable_relation_candidates([item[2] for item in ranked])
     if relation == "leftmost":
         return min(candidates, key=lambda item: box_center(item["box2d"])[0])
     if relation == "rightmost":
@@ -664,6 +701,46 @@ def select_by_relation(ranked, relation: str, width: int, height: int) -> Dict[s
         return min(candidates, key=lambda item: distance(box_center(item["box2d"]), image_center))
     ranked.sort(key=lambda item: item[0], reverse=True)
     return ranked[0][2]
+
+
+def _reasonable_relation_candidates(candidates: List[Dict[str, object]], score_margin: float = 0.25) -> List[Dict[str, object]]:
+    if not candidates:
+        return []
+    best_score = max(float(item.get("rank_score", item.get("score", 0.0))) for item in candidates)
+    reasonable = [
+        item for item in candidates
+        if float(item.get("rank_score", item.get("score", 0.0))) >= best_score - score_margin
+    ]
+    return reasonable or candidates
+
+
+def _same_box(a, b) -> bool:
+    if a is None or b is None:
+        return False
+    return [int(v) for v in a] == [int(v) for v in b]
+
+
+def _selection_matches_relation(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:
+    relation = relation_modifier(object_name)
+    if relation not in {"leftmost", "rightmost", "topmost", "bottommost"}:
+        return True
+    reasonable = _reasonable_relation_candidates(candidates)
+    selected_box = selected.get("box2d", [0, 0, 0, 0])
+    if not any(_same_box(selected_box, item.get("box2d", [0, 0, 0, 0])) for item in reasonable):
+        return False
+    if relation == "leftmost":
+        expected = min(reasonable, key=lambda item: box_center(item["box2d"])[0])
+        return box_center(selected_box)[0] <= box_center(expected["box2d"])[0] + 1.0
+    if relation == "rightmost":
+        expected = max(reasonable, key=lambda item: box_center(item["box2d"])[0])
+        return box_center(selected_box)[0] >= box_center(expected["box2d"])[0] - 1.0
+    if relation == "topmost":
+        expected = min(reasonable, key=lambda item: box_center(item["box2d"])[1])
+        return box_center(selected_box)[1] <= box_center(expected["box2d"])[1] + 1.0
+    if relation == "bottommost":
+        expected = max(reasonable, key=lambda item: box_center(item["box2d"])[1])
+        return box_center(selected_box)[1] >= box_center(expected["box2d"])[1] - 1.0
+    return True
 
 
 def is_area_object(object_name: str) -> bool:

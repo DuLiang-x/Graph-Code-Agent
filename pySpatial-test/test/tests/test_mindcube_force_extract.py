@@ -35,6 +35,7 @@ def test_mindcube_force_extract_cli_is_passed_to_sequential_processing(monkeypat
         "--dataset_json", str(tmpdir.join("annotations.json")),
         "--mode", "graph",
         "--force_extract",
+        "--max_code_repair_attempts", "2",
         "--output_file", str(tmpdir.join("out")),
         "--num_processes", "1",
     ])
@@ -47,6 +48,7 @@ def test_mindcube_force_extract_cli_is_passed_to_sequential_processing(monkeypat
     mindcube.main()
 
     assert captured["force_extract"] is True
+    assert captured["max_code_repair_attempts"] == 2
 
 
 def test_mindcube_wrapper_passes_force_extract_to_worker(monkeypatch):
@@ -65,10 +67,11 @@ def test_mindcube_wrapper_passes_force_extract_to_worker(monkeypatch):
 
     mindcube.process_scene_with_agent_wrapper((
         {"id": "omni3d_0", "question": "q", "images": ["image.jpg"]},
-        {"mode": "graph", "force_extract": True},
+        {"mode": "graph", "force_extract": True, "max_code_repair_attempts": 3},
     ))
 
     assert captured["force_extract"] is True
+    assert captured["max_code_repair_attempts"] == 3
 
 
 def test_mindcube_sequential_reuses_one_extractor(monkeypatch, tmpdir):

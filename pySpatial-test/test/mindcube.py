@@ -23,6 +23,7 @@ import time
 import threading
 import textwrap
 import tempfile
+import traceback
 try:
     import backoff
 except ImportError:
@@ -239,12 +240,14 @@ def _append_flowchart_footer(panel_path: str, output_path: Path, result: Dict[st
     correctness = "Correct" if result.get("answer_correct") else "Incorrect"
     fallback = "yes" if result.get("fallback_used") else "no"
     error = result.get("error") or "N/A"
+    repair = "yes" if result.get("code_repair_used") else "no"
+    repair_attempts = result.get("code_repair_attempts", 0)
 
     sections = [
         ("CodeAgent Generated Code", _wrap_flowchart_text(code, width=120, max_lines=120), mono_font),
         ("Generated Answer", _wrap_flowchart_text(answer, width=120, max_lines=20), body_font),
         ("Answer Reasoning", _wrap_flowchart_text(reasoning, width=120, max_lines=35), body_font),
-        ("Evaluation", _wrap_flowchart_text(f"Expected: {result.get('expected_answer')} | Correctness: {correctness} | Fallback used: {fallback} | Error: {error}", width=120, max_lines=12), body_font),
+        ("Evaluation", _wrap_flowchart_text(f"Expected: {result.get('expected_answer')} | Correctness: {correctness} | Fallback used: {fallback} | Code repair: {repair} ({repair_attempts}) | Error: {error}", width=120, max_lines=12), body_font),
     ]
 
     footer_height = padding
@@ -352,6 +355,12 @@ SUMMARY_RESULT_KEYS = [
     "mask_fallback",
     "extract_output_dir",
     "force_extract",
+    "use_vlm_object_extraction",
+    "code_repair_used",
+    "code_repair_attempts",
+    "code_repair_error",
+    "initial_generated_code",
+    "initial_generated_response",
 ]
 
 
@@ -411,6 +420,7 @@ class LazyObjectExtractor:
         api_model: str,
         api_key: str = None,
         base_url: str = None,
+        use_vlm_object_extraction: bool = True,
     ):
         self.kwargs = {
             "device": device,
@@ -421,6 +431,7 @@ class LazyObjectExtractor:
             "api_model": api_model,
             "api_key": api_key,
             "base_url": base_url,
+            "use_vlm_object_extraction": use_vlm_object_extraction,
         }
         self._runner = None
 
@@ -444,6 +455,7 @@ def build_object_extractor(
     api_model: str,
     api_key: str = None,
     base_url: str = None,
+    use_vlm_object_extraction: bool = True,
 ):
     if mode != "graph":
         return None
@@ -455,6 +467,7 @@ def build_object_extractor(
         api_model=api_model,
         api_key=api_key,
         base_url=base_url,
+        use_vlm_object_extraction=use_vlm_object_extraction,
     )
 
 
@@ -469,6 +482,7 @@ def get_worker_object_extractor(config: Dict[str, Any]):
         config.get("api_model", "gpt-4.1"),
         config.get("api_key"),
         config.get("base_url"),
+        config.get("use_vlm_object_extraction", True),
     )
     if key not in _WORKER_OBJECT_EXTRACTORS:
         _WORKER_OBJECT_EXTRACTORS[key] = build_object_extractor(
@@ -480,6 +494,7 @@ def get_worker_object_extractor(config: Dict[str, Any]):
             api_model=config.get("api_model", "gpt-4.1"),
             api_key=config.get("api_key"),
             base_url=config.get("base_url"),
+            use_vlm_object_extraction=config.get("use_vlm_object_extraction", True),
         )
     return _WORKER_OBJECT_EXTRACTORS[key]
 
@@ -522,10 +537,102 @@ def process_scene_with_agent_wrapper(args_tuple) -> Dict[str, Any]:
         extract_output_dir=config.get("extract_output_dir"),
         force_extract=config.get("force_extract", False),
         extractor=extractor,
+        use_vlm_object_extraction=config.get("use_vlm_object_extraction", True),
+        max_code_repair_attempts=config.get("max_code_repair_attempts", 1),
     )
 
 
-def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "reconstruct", mask_fallback: str = "auto", device: str = "cuda", model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH, api_model: str = "gpt-4.1", api_key: str = None, base_url: str = None, extract_output_dir: str = None, force_extract: bool = False, extractor=None) -> Dict[str, Any]:
+
+def generate_parse_execute_with_repair(agent: Agent, scene: Scene, max_code_repair_attempts: int = 1) -> Dict[str, Any]:
+    generated_response = call_agent_with_retry(agent, 'generate_code', scene)
+    parsed_code = agent.parse_LLM_response(scene, generated_response)
+    initial_generated_response = generated_response
+    initial_generated_code = parsed_code
+    visual_clue = None
+    parse_success = parsed_code is not None and parsed_code.strip() != ""
+    execution_success = False
+    code_repair_used = False
+    code_repair_attempts = 0
+    code_repair_error = None
+    last_response = generated_response
+    last_code = parsed_code
+    last_error = None
+
+    max_code_repair_attempts = max(0, int(max_code_repair_attempts or 0))
+
+    while True:
+        if parse_success:
+            try:
+                visual_clue = agent.execute(scene)
+                execution_success = visual_clue != "there is an error during code generation, no visual clue provided"
+                if execution_success:
+                    return {
+                        "generated_response": last_response,
+                        "parsed_code": last_code,
+                        "visual_clue": visual_clue,
+                        "parse_success": True,
+                        "execution_success": True,
+                        "code_repair_used": code_repair_used,
+                        "code_repair_attempts": code_repair_attempts,
+                        "code_repair_error": code_repair_error,
+                        "initial_generated_response": initial_generated_response,
+                        "initial_generated_code": initial_generated_code,
+                    }
+                last_error = str(visual_clue)
+            except Exception as exc:
+                last_error = "Execution failed: {}\nTraceback: {}".format(exc, traceback.format_exc())
+                execution_success = False
+        else:
+            last_error = "Code parsing failed: no ```python``` code block found in model response."
+
+        code_repair_error = last_error
+        if code_repair_attempts >= max_code_repair_attempts:
+            return {
+                "generated_response": last_response,
+                "parsed_code": last_code,
+                "visual_clue": visual_clue,
+                "parse_success": parse_success,
+                "execution_success": execution_success,
+                "code_repair_used": code_repair_used,
+                "code_repair_attempts": code_repair_attempts,
+                "code_repair_error": code_repair_error,
+                "initial_generated_response": initial_generated_response,
+                "initial_generated_code": initial_generated_code,
+            }
+
+        code_repair_used = True
+        code_repair_attempts += 1
+        try:
+            repair_response = call_agent_with_retry(
+                agent,
+                'repair_code',
+                scene,
+                previous_response=last_response,
+                previous_code=last_code,
+                error=last_error,
+            )
+        except Exception as exc:
+            code_repair_error = "Code repair request failed: {}\nTraceback: {}".format(exc, traceback.format_exc())
+            return {
+                "generated_response": last_response,
+                "parsed_code": last_code,
+                "visual_clue": visual_clue,
+                "parse_success": parse_success,
+                "execution_success": False,
+                "code_repair_used": code_repair_used,
+                "code_repair_attempts": code_repair_attempts,
+                "code_repair_error": code_repair_error,
+                "initial_generated_response": initial_generated_response,
+                "initial_generated_code": initial_generated_code,
+            }
+
+        last_response = repair_response
+        last_code = agent.parse_LLM_response(scene, repair_response)
+        parsed_code = last_code
+        parse_success = parsed_code is not None and parsed_code.strip() != ""
+
+
+def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "reconstruct", mask_fallback: str = "auto", device: str = "cuda", model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH, api_model: str = "gpt-4.1", api_key: str = None, base_url: str = None, extract_output_dir: str = None, force_extract: bool = False, extractor=None, use_vlm_object_extraction: bool = True, max_code_repair_attempts: int = 1) -> Dict[str, Any]:
     """
     Process a single JSONL entry through the complete pipeline and extract type information.
     
@@ -559,6 +666,11 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
     execution_success = False
     answer_generation_success = False
     parse_success = False
+    code_repair_used = False
+    code_repair_attempts = 0
+    code_repair_error = None
+    initial_generated_code = None
+    initial_generated_response = None
     try:
         if mode == "graph":
             pySpatial.extract_objects(
@@ -573,34 +685,40 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
                 save_dir=extract_output_dir,
                 force_extract=force_extract,
                 extractor=extractor,
+                use_vlm_object_extraction=use_vlm_object_extraction,
             )
             pySpatial.build_graph(scene)
 
-        # Step 1: Generate code using the agent (with retry)
-        generated_response = call_agent_with_retry(agent, 'generate_code', scene)
+        # Step 1-2: Generate, parse, execute code, with optional repair retry.
+        code_result = generate_parse_execute_with_repair(
+            agent,
+            scene,
+            max_code_repair_attempts=max_code_repair_attempts,
+        )
+        generated_response = code_result["generated_response"]
+        parsed_code = code_result["parsed_code"]
+        visual_clue = code_result["visual_clue"]
+        parse_success = code_result["parse_success"]
+        execution_success = code_result["execution_success"]
+        code_repair_used = code_result["code_repair_used"]
+        code_repair_attempts = code_result["code_repair_attempts"]
+        code_repair_error = code_result["code_repair_error"]
+        initial_generated_response = code_result["initial_generated_response"]
+        initial_generated_code = code_result["initial_generated_code"]
 
-        # Parse the response to extract code patterns
-        parsed_code = agent.parse_LLM_response(scene, generated_response)
-        parse_success = parsed_code is not None and parsed_code.strip() != ""
+        # Step 3: Generate answer using visual clue (with retry)
+        if execution_success:
+            answer_response = call_agent_with_retry(agent, 'answer', scene, visual_clue)
+            answer_generation_success = answer_response is not None
 
-        # Step 2: Execute code to get visual clue (if parsing was successful)
-        if parse_success:
-            visual_clue = agent.execute(scene)
-            execution_success = visual_clue != "there is an error during code generation, no visual clue provided"
+            if answer_generation_success:
+                generated_answer = answer_response.answer
+                answer_reasoning = getattr(answer_response, "reasoning", None)
+                answer_source = "graph"
 
-            # Step 3: Generate answer using visual clue (with retry)
-            if execution_success:
-                answer_response = call_agent_with_retry(agent, 'answer', scene, visual_clue)
-                answer_generation_success = answer_response is not None
-
-                if answer_generation_success:
-                    generated_answer = answer_response.answer
-                    answer_reasoning = getattr(answer_response, "reasoning", None)
-                    answer_source = "graph"
-
-                    # Step 4: Evaluate correctness
-                    if expected_answer is not None and generated_answer is not None:
-                        answer_correct = evaluate_answer_correctness(generated_answer, expected_answer, answer_type)
+                # Step 4: Evaluate correctness
+                if expected_answer is not None and generated_answer is not None:
+                    answer_correct = evaluate_answer_correctness(generated_answer, expected_answer, answer_type)
 
         # --- Fallback to basic QA if pySpatial pipeline didn't produce an answer ---
         if not answer_generation_success or generated_answer is None:
@@ -638,6 +756,12 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
             "mask_fallback": mask_fallback,
             "extract_output_dir": extract_output_dir,
             "force_extract": force_extract,
+            "use_vlm_object_extraction": use_vlm_object_extraction,
+            "code_repair_used": code_repair_used,
+            "code_repair_attempts": code_repair_attempts,
+            "code_repair_error": code_repair_error,
+            "initial_generated_code": initial_generated_code,
+            "initial_generated_response": initial_generated_response,
         }
 
         return result
@@ -687,6 +811,12 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
             "mask_fallback": mask_fallback,
             "extract_output_dir": extract_output_dir,
             "force_extract": force_extract,
+            "use_vlm_object_extraction": use_vlm_object_extraction,
+            "code_repair_used": code_repair_used,
+            "code_repair_attempts": code_repair_attempts,
+            "code_repair_error": code_repair_error,
+            "initial_generated_code": initial_generated_code,
+            "initial_generated_response": initial_generated_response,
             "error": error_msg,
         }
 
@@ -741,6 +871,12 @@ def main():
                        help="Object extraction/debug output root; defaults to mask_fallback output root")
     parser.add_argument("--force_extract", action="store_true",
                        help="Always rerun object extraction instead of reading cached object_3d_positions.json")
+    parser.add_argument("--use_vlm_object_extraction", action="store_true", default=True,
+                       help="Enable APC-VLM-style VLM extraction of objects of interest")
+    parser.add_argument("--no_vlm_object_extraction", action="store_false", dest="use_vlm_object_extraction",
+                       help="Disable VLM object extraction and use rule-based question parsing")
+    parser.add_argument("--max_code_repair_attempts", type=int, default=1,
+                       help="Maximum code repair attempts after parse/execution failure; 0 disables repair")
 
     args = parser.parse_args()
     
@@ -787,6 +923,8 @@ def main():
     print(f"Mask fallback: {args.mask_fallback}")
     print(f"Extract output dir: {args.extract_output_dir or 'default mask_fallback output root'}")
     print(f"Force extract: {args.force_extract}")
+    print(f"VLM object extraction: {args.use_vlm_object_extraction}")
+    print(f"Max code repair attempts: {args.max_code_repair_attempts}")
     print("="*60)
     
     # Load all entries first
@@ -846,6 +984,7 @@ def main():
             api_model=args.api_model,
             api_key=args.api_key,
             base_url=args.base_url,
+            use_vlm_object_extraction=args.use_vlm_object_extraction,
         )
         results = []
         for i, entry in enumerate(entries, 1):
@@ -863,6 +1002,8 @@ def main():
                 extract_output_dir=args.extract_output_dir,
                 force_extract=args.force_extract,
                 extractor=extractor,
+                use_vlm_object_extraction=args.use_vlm_object_extraction,
+                max_code_repair_attempts=args.max_code_repair_attempts,
             )
             results.append(result)
     else:
@@ -883,6 +1024,8 @@ def main():
             "device": args.device,
             "extract_output_dir": args.extract_output_dir,
             "force_extract": args.force_extract,
+            "use_vlm_object_extraction": args.use_vlm_object_extraction,
+            "max_code_repair_attempts": args.max_code_repair_attempts,
         }
         args_list = [(entry, worker_config) for entry in entries]
 
@@ -1004,6 +1147,8 @@ def main():
         "mask_fallback": args.mask_fallback,
         "extract_output_dir": args.extract_output_dir,
         "force_extract": args.force_extract,
+        "use_vlm_object_extraction": args.use_vlm_object_extraction,
+        "max_code_repair_attempts": args.max_code_repair_attempts,
         "overall_metrics": overall_metrics,
         "type_metrics": type_metrics,
         "raw_statistics": dict(type_stats),

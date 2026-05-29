@@ -1,5 +1,5 @@
 import os
-from agent.prompt.template import task_description, api_specification, example_problems, code_generation_prompt
+from agent.prompt.template import task_description, api_specification, example_problems, code_generation_prompt, code_repair_prompt
 from pySpatial_Interface import Scene
 
 
@@ -23,31 +23,15 @@ def _available_graph_objects_prompt(scene: Scene) -> str:
 # TODO: Rewrite the codeAgent with structured output with pydantic
 
 
-def generate_code_from_query(scene: Scene, api_key: str = None, backend: str = "local_qwen", model: str = "gpt-4.1", local_model_path: str = None, base_url: str = None, device: str = "cuda"):
-    """
-    Generate code using OpenAI GPT-4 model based on the scene question.
-    
-    Args:
-        scene: Scene object containing the question
-        api_key: OpenAI API key (if not provided, will use OPENAI_API_KEY env var)
-    
-    Returns:
-        str: Generated code response from GPT-4
-    """
-    base_prompt = f"""
+def _base_code_prompt() -> str:
+    return f"""
         {task_description}
         {api_specification}
         {example_problems}
     """
 
-    object_prompt = _available_graph_objects_prompt(scene)
-    query_for_vlm = f"""
-        {base_prompt}
-        {object_prompt}
-        {code_generation_prompt}
-        the question is {scene.question}
-    """
 
+def _call_code_model(query_for_vlm: str, api_key: str = None, backend: str = "local_qwen", model: str = "gpt-4.1", local_model_path: str = None, base_url: str = None, device: str = "cuda"):
     if backend == "local_qwen":
         from agent.model_backend import DEFAULT_LOCAL_QWEN_MODEL_PATH
         from agent.model_backend.local_qwen import generate_text_with_local_qwen
@@ -87,6 +71,74 @@ def generate_code_from_query(scene: Scene, api_key: str = None, backend: str = "
 
     except Exception as e:
         raise Exception(f"Error calling OpenAI API: {str(e)}")
+
+
+def generate_code_from_query(scene: Scene, api_key: str = None, backend: str = "local_qwen", model: str = "gpt-4.1", local_model_path: str = None, base_url: str = None, device: str = "cuda"):
+    """
+    Generate code using the configured code model based on the scene question.
+    """
+    object_prompt = _available_graph_objects_prompt(scene)
+    query_for_vlm = f"""
+        {_base_code_prompt()}
+        {object_prompt}
+        {code_generation_prompt}
+        the question is {scene.question}
+    """
+
+    return _call_code_model(
+        query_for_vlm,
+        api_key=api_key,
+        backend=backend,
+        model=model,
+        local_model_path=local_model_path,
+        base_url=base_url,
+        device=device,
+    )
+
+
+def repair_code_from_error(
+    scene: Scene,
+    previous_response: str = None,
+    previous_code: str = None,
+    error: str = None,
+    api_key: str = None,
+    backend: str = "local_qwen",
+    model: str = "gpt-4.1",
+    local_model_path: str = None,
+    base_url: str = None,
+    device: str = "cuda",
+):
+    """Generate corrected code after parse or execution failure."""
+    object_prompt = _available_graph_objects_prompt(scene)
+    query_for_vlm = f"""
+        {_base_code_prompt()}
+        {object_prompt}
+        {code_repair_prompt}
+
+        Original question:
+        {scene.question}
+
+        Previous model response:
+        {previous_response or "N/A"}
+
+        Previously parsed code:
+        ```python
+        {previous_code or ""}
+        ```
+
+        Traceback or error:
+        {error or "N/A"}
+    """
+
+    return _call_code_model(
+        query_for_vlm,
+        api_key=api_key,
+        backend=backend,
+        model=model,
+        local_model_path=local_model_path,
+        base_url=base_url,
+        device=device,
+    )
 
 def generate_code(scene: Scene, api_key: str = None, **kwargs):
     """Legacy function name for backward compatibility"""

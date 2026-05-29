@@ -14,6 +14,11 @@ if str(REPO_TEST_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_TEST_DIR))
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
+from object_3d_extraction.prompts import (
+    PATTERN_GET_OBJECTS_OF_INTEREST,
+    PROMPT_GET_OBJECTS_OF_INTEREST,
+    PROMPT_GET_OBJECTS_OF_INTEREST_AUX,
+)
 from object_3d_extraction.utils import extract_object_names_from_question_options
 
 DEFAULT_LOCAL_QWEN_MODEL_PATH = "/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct"
@@ -126,7 +131,7 @@ def _resolve_qwen_vl_model_class():
     )
 
 def build_vlm_refinement_model(args):
-    if not args.use_vlm_refinement:
+    if not args.use_vlm_refinement and not getattr(args, "use_vlm_object_extraction", True):
         return None
     if getattr(args, "backend", "local_qwen") == "openai":
         print("Loading OpenAI refinement model {}...".format(args.api_model))
@@ -147,6 +152,7 @@ class ObjectExtractionRunner:
         api_model: str = "gpt-4.1",
         api_key: str = None,
         base_url: str = None,
+        use_vlm_object_extraction: bool = True,
     ):
         print("Initializing reusable object extractor...")
         self.device = device
@@ -159,6 +165,7 @@ class ObjectExtractionRunner:
             box_threshold=0.05,
             text_threshold=0.05,
             use_vlm_refinement=use_vlm_refinement,
+            use_vlm_object_extraction=use_vlm_object_extraction,
             vlm_model_path=vlm_model_path,
             mask_fallback=mask_fallback,
         )
@@ -168,12 +175,13 @@ class ObjectExtractionRunner:
         config.detection.use_vlm_refinement = use_vlm_refinement
         config.mask_fallback_mode = mask_fallback
 
-        if vlm_model is None and use_vlm_refinement:
+        if vlm_model is None and (use_vlm_refinement or use_vlm_object_extraction):
             if backend == "openai":
                 vlm_model = OpenAIVLRefinementModel(api_key=api_key, model=api_model, base_url=base_url)
             else:
                 vlm_model = QwenVLRefinementModel(vlm_model_path, device=device)
 
+        self.vlm_model = vlm_model
         self.locator = Object3DLocator(config=config, device=device, vlm_model=vlm_model)
 
     def extract_sample(
@@ -189,7 +197,13 @@ class ObjectExtractionRunner:
         args.base_data_path = base_data_path
         sample_key = get_sample_key(sample, 0)
         resolved_image = resolve_image_path(args, sample)
-        object_names = resolve_object_names(sample)
+        object_info = resolve_object_names(
+            sample,
+            image=resolved_image,
+            vlm_model=self.vlm_model if self.args.use_vlm_object_extraction else None,
+            use_vlm_object_extraction=self.args.use_vlm_object_extraction,
+        )
+        object_names = object_info["objects"]
         sample_save_dir = Path(output_root) / sample_key
         result = self.locator.extract(
             image=resolved_image,
@@ -203,6 +217,10 @@ class ObjectExtractionRunner:
             "sample_id": sample_key,
             "image": resolved_image,
             "objects": object_names,
+            "object_extraction_method": object_info["method"],
+            "vlm_extracted_objects": object_info["vlm_extracted_objects"],
+            "rule_extracted_objects": object_info["rule_extracted_objects"],
+            "object_extraction_response": object_info["object_extraction_response"],
             "result": result,
         }
         output_path = write_sample_json(sample_save_dir, sample_key, record)
@@ -225,6 +243,7 @@ def extract_objects_for_sample(
     api_key: str = None,
     base_url: str = None,
     extractor=None,
+    use_vlm_object_extraction: bool = True,
 ):
     if extractor is not None:
         return extractor.extract_sample(
@@ -245,6 +264,7 @@ def extract_objects_for_sample(
         api_model=api_model,
         api_key=api_key,
         base_url=base_url,
+        use_vlm_object_extraction=use_vlm_object_extraction,
     )
     return runner.extract_sample(
         sample,
@@ -313,6 +333,18 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         dest="use_vlm_refinement",
         help="Disable VLM refinement and use rule-based candidate ranking.",
+    )
+    parser.add_argument(
+        "--use_vlm_object_extraction",
+        action="store_true",
+        default=True,
+        help="Enable APC-VLM-style VLM extraction of objects of interest.",
+    )
+    parser.add_argument(
+        "--no_vlm_object_extraction",
+        action="store_false",
+        dest="use_vlm_object_extraction",
+        help="Disable VLM object extraction and use rule-based question parsing.",
     )
     parser.add_argument(
         "--mask_fallback",
@@ -417,16 +449,92 @@ def get_sample_key(sample, fallback_index: int) -> str:
     return sample.get("id", "sample_{}".format(fallback_index))
 
 
-def resolve_object_names(sample) -> list:
+def resolve_object_names(
+    sample,
+    image: str = None,
+    vlm_model=None,
+    use_vlm_object_extraction: bool = True,
+) -> dict:
+    question = sample.get("question", "")
+    rule_objects = resolve_object_names_by_rule(sample)
+    vlm_objects = []
+    vlm_response = None
+
+    if use_vlm_object_extraction and vlm_model is not None and image is not None:
+        try:
+            vlm_objects, vlm_response = extract_object_names_with_vlm(image, question, vlm_model)
+        except Exception as exc:
+            vlm_response = "ERROR: {}".format(exc)
+
+    if vlm_objects:
+        return {
+            "objects": vlm_objects,
+            "method": "vlm",
+            "vlm_extracted_objects": vlm_objects,
+            "rule_extracted_objects": rule_objects,
+            "object_extraction_response": vlm_response,
+        }
+
+    if rule_objects:
+        return {
+            "objects": rule_objects,
+            "method": "rule_fallback" if use_vlm_object_extraction else "rule",
+            "vlm_extracted_objects": vlm_objects,
+            "rule_extracted_objects": rule_objects,
+            "object_extraction_response": vlm_response,
+        }
+
+    raise ValueError("Could not extract object names from sample question")
+
+
+def resolve_object_names_by_rule(sample) -> list:
     question = sample.get("question", "")
     object_names = extract_object_names_from_omni3d_question(question)
     if not object_names:
         object_names = extract_object_names_from_question_options(question)
-    if not object_names or any(_looks_like_non_object_phrase(name) for name in object_names):
-        object_names = [name for name in object_names if not _looks_like_non_object_phrase(name)]
-    if not object_names:
-        raise ValueError("Could not extract object names from sample question")
-    return object_names
+    object_names = [name for name in object_names if not _looks_like_non_object_phrase(name)]
+    return _dedupe_preserve_order(object_names)
+
+
+def extract_object_names_with_vlm(image, question: str, vlm_model, num_tries: int = 2) -> tuple:
+    from PIL import Image
+
+    image_pil = Image.open(image).convert("RGB") if isinstance(image, (str, Path)) else image.convert("RGB")
+    response = None
+    for try_idx in range(num_tries):
+        if try_idx == 0:
+            prompt = PROMPT_GET_OBJECTS_OF_INTEREST.format(question=question)
+        else:
+            prompt = PROMPT_GET_OBJECTS_OF_INTEREST_AUX.format(question=question, response=response or "")
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image_pil.resize((400, 400))},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        response = vlm_model.process_messages(messages, max_new_tokens=128)
+        objects = parse_vlm_object_names(response)
+        if objects:
+            return objects, response
+    return [], response
+
+
+def parse_vlm_object_names(response: str) -> list:
+    matches = re.findall(PATTERN_GET_OBJECTS_OF_INTEREST, str(response or ""))
+    if not matches:
+        return []
+    match = matches[-1]
+    names = []
+    for part in match.strip().replace("[", "").replace("]", "").split(","):
+        cleaned = part.strip().lower().replace("'", "").replace('\"', "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned and not _looks_like_non_object_phrase(cleaned):
+            names.append(cleaned)
+    return _dedupe_preserve_order(names)
 
 
 def extract_object_names_from_omni3d_question(question: str) -> list:
@@ -547,7 +655,13 @@ def main() -> None:
         object_names = []
         try:
             image = resolve_image_path(args, sample)
-            object_names = resolve_object_names(sample)
+            object_info = resolve_object_names(
+                sample,
+                image=image,
+                vlm_model=vlm_model if args.use_vlm_object_extraction else None,
+                use_vlm_object_extraction=args.use_vlm_object_extraction,
+            )
+            object_names = object_info["objects"]
             print(
                 "[{}/{}] {} objects: {}".format(
                     idx + 1,
@@ -568,6 +682,10 @@ def main() -> None:
                 "sample_id": sample_key,
                 "image": image,
                 "objects": object_names,
+                "object_extraction_method": object_info["method"],
+                "vlm_extracted_objects": object_info["vlm_extracted_objects"],
+                "rule_extracted_objects": object_info["rule_extracted_objects"],
+                "object_extraction_response": object_info["object_extraction_response"],
                 "result": result,
             }
         except Exception as exc:

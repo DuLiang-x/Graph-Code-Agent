@@ -289,8 +289,78 @@ def test_omni3d_question_object_name_extraction():
 
     for question, expected in samples:
         sample = {"question": question}
-        assert demo_extract_3d_positions.resolve_object_names(sample) == expected
+        assert demo_extract_3d_positions.resolve_object_names(sample, use_vlm_object_extraction=False)["objects"] == expected
 
+
+
+class FakeObjectExtractionVLM:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def process_messages(self, messages, max_new_tokens=128):
+        self.calls.append((messages, max_new_tokens))
+        return self.responses.pop(0)
+
+
+def test_vlm_object_extraction_preferred_over_rule(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {"question": "What is the ratio of the height of the fireplace to the sofa?"}
+    vlm = FakeObjectExtractionVLM(["[fireplace, coffee table, sofa]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert info["objects"] == ["fireplace", "coffee table", "sofa"]
+    assert info["method"] == "vlm"
+    assert info["vlm_extracted_objects"] == ["fireplace", "coffee table", "sofa"]
+    assert info["object_extraction_response"] == "[fireplace, coffee table, sofa]"
+
+
+def test_vlm_object_extraction_aux_retry(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {"question": "Which object is closer to the fireplace: the sofa or the coffee table?"}
+    vlm = FakeObjectExtractionVLM(["fireplace, sofa", "[fireplace, sofa, coffee table]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert info["objects"] == ["fireplace", "sofa", "coffee table"]
+    assert info["method"] == "vlm"
+    assert len(vlm.calls) == 2
+    assert "Previous response: fireplace, sofa" in vlm.calls[1][0][0]["content"][1]["text"]
+
+
+def test_vlm_object_extraction_falls_back_to_rule(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {"question": "What is the ratio of the height of the fireplace to the sofa?"}
+    vlm = FakeObjectExtractionVLM(["no list", "still no list"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert info["objects"] == ["fireplace", "sofa"]
+    assert info["method"] == "rule_fallback"
+    assert info["vlm_extracted_objects"] == []
+    assert info["rule_extracted_objects"] == ["fireplace", "sofa"]
+
+
+def test_no_vlm_object_extraction_does_not_call_vlm(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {"question": "What is the ratio of the height of the fireplace to the sofa?"}
+    vlm = FakeObjectExtractionVLM(["[wrong]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(
+        sample,
+        image=str(image_path),
+        vlm_model=vlm,
+        use_vlm_object_extraction=False,
+    )
+
+    assert info["objects"] == ["fireplace", "sofa"]
+    assert info["method"] == "rule"
+    assert vlm.calls == []
 
 def test_detection_prompt_fallback_uses_simplified_object_name():
     locator = make_locator(
@@ -343,11 +413,11 @@ def test_rule_ranker_avoids_large_area_box_for_non_area_object():
     assert selected["prompt"] == "table"
 
 
-def test_rule_ranker_selects_rightmost_candidate():
+def test_rule_ranker_selects_rightmost_candidate_when_quality_is_reasonable():
     image = Image.new("RGB", (100, 100), color="white")
     candidates = [
         {"box2d": [5, 10, 25, 40], "score": 0.9, "prompt": "sofa"},
-        {"box2d": [70, 10, 95, 40], "score": 0.5, "prompt": "sofa"},
+        {"box2d": [70, 10, 95, 40], "score": 0.75, "prompt": "sofa"},
     ]
 
     selected = rank_detection_candidates(image, "rightmost sofa", candidates, {})
@@ -434,12 +504,20 @@ def test_entity_large_box_triggers_mask_fallback():
 
 
 class FakeVLM:
+    def __init__(self, response="1"):
+        self.response = response
+        self.messages = None
+        self.max_new_tokens = None
+
     def process_messages(self, messages, max_new_tokens=32):
+        self.messages = messages
+        self.max_new_tokens = max_new_tokens
         assert messages[0]["content"][0]["type"] == "image"
-        return "1"
+        return self.response
 
 
 def test_vlm_refinement_selects_mocked_candidate_index():
+    vlm = FakeVLM()
     locator = make_locator(
         {
             "chair": [
@@ -447,7 +525,7 @@ def test_vlm_refinement_selects_mocked_candidate_index():
                 {"box2d": [8, 8, 12, 12], "score": 0.75},
             ]
         },
-        vlm_model=FakeVLM(),
+        vlm_model=vlm,
         use_vlm_refinement=True,
     )
     image = Image.new("RGB", (16, 16), color="white")
@@ -461,6 +539,76 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert item["vlm_selected_index"] == 1
     assert item["final_selected_index"] == 1
     assert item["selection_decision"] == "vlm_refinement"
+    assert vlm.max_new_tokens == 32
+    content = vlm.messages[0]["content"]
+    assert content[0]["type"] == "image"
+    assert content[1]["type"] == "image"
+    assert content[2]["type"] == "text"
+    prompt = content[2]["text"]
+    assert "Candidate 0 is the rule-ranked best candidate, but you may choose another candidate if it better matches the exact target object category and question context." in prompt
+    assert "not just the most visually obvious object of the category" in prompt
+    assert "color, material, relative position, nearby objects, and role in the scene" in prompt
+    assert '"white coffee table", "black table", "person wearing a hat", "left chair", or "closer sofa"' in prompt
+    assert "Use the full-image overlay first" in prompt
+    assert "Use the crop grid only as supporting evidence" in prompt
+    assert "Object-specific rules:" in prompt
+    assert "avoid boxes that include large carpet/floor/background regions or multiple objects" in prompt
+    assert "avoid partial boxes that only cover the top, seat, backrest, leg, or one component" in prompt
+    assert "prefer the large low horizontal floor-covering region" in prompt
+    assert "Similar-object rules:" in prompt
+    assert "chair, stool, bench, sofa, couch, ottoman, and seat" in prompt
+    assert 'Do not select a stool for "chair"' in prompt
+    assert 'Do not select a chair for "stool"' in prompt
+    assert 'Do not select a chair for "bench", "sofa", "couch", or "ottoman"' in prompt
+    assert 'Do not select an ottoman for "stool" or a stool for "ottoman"' in prompt
+    assert "chair: usually has a backrest" in prompt
+    assert "stool: usually has no backrest" in prompt
+    assert "bench: usually elongated" in prompt
+    assert "sofa/couch: usually larger" in prompt
+    assert "ottoman: usually a low padded seat" in prompt
+    assert "Treat words such as rightmost, leftmost, topmost, and bottommost as part of the target object phrase" in prompt
+    assert 'For "rightmost chair" or similar targets, choose the rightmost complete candidate' in prompt
+    assert "Do not choose a larger, clearer, or more central candidate" in prompt
+    assert "Return only one integer index" in prompt
+    assert "return INVALID" in prompt
+
+
+def test_rightmost_relation_prefers_quality_candidate_over_extreme_partial_box():
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [80, 10, 100, 40], "score": 0.20, "prompt": "rightmost stool"},
+        {"box2d": [50, 60, 95, 95], "score": 0.70, "prompt": "rightmost stool"},
+        {"box2d": [45, 62, 93, 97], "score": 0.68, "prompt": "stool"},
+    ]
+
+    selected = rank_detection_candidates(image, "rightmost stool", candidates)
+
+    assert selected["box2d"] == [50, 60, 95, 95]
+
+
+def test_vlm_refinement_rejects_relation_mismatch_for_rightmost_object():
+    locator = make_locator(
+        {
+            "rightmost chair": [
+                {"box2d": [70, 10, 90, 50], "score": 0.70, "prompt": "rightmost chair"},
+                {"box2d": [10, 10, 40, 50], "score": 0.65, "prompt": "rightmost chair"},
+            ]
+        },
+        vlm_model=FakeVLM(response="1"),
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (100, 100), color="white")
+
+    result = locator.extract(image, ["rightmost chair"])
+
+    item = result["rightmost chair"]
+    assert item["box2d"] == [70, 10, 90, 50]
+    assert item["candidate_rank_reason"] == "rule_ranker"
+    assert item["rule_selected_index"] == 0
+    assert item["vlm_selected_index"] == 1
+    assert item["final_selected_index"] == 0
+    assert item["selection_decision"] == "rule_ranker_vlm_rejected"
+    assert item["selection_reject_reason"] == "relation_mismatch"
 
 
 def test_vlm_refinement_rejects_small_unclear_black_table():
@@ -611,3 +759,45 @@ def test_openai_refinement_model_uses_base_url(monkeypatch):
 
     assert calls == {"api_key": "test-key", "base_url": "https://closeai.example/v1"}
     assert model.model == "gpt-4.1"
+
+
+def test_object_extraction_prompt_documents_camera_viewpoint_rule():
+    from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST
+
+    assert "Camera rule" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert '"camera" usually means the viewpoint of the current image' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert 'Do not include "camera" in [Detect]' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "visible physical camera object" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "From the camera's perspective, is the chair on the left or right of the table?" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [chair, table]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[camera, chair, table]" not in PROMPT_GET_OBJECTS_OF_INTEREST
+
+
+def test_object_extraction_prompt_preserves_similar_object_categories():
+    from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST
+
+    assert "Similar object rule" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert 'Do not replace "stool" with "chair"' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert 'Do not replace "chair" with "stool"' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert 'Do not replace "bench", "sofa", "couch", "ottoman", or "seat" with "chair"' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert 'If the question says a generic "seat", keep "seat" as the detection target' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Question] Is the chair to the left or right of the stool?" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [chair, stool]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Question] Is the stool closer to the table than the chair?" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [stool, table, chair]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [bench, chair]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [sofa, chair]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [ottoman, couch]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [black chair, wooden stool]" in PROMPT_GET_OBJECTS_OF_INTEREST
+
+
+def test_object_extraction_aux_prompt_preserves_similar_object_categories():
+    from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+
+    assert "Return only one bracketed Python-style list" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert "Keep the exact object category used in the question" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert 'Keep full object phrases such as "black chair", "wooden stool", "white coffee table", or "person wearing a hat"' in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert 'Do not replace "stool" with "chair"' in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert 'Do not replace "chair" with "stool"' in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert "Do not include relation words such as left, right, closer, farther, above, below, front, behind" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert 'Do not include "camera" unless it is a visible physical camera object' in PROMPT_GET_OBJECTS_OF_INTEREST_AUX

@@ -124,6 +124,28 @@ def test_extract_objects_passes_unified_openai_model_config(monkeypatch, tmpdir)
     assert calls["api_key"] == "test-key"
 
 
+
+def test_extract_objects_passes_vlm_object_extraction_flag(monkeypatch, tmpdir):
+    scene_id = "scene_vlm_objects"
+    output_root = Path(str(tmpdir)) / "Omni3D-Bench"
+    monkeypatch.setitem(OBJECT_OUTPUT_ROOTS, "auto", output_root)
+
+    import scripts.demo_extract_3d_positions as demo
+
+    calls = {}
+
+    def fake_extract(sample, output_root, **kwargs):
+        calls.update(kwargs)
+        return {"result": sample_result()}, str(Path(output_root) / sample["id"] / "object_3d_positions.json")
+
+    monkeypatch.setattr(demo, "extract_objects_for_sample", fake_extract)
+
+    scene = Scene(["image.jpg"], "Where is the chair?", scene_id=scene_id)
+    pySpatial.extract_objects(scene, mask_fallback="auto", use_vlm_object_extraction=False)
+
+    assert calls["use_vlm_object_extraction"] is False
+
+
 def test_extract_objects_passes_base_url_to_demo_wrapper(monkeypatch, tmpdir):
     scene_id = "scene_base_url"
     output_root = Path(str(tmpdir)) / "Omni3D-Bench"

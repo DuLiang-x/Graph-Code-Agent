@@ -165,6 +165,9 @@ def compose_question_image_3d_visualization(
     question_text = question or ""
     if answer:
         question_text = f"{question_text}\n\nAnswer\n{answer}"
+    spatial_info = _format_spatial_info_for_panel(results or {})
+    if spatial_info:
+        question_text = f"{question_text}\n\n{spatial_info}"
     wrapped = _wrap_and_truncate_text(question_text, body_font, question_box[2] - 12, question_box[3] - 58)
     draw.multiline_text((question_box[0], question_box[1] + 42), wrapped, fill=(30, 30, 30), font=body_font, spacing=6)
 
@@ -208,6 +211,36 @@ def visualize_3d_debug_panel(
         debug_dir=str(save_path),
     )
     return {"aabb_vis_path": str(aabb_path), "panel_path": str(panel_path)}
+
+
+def _format_spatial_info_for_panel(results: dict, max_lines: int = 8) -> str:
+    lines = ["Extracted 3D Objects"]
+    omitted = 0
+    for name, item in (results or {}).items():
+        if len(lines) >= max_lines:
+            omitted += 1
+            continue
+        if not isinstance(item, dict):
+            continue
+        if item.get("error"):
+            lines.append(f"{name}: error={item.get('error')}")
+            continue
+        position = _format_vector_for_panel(item.get("position"))
+        center = _format_vector_for_panel(item.get("box3d_center"))
+        size = _format_vector_for_panel(item.get("box3d_size"))
+        if position is None or center is None or size is None:
+            continue
+        lines.append(f"{name}: pos={position}, center={center}, size={size}")
+    if omitted:
+        lines.append(f"... {omitted} more objects")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _format_vector_for_panel(value: Any) -> Optional[str]:
+    vector = _to_float_list(value, 3)
+    if vector is None:
+        return None
+    return "[" + ", ".join(f"{item:.3f}" for item in vector) + "]"
 
 
 def _valid_3d_objects(results: dict) -> List[Dict[str, Any]]:
