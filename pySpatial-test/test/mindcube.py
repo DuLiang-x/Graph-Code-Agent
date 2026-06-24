@@ -50,6 +50,14 @@ from pySpatial_Interface import Agent, Scene, pySpatial, DEFAULT_LOCAL_QWEN_MODE
 last_request_time = 0
 min_request_interval = 0.1  # Minimum time between requests (100ms)
 request_lock = threading.Lock()
+CALL_AGENT_MAX_TRIES = 5
+
+
+def _log_agent_retry(details):
+    target = details.get("target")
+    target_name = getattr(target, "__name__", "call_agent_with_retry")
+    tries = details.get("tries", "?")
+    print(f"Retrying {target_name} (attempt {tries}/{CALL_AGENT_MAX_TRIES})...")
 
 
 def rate_limit():
@@ -67,10 +75,10 @@ def rate_limit():
 @backoff.on_exception(
     backoff.expo,
     Exception,
-    max_tries=5,
+    max_tries=CALL_AGENT_MAX_TRIES,
     factor=2,
     jitter=backoff.full_jitter,
-    on_backoff=lambda details: print(f"Retrying {details['target'].__name__} (attempt {details['tries']}/{details['max_tries']})...")
+    on_backoff=_log_agent_retry
 )
 def call_agent_with_retry(agent, method_name, *args, **kwargs):
     """Call agent method with rate limiting and retry logic"""
@@ -211,7 +219,7 @@ def compute_float_metrics(generated_answer, expected_answer, answer_type: str = 
     }
 
 
-def compute_acc_mar(results: List[Dict[str, Any]]) -> Dict[str, float]:
+def compute_acc_mra(results: List[Dict[str, Any]]) -> Dict[str, float]:
     total = 0
     score = 0.0
     for result in results:
@@ -226,7 +234,7 @@ def compute_acc_mar(results: List[Dict[str, Any]]) -> Dict[str, float]:
         else:
             score += 1.0 if result.get("answer_correct") else 0.0
             total += 1
-    return {"acc_mar": round(score / total, 6) if total else 0.0, "acc_mar_count": total}
+    return {"acc_mra": round(score / total, 6) if total else 0.0, "acc_mra_count": total}
 
 
 def _load_flowchart_font(size: int, mono: bool = False):
@@ -450,6 +458,67 @@ def load_omni3d_entries(dataset_json: str, image_root: str, max_entries: int = N
         data = json.load(f)
     samples = data.get("questions", data if isinstance(data, list) else [])
     entries = [omni3d_entry_to_pipeline_entry(sample, image_root) for sample in samples]
+    return entries[:max_entries] if max_entries is not None else entries
+
+
+def get_entry_question_index(entry: Dict[str, Any]) -> Optional[int]:
+    raw_sample = entry.get("raw_sample") if isinstance(entry, dict) else None
+    if isinstance(raw_sample, dict) and raw_sample.get("question_index") is not None:
+        try:
+            return int(raw_sample.get("question_index"))
+        except (TypeError, ValueError):
+            return None
+
+    if entry.get("question_index") is not None:
+        try:
+            return int(entry.get("question_index"))
+        except (TypeError, ValueError):
+            return None
+
+    entry_id = str(entry.get("id", ""))
+    match = re.match(r"^omni3d_(\d+)$", entry_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def validate_index_range(start_index: Optional[int], end_index: Optional[int]) -> None:
+    if start_index is not None and start_index < 0:
+        raise ValueError("--start_index must be non-negative")
+    if end_index is not None and end_index < 0:
+        raise ValueError("--end_index must be non-negative")
+    if start_index is not None and end_index is not None and start_index > end_index:
+        raise ValueError("--start_index must be less than or equal to --end_index")
+
+
+def filter_entries_by_index_range(
+    entries: List[Dict[str, Any]],
+    start_index: Optional[int] = None,
+    end_index: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if start_index is None and end_index is None:
+        return entries
+
+    filtered = []
+    for entry in entries:
+        question_index = get_entry_question_index(entry)
+        if question_index is None:
+            continue
+        if start_index is not None and question_index < start_index:
+            continue
+        if end_index is not None and question_index > end_index:
+            continue
+        filtered.append(entry)
+    return filtered
+
+
+def apply_index_range_and_max_entries(
+    entries: List[Dict[str, Any]],
+    start_index: Optional[int] = None,
+    end_index: Optional[int] = None,
+    max_entries: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    entries = filter_entries_by_index_range(entries, start_index=start_index, end_index=end_index)
     return entries[:max_entries] if max_entries is not None else entries
 
 
@@ -897,6 +966,10 @@ def main():
                        help="Output directory for timestamped results and flowcharts")
     parser.add_argument("--max_entries", type=int, default=None,
                        help="Maximum number of entries to process")
+    parser.add_argument("--start_index", type=int, default=None,
+                       help="Inclusive Omni3D question_index start, e.g. 400")
+    parser.add_argument("--end_index", type=int, default=None,
+                       help="Inclusive Omni3D question_index end, e.g. 500")
     parser.add_argument("--api_key", type=str, default=os.getenv("OPENAI_API_KEY"),
                        help="OpenAI API key (if not provided, uses OPENAI_API_KEY env var)")
     parser.add_argument("--num_processes", type=int, default=1,
@@ -942,6 +1015,7 @@ def main():
                        help="Maximum code repair attempts after parse/execution failure; 0 disables repair")
 
     args = parser.parse_args()
+    validate_index_range(args.start_index, args.end_index)
     
     # Update global rate limiting interval
     global min_request_interval
@@ -977,6 +1051,9 @@ def main():
     print(f"Output root: {output_root}")
     print(f"Run output directory: {output_dir}")
     print(f"Max entries: {args.max_entries or 'all'}")
+    print(f"Start index: {args.start_index if args.start_index is not None else 'none'}")
+    print(f"End index: {args.end_index if args.end_index is not None else 'none'}")
+    print("Index range mode: question_index")
     print(f"Filter type: {args.filter_type or 'none (processing all types)'}")
     print(f"Number of processes: {num_processes}")
     print(f"Request interval: {min_request_interval}s")
@@ -991,20 +1068,35 @@ def main():
     print("="*60)
     
     # Load all entries first
+    range_enabled = args.start_index is not None or args.end_index is not None
     if args.dataset_json:
-        entries = load_omni3d_entries(args.dataset_json, args.image_root, max_entries=args.max_entries)
+        entries = load_omni3d_entries(args.dataset_json, args.image_root)
     else:
         entries = []
         with open(args.jsonl_path, 'r') as f:
             for line_num, line in enumerate(f, 1):
-                if args.max_entries and len(entries) >= args.max_entries:
+                if not range_enabled and args.max_entries and len(entries) >= args.max_entries:
                     print(f"Reached maximum entries limit: {args.max_entries}")
                     break
                 if not line.strip():
                     continue
                 entries.append(json.loads(line.strip()))
 
-    print(f"Loaded {len(entries)} entries for processing")
+    loaded_count = len(entries)
+    entries = apply_index_range_and_max_entries(
+        entries,
+        start_index=args.start_index,
+        end_index=args.end_index,
+        max_entries=args.max_entries,
+    )
+    if range_enabled or args.max_entries is not None:
+        print(f"Selected {len(entries)} entries for processing from {loaded_count} loaded entries")
+    else:
+        print(f"Loaded {len(entries)} entries for processing")
+
+    if len(entries) == 0:
+        print("No entries selected for processing. Exiting.")
+        return
 
     # Filter entries by type if specified
     if args.filter_type:
@@ -1203,7 +1295,7 @@ def main():
             metrics['mra_count'] = stats['mra_count']
         answer_type_metrics[answer_type] = metrics
 
-    acc_mar_metrics = compute_acc_mar(results)
+    acc_mra_metrics = compute_acc_mra(results)
 
     # Calculate overall metrics
     total = overall_stats['total_processed']
@@ -1213,8 +1305,8 @@ def main():
         'execution_rate': round(overall_stats['execution_success'] / total * 100, 2) if total > 0 else 0,
         'answer_generation_rate': round(overall_stats['answer_generation_success'] / total * 100, 2) if total > 0 else 0,
         'correctness_rate': round(overall_stats['correct_answers'] / overall_stats['evaluable_answers'] * 100, 2) if overall_stats['evaluable_answers'] > 0 else 0,
-        'acc_mar': acc_mar_metrics['acc_mar'],
-        'acc_mar_count': acc_mar_metrics['acc_mar_count'],
+        'acc_mra': acc_mra_metrics['acc_mra'],
+        'acc_mra_count': acc_mra_metrics['acc_mra_count'],
         'error_rate': round(overall_stats['errors'] / total * 100, 2) if total > 0 else 0,
         'evaluable_count': overall_stats['evaluable_answers'],
         'error_count': overall_stats['errors']
@@ -1234,6 +1326,9 @@ def main():
         "processing_time_seconds": round(processing_time, 2),
         "avg_time_per_entry": round(processing_time/len(entries), 2),
         "num_processes_used": num_processes,
+        "start_index": args.start_index,
+        "end_index": args.end_index,
+        "index_range_mode": "question_index",
         "mode": args.mode,
         "backend": args.backend,
         "model_path": args.model_path,
@@ -1263,7 +1358,7 @@ def main():
     print(f"Execution success: {overall_stats['execution_success']}/{total} ({overall_metrics['execution_rate']:.1f}%)")
     print(f"Answer generation: {overall_stats['answer_generation_success']}/{total} ({overall_metrics['answer_generation_rate']:.1f}%)")
     print(f"Answer correctness: {overall_stats['correct_answers']}/{overall_stats['evaluable_answers']} ({overall_metrics['correctness_rate']:.1f}%)")
-    print(f"ACC_MAR: {overall_metrics['acc_mar']:.4f} over {overall_metrics['acc_mar_count']} samples")
+    print(f"ACC_MRA: {overall_metrics['acc_mra']:.4f} over {overall_metrics['acc_mra_count']} samples")
 
     print(f"\n=== Statistics by Answer Type ===")
     for answer_type, metrics in sorted(answer_type_metrics.items()):

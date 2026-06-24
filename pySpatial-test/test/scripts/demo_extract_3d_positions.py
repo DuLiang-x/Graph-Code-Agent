@@ -18,6 +18,7 @@ from object_3d_extraction.prompts import (
     PATTERN_GET_OBJECTS_OF_INTEREST,
     PROMPT_GET_OBJECTS_OF_INTEREST,
     PROMPT_GET_OBJECTS_OF_INTEREST_AUX,
+    QUESTION_TYPE_RULES,
 )
 from object_3d_extraction.utils import extract_object_names_from_question_options
 
@@ -212,6 +213,7 @@ class ObjectExtractionRunner:
             save_dir=sample_save_dir,
             question=sample.get("question", ""),
             answer=sample.get("answer", sample.get("gt_answer", "")),
+            question_type=object_info["question_type"],
         )
         record = {
             "sample_id": sample_key,
@@ -221,6 +223,7 @@ class ObjectExtractionRunner:
             "vlm_extracted_objects": object_info["vlm_extracted_objects"],
             "rule_extracted_objects": object_info["rule_extracted_objects"],
             "object_extraction_response": object_info["object_extraction_response"],
+            "question_type": object_info["question_type"],
             "result": result,
         }
         output_path = write_sample_json(sample_save_dir, sample_key, record)
@@ -449,6 +452,45 @@ def get_sample_key(sample, fallback_index: int) -> str:
     return sample.get("id", "sample_{}".format(fallback_index))
 
 
+COUNT_QUESTION_RE = re.compile(r"\b(how many|number of|count|total number)\b", re.IGNORECASE)
+YES_NO_ANSWER_RE = re.compile(r"^\s*(yes|no)\s*[.!]?\s*$", re.IGNORECASE)
+
+
+def _sample_answer(sample):
+    for key in ("answer", "expected_answer", "gt_answer"):
+        if key in sample and sample.get(key) is not None:
+            return sample.get(key)
+    return None
+
+
+def _is_yes_no_answer(answer) -> bool:
+    return bool(YES_NO_ANSWER_RE.match(str(answer or "")))
+
+
+def classify_question_type(sample) -> str:
+    question = sample.get("question", "")
+    answer_type = str(sample.get("answer_type") or "").lower()
+    answer = _sample_answer(sample)
+
+    if _is_yes_no_answer(answer):
+        return "yes_no"
+    if answer_type == "int" or COUNT_QUESTION_RE.search(question):
+        return "numeric_ct"
+    if answer_type == "float":
+        return "numeric_other"
+    if answer_type == "str":
+        return "choice_object"
+    return "generic"
+
+
+def build_object_extraction_prompt(question: str, question_type: str = "generic") -> str:
+    rules = QUESTION_TYPE_RULES.get(question_type, QUESTION_TYPE_RULES["generic"])
+    return PROMPT_GET_OBJECTS_OF_INTEREST.format(
+        question=question,
+        question_type_rules=rules.strip(),
+    )
+
+
 def resolve_object_names(
     sample,
     image: str = None,
@@ -456,13 +498,14 @@ def resolve_object_names(
     use_vlm_object_extraction: bool = True,
 ) -> dict:
     question = sample.get("question", "")
+    question_type = classify_question_type(sample)
     rule_objects = resolve_object_names_by_rule(sample)
     vlm_objects = []
     vlm_response = None
 
     if use_vlm_object_extraction and vlm_model is not None and image is not None:
         try:
-            vlm_objects, vlm_response = extract_object_names_with_vlm(image, question, vlm_model)
+            vlm_objects, vlm_response = extract_object_names_with_vlm(image, question, vlm_model, question_type=question_type)
         except Exception as exc:
             vlm_response = "ERROR: {}".format(exc)
 
@@ -473,6 +516,7 @@ def resolve_object_names(
             "vlm_extracted_objects": vlm_objects,
             "rule_extracted_objects": rule_objects,
             "object_extraction_response": vlm_response,
+            "question_type": question_type,
         }
 
     if rule_objects:
@@ -482,6 +526,7 @@ def resolve_object_names(
             "vlm_extracted_objects": vlm_objects,
             "rule_extracted_objects": rule_objects,
             "object_extraction_response": vlm_response,
+            "question_type": question_type,
         }
 
     raise ValueError("Could not extract object names from sample question")
@@ -496,14 +541,14 @@ def resolve_object_names_by_rule(sample) -> list:
     return _dedupe_preserve_order(object_names)
 
 
-def extract_object_names_with_vlm(image, question: str, vlm_model, num_tries: int = 2) -> tuple:
+def extract_object_names_with_vlm(image, question: str, vlm_model, num_tries: int = 2, question_type: str = "generic") -> tuple:
     from PIL import Image
 
     image_pil = Image.open(image).convert("RGB") if isinstance(image, (str, Path)) else image.convert("RGB")
     response = None
     for try_idx in range(num_tries):
         if try_idx == 0:
-            prompt = PROMPT_GET_OBJECTS_OF_INTEREST.format(question=question)
+            prompt = build_object_extraction_prompt(question, question_type)
         else:
             prompt = PROMPT_GET_OBJECTS_OF_INTEREST_AUX.format(question=question, response=response or "")
 
@@ -677,6 +722,7 @@ def main() -> None:
                 save_dir=sample_save_dir,
                 question=sample.get("question", ""),
                 answer=sample.get("answer", ""),
+                question_type=object_info["question_type"],
             )
             record = {
                 "sample_id": sample_key,
@@ -686,6 +732,7 @@ def main() -> None:
                 "vlm_extracted_objects": object_info["vlm_extracted_objects"],
                 "rule_extracted_objects": object_info["rule_extracted_objects"],
                 "object_extraction_response": object_info["object_extraction_response"],
+                "question_type": object_info["question_type"],
                 "result": result,
             }
         except Exception as exc:

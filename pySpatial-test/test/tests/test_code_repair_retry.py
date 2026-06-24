@@ -125,6 +125,29 @@ def test_process_scene_uses_repair_before_basic_qa():
     assert agent.basic_qa_calls == 0
 
 
+def test_extract_chat_completion_text_accepts_string_response():
+    assert query._extract_chat_completion_text("```python\npass\n```") == "```python\npass\n```"
+
+
+def test_extract_chat_completion_text_accepts_dict_response():
+    response = {"choices": [{"message": {"content": "```python\npass\n```"}}]}
+
+    assert query._extract_chat_completion_text(response) == "```python\npass\n```"
+
+
+def test_extract_chat_completion_text_accepts_sdk_like_response():
+    class Message:
+        content = "```python\npass\n```"
+
+    class Choice:
+        message = Message()
+
+    class Response:
+        choices = [Choice()]
+
+    assert query._extract_chat_completion_text(Response()) == "```python\npass\n```"
+
+
 def test_repair_prompt_contains_context_and_uses_same_backend(monkeypatch):
     captured = {}
 

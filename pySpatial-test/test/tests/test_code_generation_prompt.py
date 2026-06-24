@@ -33,6 +33,8 @@ def test_available_graph_objects_prompt_lists_exact_names():
         "fireplace": _box([0.0, 0.0, -3.0]),
         "coffee table": _box([1.0, 0.0, -3.0]),
         "leftmost cabinet": _box([2.0, 0.0, -3.0]),
+        "handle_1": _box([3.0, 0.0, -3.0]),
+        "handle_2": _box([4.0, 0.0, -3.0]),
     })
 
     prompt = _available_graph_objects_prompt(scene)
@@ -41,8 +43,12 @@ def test_available_graph_objects_prompt_lists_exact_names():
     assert "- fireplace" in prompt
     assert "- coffee table" in prompt
     assert "- leftmost cabinet" in prompt
+    assert "- handle_1" in prompt
+    assert "- handle_2" in prompt
     assert "Do not shorten names" in prompt
     assert "do not rewrite names into snake_case" in prompt
+    assert "same-category instances may appear as indexed nodes" in prompt
+    assert "Count these indexed nodes with graph.list_nodes()" in prompt
 
 
 def test_graph_api_prompt_documents_closest_object_and_float_returns():
@@ -69,6 +75,17 @@ def test_graph_api_prompt_documents_dimension_apis_and_safe_ratio():
     assert "must not be used as an object's own height" in api_specification
     assert 'For "height of X", use graph.height("X").' in api_specification
     assert "use graph.ratio(numerator, denominator) instead of direct division" in api_specification
+
+
+def test_graph_api_prompt_documents_indexed_counting_nodes():
+    assert "same-category instances can be exposed as indexed nodes" in api_specification
+    assert "handle_1, handle_2" in api_specification
+    assert "Count indexed instance nodes from graph.list_nodes()" in api_specification
+    assert 'For "how many X" visual counting questions' in api_specification
+    assert 'name.startswith("handle_")' in api_specification
+    assert "Do not answer counting questions by checking only graph.get_node" in api_specification
+    assert "inspect graph.list_nodes() and count indexed same-category instance nodes" in code_generation_prompt
+    assert "Do not use a single aggregate node such as handles" in code_generation_prompt
 
 
 def test_graph_examples_include_height_ratio_pattern():
@@ -155,3 +172,12 @@ def test_camera_semantics_are_documented_for_graph_prompt():
     assert 'camera = graph.observer_from_camera()' in example_problems
     assert 'graph.is_left_of("chair", "table", camera)' in example_problems
     assert 'Do not use graph.observer_from_object("camera"). The camera is the current image viewpoint, not an object node.' in example_problems
+
+
+def test_graph_examples_include_indexed_counting_pattern():
+    from agent.prompt.template import example_problems
+
+    assert "Example 13: counting indexed same-category instances" in example_problems
+    assert 'handles = [name for name in nodes if name.startswith("handle_")]' in example_problems
+    assert "answer = len(handles)" in example_problems
+    assert '"counted_nodes": handles' in example_problems

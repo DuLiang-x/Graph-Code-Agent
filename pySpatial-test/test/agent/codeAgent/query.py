@@ -17,6 +17,7 @@ def _available_graph_objects_prompt(scene: Scene) -> str:
 
         Use these exact names in graph calls. Do not shorten names such as "leftmost cabinet" to "left", and do not rewrite names into snake_case.
         If the question wording differs from the available object names, choose the closest complete object name from this list.
+        For counting questions, same-category instances may appear as indexed nodes such as handle_1, handle_2, chair_1, chair_2. Count these indexed nodes with graph.list_nodes(); do not look for a single aggregate node such as handles.
     """
 
 
@@ -29,6 +30,33 @@ def _base_code_prompt() -> str:
         {api_specification}
         {example_problems}
     """
+
+
+def _extract_chat_completion_text(response) -> str:
+    if isinstance(response, str):
+        return response
+
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        if choices:
+            first_choice = choices[0] or {}
+            message = first_choice.get("message") or {}
+            content = message.get("content") or first_choice.get("text")
+            if content is not None:
+                return content
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        first_choice = choices[0]
+        message = getattr(first_choice, "message", None)
+        content = getattr(message, "content", None) if message is not None else None
+        if content is not None:
+            return content
+        text = getattr(first_choice, "text", None)
+        if text is not None:
+            return text
+
+    raise TypeError("Unsupported chat completion response type: {}".format(type(response).__name__))
 
 
 def _call_code_model(query_for_vlm: str, api_key: str = None, backend: str = "local_qwen", model: str = "gpt-4.1", local_model_path: str = None, base_url: str = None, device: str = "cuda"):
@@ -67,7 +95,7 @@ def _call_code_model(query_for_vlm: str, api_key: str = None, backend: str = "lo
             max_tokens=1000
         )
 
-        return response.choices[0].message.content
+        return _extract_chat_completion_text(response)
 
     except Exception as e:
         raise Exception(f"Error calling OpenAI API: {str(e)}")

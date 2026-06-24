@@ -23,6 +23,8 @@ api_specification = """
             Builds a SpatialGraph from scene.object_3d_boxes.
             Use graph.list_nodes() to inspect the exact object names available in the graph.
             Prefer those exact names in all graph calls; do not rewrite object names into snake_case.
+            For counting questions, same-category instances can be exposed as indexed nodes such as handle_1, handle_2, chair_1, chair_2.
+            Count indexed instance nodes from graph.list_nodes(); do not rely on a single aggregate node such as handles or chairs.
 
         observer = graph.observer_from_camera()
         observer = graph.observer_from_object("object_name")
@@ -88,6 +90,11 @@ api_specification = """
         Float-returning APIs produce numbers, not arrays or dictionaries. Do not subscript them:
             Correct: ratio = graph.size_ratio("tv", "table")
             Wrong: graph.size_ratio("tv", "table")[0]
+
+        Counting rules:
+            For "how many X" visual counting questions, use graph.list_nodes() and count indexed instance nodes such as x_1, x_2, x_3.
+            Example: handles = [name for name in graph.list_nodes() if name.startswith("handle_")]; answer = len(handles).
+            Do not answer counting questions by checking only graph.get_node("handles") or graph.height("handles").
 
         Dimension and ratio rules:
             For "height of X", use graph.height("X").
@@ -299,6 +306,22 @@ example_problems = """
 
     Do not use graph.observer_from_object("camera"). The camera is the current image viewpoint, not an object node.
 
+    Example 13: counting indexed same-category instances
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        handles = [name for name in nodes if name.startswith("handle_")]
+        answer = len(handles)
+        return {
+            "computed_results": {
+                "answer": answer,
+                "counted_nodes": handles,
+                "nodes": nodes
+            }
+        }
+    ```
+
     These examples use illustrative object names only. When generating a real program, use the real node names that exist in graph.list_nodes().
 
 """    
@@ -310,6 +333,8 @@ code_generation_prompt = f"""
     Noted that you can first do reasoning and then write the code. 
     But the code should be wrapped in the ```python ``` block.
     Write a compact code block
+    For counting questions, inspect graph.list_nodes() and count indexed same-category instance nodes such as handle_1, handle_2, chair_1, chair_2.
+    Do not use a single aggregate node such as handles when indexed instance nodes are available.
     Before writing code for left/right/front/back relations, first choose the observer.
     For Omni3D-Bench single-image tasks, "camera" means the current image viewpoint.
     If the question says "from the camera's perspective", use graph.observer_from_camera().

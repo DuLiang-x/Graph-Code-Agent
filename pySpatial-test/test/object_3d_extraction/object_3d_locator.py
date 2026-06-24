@@ -42,6 +42,7 @@ class Object3DLocator:
         save_dir: Optional[Union[str, Path]] = None,
         question: str = "",
         answer: str = "",
+        question_type: str = None,
     ) -> Dict[str, Dict[str, object]]:
         image_pil = load_rgb_image(image)
         names = validate_object_names(object_names)
@@ -64,6 +65,27 @@ class Object3DLocator:
                         "error": f"No detection for object: {object_name}",
                         "prompts_tried": prompts_tried,
                     }
+                    continue
+
+                if is_visual_count_target(question_type, question, object_name):
+                    instance_results, instance_names, depth = self._extract_count_instances(
+                        image_pil=image_pil,
+                        object_name=object_name,
+                        candidates=candidates,
+                        selected_boxes=selected_boxes,
+                        depth=depth,
+                        visualize=visualize,
+                        save_dir=save_dir,
+                    )
+                    results[object_name] = {
+                        "error": "Count target expanded into indexed instances",
+                        "counting_target": True,
+                        "counting_instances": instance_names,
+                        "counting_instance_count": len(instance_names),
+                        "prompts_tried": prompts_tried,
+                        "candidates_considered": summarize_candidates(candidates),
+                    }
+                    results.update(instance_results)
                     continue
 
                 best_detection = self._select_detection(
@@ -205,6 +227,107 @@ class Object3DLocator:
         candidates = candidates[: max(1, self.config.detection.num_candidates * len(prompts))]
         return rank_candidates_for_object(image_pil, object_name, candidates, {})
 
+    def _extract_count_instances(
+        self,
+        image_pil: Image.Image,
+        object_name: str,
+        candidates: List[Dict[str, object]],
+        selected_boxes: Dict[str, List[int]],
+        depth,
+        visualize: bool,
+        save_dir: Optional[Union[str, Path]],
+    ) -> Tuple[Dict[str, Dict[str, object]], List[str], Any]:
+        instances = {}  # type: Dict[str, Dict[str, object]]
+        instance_names = []  # type: List[str]
+        selected_candidates = select_count_instance_candidates(
+            candidates,
+            max_instances=max(1, self.config.detection.num_candidates),
+        )
+
+        for idx, detection in enumerate(selected_candidates, start=1):
+            instance_name = make_count_instance_name(object_name, idx)
+            box2d = [int(v) for v in detection["box2d"]]
+            sam_mask = self.detection_module.run_segmentation(image_pil, box2d)
+            if self.config.mask_fallback_mode == "auto":
+                mask, mask_fallback_reason = maybe_fallback_mask(image_pil, object_name, box2d, sam_mask)
+            else:
+                mask = sam_mask
+                mask_fallback_reason = None
+            mask_used_for_3d = "fallback" if mask_fallback_reason else "sam"
+            sam_mask_area = int((sam_mask > 0.5).sum())
+            mask_area = int((mask > 0.5).sum())
+
+            if mask_area < self.config.min_mask_area:
+                instances[instance_name] = {
+                    "error": f"Segmentation mask too small: {mask_area} < {self.config.min_mask_area}",
+                    "counting_source_object": object_name,
+                    "box2d": box2d,
+                    "bbox_wh": bbox_wh(box2d),
+                    "mask_area": mask_area,
+                    "sam_mask_area": sam_mask_area,
+                    "final_mask_area": mask_area,
+                    "mask_used_for_3d": mask_used_for_3d,
+                    "prompt_used": detection.get("prompt"),
+                    "candidate_rank_reason": "count_instance_ranker",
+                    "mask_fallback_reason": mask_fallback_reason,
+                    "candidates_considered": summarize_candidates([detection]),
+                }
+                continue
+
+            if depth is None:
+                depth = self.depth_module.run_depth_estimation(image_pil)
+
+            unprojected = self.depth_module.unproject_to_3D(image_pil, depth, mask)
+            orientation = self.orientation_module.run_orientation_estimation(image_pil, box2d)
+            selected_boxes[instance_name] = box2d
+            instance_names.append(instance_name)
+            instances[instance_name] = {
+                "position": unprojected["position"],
+                "orientation": orientation["orientation"],
+                "orientation_angles": orientation["orientation_angles"],
+                "box3d_size": unprojected["box3d_size"],
+                "box3d_center": unprojected["box3d_center"],
+                "box3d_min": unprojected["box3d_min"],
+                "box3d_max": unprojected["box3d_max"],
+                "bbox_wh": bbox_wh(box2d),
+                "box2d": box2d,
+                "mask_area": int(unprojected["mask_area"]),
+                "sam_mask_area": sam_mask_area,
+                "final_mask_area": int(unprojected["mask_area"]),
+                "mask_used_for_3d": mask_used_for_3d,
+                "depth_mode": float(unprojected["depth_mode"]),
+                "num_points": int(unprojected["num_points"]),
+                "prompt_used": detection.get("prompt"),
+                "candidate_rank_reason": "count_instance_ranker",
+                "rule_selected_index": detection.get("candidate_index"),
+                "vlm_selected_index": None,
+                "final_selected_index": detection.get("candidate_index"),
+                "selection_decision": "count_instance",
+                "selection_reject_reason": None,
+                "vlm_response": None,
+                "mask_fallback_reason": mask_fallback_reason,
+                "overlap_warnings": overlap_warnings(instance_name, box2d, selected_boxes),
+                "candidates_considered": summarize_candidates([detection]),
+                "counting_source_object": object_name,
+                "counting_instance_id": idx,
+            }
+            if "score" in detection:
+                instances[instance_name]["score"] = float(detection["score"])
+
+            if visualize and (box2d is not None or mask is not None or sam_mask is not None):
+                save_debug_visuals(
+                    image_pil,
+                    instance_name,
+                    box2d,
+                    mask,
+                    save_dir,
+                    sam_mask=sam_mask,
+                    mask_used_for_3d=mask_used_for_3d,
+                )
+
+        return instances, instance_names, depth
+
+
     def _select_detection(
         self,
         image_pil: Image.Image,
@@ -267,22 +390,43 @@ class Object3DLocator:
 
 def detection_prompts_for_object(object_name: str) -> List[str]:
     original = str(object_name).strip().lower()
-    prompts = [original]
-    base = _remove_relation_words(original)
-    if base != original:
+    context = parse_object_relation_context(original)
+    target = context["target_phrase"]
+    prompt_target = target or original
+    prompts = [prompt_target]
+
+    base = _remove_relation_words(prompt_target)
+    if base and base not in prompts:
         prompts.append(base)
 
     without_color = _remove_leading_color(base)
     if without_color != base:
         prompts.append(without_color)
 
-    if "coffee table" in original:
-        if "white" in original:
+    if "coffee table" in target:
+        if "white" in target:
             prompts.append("white table")
         prompts.extend(["coffee table", "table"])
-    if original in {"tv", "television"} or " tv" in original:
+    elif " table" in target or target == "table":
+        if is_shape_object(target):
+            if "circular" in target:
+                prompts.append(target.replace("circular", "round"))
+            if "round" in target:
+                prompts.append(target.replace("round", "circular"))
+            prompts.append("table")
+        if is_color_object(target):
+            prompts.append(target)
+
+    if is_transparency_object(target):
+        prompts.extend(_transparency_synonym_prompts(target))
+        transparency_base = _remove_leading_transparency(target)
+        if transparency_base and transparency_base != target:
+            prompts.append(transparency_base)
+    if is_material_object(target) and "table" in target:
+        prompts.extend(["transparent table", "glass coffee table", "clear table"])
+    if target in {"tv", "television"}:
         prompts.extend(["tv", "television"])
-    return _dedupe_preserve_order(prompts)
+    return _dedupe_preserve_order([prompt for prompt in prompts if prompt])
 
 
 def rank_detection_candidates(
@@ -342,15 +486,26 @@ def score_detection_candidate(
 
     prompt = str(candidate.get("prompt", "")).lower()
     original = object_name.lower()
+    context = parse_object_relation_context(original)
+    target = context["target_phrase"]
     if prompt == original:
         score += 0.18
         reasons.append("exact_prompt")
-    elif prompt and prompt in original:
+    elif prompt == target:
+        score += 0.16
+        reasons.append("target_prompt")
+    elif prompt and (prompt in original or prompt in target):
         score += 0.08
         reasons.append("specific_prompt")
-    if is_color_object(object_name) and prompt_has_color(prompt, object_name):
+    if is_color_object(target) and prompt_has_color(prompt, target):
         score += 0.12
         reasons.append("color_prompt")
+    if is_shape_object(target) and prompt_has_shape(prompt, target):
+        score += 0.12
+        reasons.append("shape_prompt")
+    if is_material_object(target) and prompt_has_material(prompt, target):
+        score += 0.14
+        reasons.append("material_prompt")
 
     if area_kind:
         if area_ratio > 0.15:
@@ -407,10 +562,14 @@ def select_candidate_with_vlm(
     overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
     overlay_image = Image.open(overlay_path).convert("RGB") if overlay_path is not None else make_candidate_overlay(image_pil, candidates)
     object_kind = "area" if is_area_object(object_name) else "entity"
+    relation_context = parse_object_relation_context(object_name)
     prompt = f"""
 Choose the single numbered bounding box that best matches the target object in the full image.
 
-Target object: {object_name}
+Target object phrase: {object_name}
+Main target: {relation_context['target_phrase']}
+Relation context: {relation_context['relation_context'] or 'none'}
+Reference object: {relation_context['reference_object'] or 'none'}
 Object kind: {object_kind}
 Question context: {question}
 
@@ -418,8 +577,11 @@ Candidate 0 is the rule-ranked best candidate, but you may choose another candid
 
 Selection rules:
 - Select the candidate that corresponds to the object referred to in the question, not just the most visually obvious object of the category.
-- Use spatial/contextual clues in the question, such as color, material, relative position, nearby objects, and role in the scene.
-- If the question distinguishes similar objects, choose the candidate matching the distinguishing phrase, such as "white coffee table", "black table", "person wearing a hat", "left chair", or "closer sofa".
+- Use spatial/contextual clues in the question, such as color, material, shape, relative position, nearby objects, and role in the scene.
+- If the question distinguishes similar objects, choose the candidate matching the distinguishing phrase, such as "white coffee table", "circular table", "black table", "person wearing a hat", "left chair", or "closer sofa".
+- Match the Main target first. Use the Relation context only to choose among candidates for the same target category.
+- Relation context such as "under the tv" means choose the target object located under the TV; it does not mean choose the TV.
+- Relation context such as "right of X", "left of X", "next to X", "in front of X", and "behind X" is a candidate position constraint.
 - Use the full-image overlay first to understand the object's position in the whole scene.
 - Use the crop grid only as supporting evidence for object identity and box quality.
 - Prefer complete visible objects over partial parts when the target is a complete object.
@@ -444,6 +606,15 @@ Similar-object rules:
   - sofa/couch: usually larger, padded, and designed for multiple people;
   - ottoman: usually a low padded seat or footrest, often without a backrest.
 - If the question contains an attribute such as color, material, size, or relative location, prefer the candidate matching both the category and the attribute.
+
+Material, shape, and color rules:
+- Treat material and appearance words such as glass, translucent, transparent, clear, see-through, wooden, metal, plastic, leather, fabric, marble, and ceramic as part of the target object phrase.
+- Treat shape words such as circular, round, square, rectangular, and oval as part of the target object phrase.
+- Treat color words such as gray, black, white, red, and brown as part of the target object phrase when they distinguish same-category objects.
+- For "glass table", choose the actual glass/transparent table, not a black plastic table or ordinary dark table.
+- For "translucent cube", choose the transparent/translucent cube, not an opaque box or ordinary cube-like object.
+- For "circular table" or "round table", choose the round/circular table, not a rectangular table.
+- Do not choose a visually different material, color, transparency, or shape just because it has a higher detector score.
 
 Relation modifier rules:
 - Treat words such as rightmost, leftmost, topmost, and bottommost as part of the target object phrase, not as optional context.
@@ -485,7 +656,10 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
         return False, "no_candidates"
     selected_score = float(selected.get("rank_score", selected.get("score", 0.0)))
     best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
-    if selected_score < best_score - 0.20:
+    if _candidate_matches_reference_object(object_name, selected):
+        return False, "reference_object_selected"
+    rank_margin = 0.45 if is_material_object(object_name) else 0.20
+    if selected_score < best_score - rank_margin:
         return False, "rank_score_too_low"
     if not _selection_matches_relation(object_name, selected, candidates):
         return False, "relation_mismatch"
@@ -493,9 +667,11 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
         selected_area = box_area(selected.get("box2d", [0, 0, 0, 0]))
         best_area = max(1, box_area(candidates[0].get("box2d", [0, 0, 0, 0])))
         if selected_score < best_score and selected_area < best_area * 0.70 and _prefers_complete_entity(object_name):
-            return False, "partial_entity_box"
+            if not _relation_target_candidate_override(object_name, selected):
+                return False, "partial_entity_box"
         if selected_score < best_score and selected_area > best_area * 2.0:
-            return False, "entity_box_too_large"
+            if not (_attribute_target_candidate_override(object_name, selected) and selected_area <= best_area * 4.0):
+                return False, "entity_box_too_large"
     return True, None
 
 def save_candidate_grid(
@@ -661,6 +837,32 @@ def parse_candidate_index_or_none(response: object, num_candidates: int) -> Opti
     return idx
 
 
+def parse_object_relation_context(object_name: str) -> Dict[str, str]:
+    text = re.sub(r"\s+", " ", str(object_name or "").strip().lower())
+    patterns = [
+        (r"\s+(to the right of|right of)\s+", "right of"),
+        (r"\s+(to the left of|left of)\s+", "left of"),
+        (r"\s+(in front of|front of)\s+", "in front of"),
+        (r"\s+(next to|beside|near)\s+", "next to"),
+        (r"\s+(underneath|under|below|beneath)\s+", "under"),
+        (r"\s+(above|over|on top of)\s+", "above"),
+        (r"\s+(behind)\s+", "behind"),
+    ]
+    for pattern, relation in patterns:
+        match = re.search(pattern, text)
+        if match:
+            target = text[:match.start()].strip()
+            reference = text[match.end():].strip()
+            reference = re.sub(r"^(?:the|a|an)\s+", "", reference).strip()
+            return {
+                "target_phrase": target or text,
+                "relation": relation,
+                "relation_context": text[match.start():].strip(),
+                "reference_object": reference,
+            }
+    return {"target_phrase": text, "relation": "", "relation_context": "", "reference_object": ""}
+
+
 def _remove_relation_words(prompt: str) -> str:
     prompt = prompt.replace("left-most", "leftmost").replace("top-most", "topmost")
     return re.sub(
@@ -678,6 +880,79 @@ def _remove_leading_color(prompt: str) -> str:
     ).strip()
 
 
+NON_VISUAL_COUNT_RE = re.compile(r"\b(?:need|needed|stack|stacked|achieve|match|reach|same height|have to)\b")
+
+
+def is_visual_count_target(question_type: Optional[str], question: str, object_name: str) -> bool:
+    if question_type != "numeric_ct":
+        return False
+    question_text = re.sub(r"\s+", " ", str(question or "").lower())
+    if NON_VISUAL_COUNT_RE.search(question_text):
+        return False
+    forms = _object_name_forms(object_name)
+    for form in forms:
+        escaped = re.escape(form)
+        if re.search(r"\bhow many\s+" + escaped + r"\b", question_text):
+            return True
+        if re.search(r"\bnumber of\s+" + escaped + r"\b", question_text):
+            return True
+    return False
+
+
+def _object_name_forms(object_name: str) -> List[str]:
+    name = re.sub(r"\s+", " ", str(object_name or "").strip().lower())
+    singular = singularize_count_name(name)
+    plural = pluralize_count_name(singular)
+    return _dedupe_preserve_order([name, singular, plural])
+
+
+def singularize_count_name(name: str) -> str:
+    value = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    if value.endswith("ies") and len(value) > 3:
+        return value[:-3] + "y"
+    if value.endswith("ves") and len(value) > 3:
+        return value[:-3] + "f"
+    if value.endswith("xes") or value.endswith("ches") or value.endswith("shes") or value.endswith("ses"):
+        return value[:-2]
+    if value.endswith("s") and not value.endswith("ss") and len(value) > 1:
+        return value[:-1]
+    return value
+
+
+def pluralize_count_name(name: str) -> str:
+    value = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    if value.endswith("y"):
+        return value[:-1] + "ies"
+    if value.endswith(("x", "ch", "sh", "s")):
+        return value + "es"
+    return value + "s"
+
+
+def make_count_instance_name(object_name: str, idx: int) -> str:
+    prefix = singularize_count_name(_remove_leading_color(_remove_relation_words(object_name.lower())))
+    prefix = re.sub(r"[^a-z0-9]+", "_", prefix).strip("_") or "object"
+    return f"{prefix}_{idx}"
+
+
+def select_count_instance_candidates(candidates: List[Dict[str, object]], max_instances: int = 5) -> List[Dict[str, object]]:
+    if not candidates:
+        return []
+    best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
+    selected = []
+    for candidate in candidates:
+        score = float(candidate.get("rank_score", candidate.get("score", 0.0)))
+        if score < best_score - 0.35:
+            continue
+        box = candidate.get("box2d", [0, 0, 0, 0])
+        if any(box_iou(box, item.get("box2d", [0, 0, 0, 0])) > 0.75 for item in selected):
+            continue
+        selected.append(candidate)
+        if len(selected) >= max_instances:
+            break
+    selected.sort(key=lambda item: (box_center(item.get("box2d", [0, 0, 0, 0]))[1], box_center(item.get("box2d", [0, 0, 0, 0]))[0]))
+    return selected
+
+
 def relation_modifier(object_name: str) -> str:
     name = object_name.lower().replace("left-most", "leftmost").replace("top-most", "topmost")
     for modifier in ["leftmost", "rightmost", "center", "topmost", "bottommost"]:
@@ -687,7 +962,7 @@ def relation_modifier(object_name: str) -> str:
 
 
 def select_by_relation(ranked, relation: str, width: int, height: int) -> Dict[str, object]:
-    candidates = _reasonable_relation_candidates([item[2] for item in ranked])
+    candidates = _reasonable_relation_candidates([item[2] for item in ranked], relation)
     if relation == "leftmost":
         return min(candidates, key=lambda item: box_center(item["box2d"])[0])
     if relation == "rightmost":
@@ -703,7 +978,7 @@ def select_by_relation(ranked, relation: str, width: int, height: int) -> Dict[s
     return ranked[0][2]
 
 
-def _reasonable_relation_candidates(candidates: List[Dict[str, object]], score_margin: float = 0.25) -> List[Dict[str, object]]:
+def _reasonable_relation_candidates(candidates: List[Dict[str, object]], relation: str = "", score_margin: float = 0.25) -> List[Dict[str, object]]:
     if not candidates:
         return []
     best_score = max(float(item.get("rank_score", item.get("score", 0.0))) for item in candidates)
@@ -711,7 +986,38 @@ def _reasonable_relation_candidates(candidates: List[Dict[str, object]], score_m
         item for item in candidates
         if float(item.get("rank_score", item.get("score", 0.0))) >= best_score - score_margin
     ]
-    return reasonable or candidates
+    protected = _relation_extreme_candidate(candidates, relation)
+    if protected is not None and _should_protect_relation_extreme(protected):
+        reasonable.append(protected)
+    return _dedupe_candidates_by_box(reasonable) or candidates
+
+
+def _relation_extreme_candidate(candidates: List[Dict[str, object]], relation: str) -> Optional[Dict[str, object]]:
+    if not candidates:
+        return None
+    if relation == "leftmost":
+        return min(candidates, key=lambda item: box_center(item["box2d"])[0])
+    if relation == "rightmost":
+        return max(candidates, key=lambda item: box_center(item["box2d"])[0])
+    if relation == "topmost":
+        return min(candidates, key=lambda item: box_center(item["box2d"])[1])
+    if relation == "bottommost":
+        return max(candidates, key=lambda item: box_center(item["box2d"])[1])
+    return None
+
+
+def _should_protect_relation_extreme(candidate: Dict[str, object]) -> bool:
+    reasons = set(candidate.get("rank_reasons") or [])
+    return bool(reasons.intersection({"large_entity_penalty", "broad_entity_penalty"}))
+
+
+def _dedupe_candidates_by_box(candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    result = []
+    for candidate in candidates:
+        box = candidate.get("box2d", [0, 0, 0, 0])
+        if not any(_same_box(box, item.get("box2d", [0, 0, 0, 0])) for item in result):
+            result.append(candidate)
+    return result
 
 
 def _same_box(a, b) -> bool:
@@ -724,7 +1030,7 @@ def _selection_matches_relation(object_name: str, selected: Dict[str, object], c
     relation = relation_modifier(object_name)
     if relation not in {"leftmost", "rightmost", "topmost", "bottommost"}:
         return True
-    reasonable = _reasonable_relation_candidates(candidates)
+    reasonable = _reasonable_relation_candidates(candidates, relation)
     selected_box = selected.get("box2d", [0, 0, 0, 0])
     if not any(_same_box(selected_box, item.get("box2d", [0, 0, 0, 0])) for item in reasonable):
         return False
@@ -753,6 +1059,61 @@ def _prefers_complete_entity(object_name: str) -> bool:
     return any(word in base for word in ("cabinet", "table", "sofa", "chair"))
 
 
+def is_shape_object(object_name: str) -> bool:
+    return bool(re.search(r"\b(?:circular|round|square|rectangular|oval)\b", object_name.lower()))
+
+
+def prompt_has_shape(prompt: str, object_name: str) -> bool:
+    shapes = re.findall(r"\b(?:circular|round|square|rectangular|oval)\b", object_name.lower())
+    prompt_text = prompt.lower()
+    if "circular" in shapes:
+        shapes.append("round")
+    if "round" in shapes:
+        shapes.append("circular")
+    return any(shape in prompt_text for shape in shapes)
+
+
+def _relation_target_candidate_override(object_name: str, selected: Dict[str, object]) -> bool:
+    context = parse_object_relation_context(object_name)
+    if not context.get("relation_context"):
+        return False
+    return _candidate_matches_target_phrase(object_name, selected)
+
+
+def _attribute_target_candidate_override(object_name: str, selected: Dict[str, object]) -> bool:
+    target = parse_object_relation_context(object_name).get("target_phrase", "")
+    if not (is_color_object(target) or is_material_object(target) or is_shape_object(target)):
+        return False
+    return _candidate_matches_target_phrase(object_name, selected)
+
+
+def _candidate_matches_target_phrase(object_name: str, candidate: Dict[str, object]) -> bool:
+    context = parse_object_relation_context(object_name)
+    target = context.get("target_phrase", "")
+    prompt = str(candidate.get("prompt", "")).lower()
+    if not target or not prompt:
+        return False
+    if prompt == target or prompt == object_name.lower():
+        return True
+    if prompt in detection_prompts_for_object(target):
+        return True
+    return False
+
+
+def _candidate_matches_reference_object(object_name: str, candidate: Dict[str, object]) -> bool:
+    context = parse_object_relation_context(object_name)
+    reference = context.get("reference_object", "")
+    if not reference:
+        return False
+    prompt = str(candidate.get("prompt", "")).lower().strip()
+    if not prompt:
+        return False
+    reference_prompts = set(detection_prompts_for_object(reference))
+    if reference in {"tv", "television"}:
+        reference_prompts.update({"tv", "television"})
+    return prompt in reference_prompts
+
+
 def is_color_object(object_name: str) -> bool:
     return bool(re.match(r"^(?:white|black|red|blue|green|yellow|brown|gray|grey|pink|purple|orange|silver|gold|dark|light)\s+", object_name.lower()))
 
@@ -760,6 +1121,35 @@ def is_color_object(object_name: str) -> bool:
 def prompt_has_color(prompt: str, object_name: str) -> bool:
     color = object_name.lower().split()[0]
     return prompt.lower().startswith(color + " ")
+
+
+def is_transparency_object(object_name: str) -> bool:
+    return bool(re.search(r"\b(?:translucent|transparent|clear|see[- ]through)\b", object_name.lower()))
+
+
+def _remove_leading_transparency(prompt: str) -> str:
+    return re.sub(r"^(?:translucent|transparent|clear|see[- ]through)\s+", "", prompt.lower()).strip()
+
+
+def _transparency_synonym_prompts(object_name: str) -> List[str]:
+    base = _remove_leading_transparency(object_name)
+    if not base or base == object_name.lower().strip():
+        return []
+    return [f"translucent {base}", f"transparent {base}", f"clear {base}", f"see-through {base}"]
+
+
+def is_material_object(object_name: str) -> bool:
+    return bool(re.search(r"\b(?:glass|translucent|transparent|clear|see[- ]through|wooden|metal|plastic|leather|fabric|marble|ceramic)\b", object_name.lower()))
+
+
+def prompt_has_material(prompt: str, object_name: str) -> bool:
+    materials = re.findall(r"\b(?:glass|translucent|transparent|clear|see[- ]through|wooden|metal|plastic|leather|fabric|marble|ceramic)\b", object_name.lower())
+    prompt_text = prompt.lower()
+    if "glass" in materials:
+        materials.extend(["transparent", "clear"])
+    if any(material in materials for material in ("translucent", "transparent", "clear", "see-through", "see through")):
+        materials.extend(["translucent", "transparent", "clear", "see-through", "see through"])
+    return any(material in prompt_text for material in materials)
 
 
 def box_area(box: List[int]) -> int:
