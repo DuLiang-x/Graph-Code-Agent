@@ -98,16 +98,21 @@ api_specification = """
             For "how many X" visual counting questions, use graph.list_nodes() and count indexed instance nodes such as x_1, x_2, x_3.
             Example: handles = [name for name in graph.list_nodes() if name.startswith("handle_")]; answer = len(handles).
             Do not answer counting questions by checking only graph.get_node("handles") or graph.height("handles").
+            Inspect graph.list_nodes() before choosing prefixes; prefer prefixes that actually exist, such as pillow_ rather than blindly writing pillows_.
             If the question says dials count as handles, count both handle_ and dial_ indexed nodes.
             If the question asks how many objects are stuck/attached/on a surface, count all relevant indexed small-object nodes, not the surface object itself.
             If preprocessing already exposes relation-specific indexed nodes such as towel_1...towel_4 for "towels on the bed" or fridge_object_1...fridge_object_N for "objects stuck on the fridge", count those nodes directly; do not re-filter them with fragile geometry checks like graph.is_on_top or graph.is_inside unless no relation-specific indexed nodes exist.
             For count-ratio questions, count each indexed prefix separately and compute graph.ratio(count_a, count_b).
+            For shelf/book block questions, use indexed book nodes and shelf nodes; sort shelves from top to bottom and check horizontal adjacency of books on each shelf. Do not use graph.objects_in_view to infer adjacent books.
+            Never create graph node names from question fragments such as "right-most chair closer", "blue stool can you fit", or "furthest point". Use exact names from graph.list_nodes(); for furthest point of an object, use that object's box3d_min/box3d_max depth extent instead.
 
         Dimension and ratio rules:
             For "height of X", use graph.height("X").
             For "length of X", use graph.length("X").
             For "width/depth of X", use graph.width("X") or graph.depth("X").
             For ratio questions, use graph.ratio(numerator, denominator) instead of direct division.
+            For float numeric questions such as "how many objects with the volume/width/height of X would fit/reach Y", return the continuous ratio. Do not use //, int(), or round() unless the question explicitly asks for an integer or rounding.
+            For TV/monitor/screen diagonal length, use the screen-plane diagonal sqrt(width^2 + height^2). Do not include graph.depth(obj) in the diagonal unless the question explicitly asks for a 3D box diagonal.
             Do not use graph.compare_height/width/depth as an object's own size; they are signed differences between two objects.
             Raw graph dimensions are 3D AABB units, not guaranteed real meters.
             If the question gives a known real size such as "X is 2m long", use it as a scale reference:
@@ -115,10 +120,14 @@ api_specification = """
                 answer = graph.length(target_object) * scale
             Do not directly return raw graph.length(target_object) as meters when a known reference size is provided.
             For "length of table/sofa-side table" in Omni3D numeric calibration questions, use graph.length(obj, axis="auto") as the horizontal long side, not graph.height(obj).
+            If the wording says a length/width-sized object is stacked or multiplied to reach a height, use the dimension named by the question as the object size and compare against graph.height(target). Do not silently switch to a different axis.
 
         Visual/color and physical-motion limitations:
             SpatialGraph is geometric and does not provide color APIs. Do not invent get_color or color attributes. For color comparison questions, return computed_results with the relevant object names and rely on the visual clue/answer model to produce yes/no.
-            For "falling directly towards the camera" or "towards the viewer" questions, do not use simple Euclidean distance to decide the first hit. Approximate along the camera/view direction using object positions and extents, and prefer floor when the falling path is downward/forward and intersects the floor before furniture.
+            For color questions with closest/furthest objects, first compute which object is closest/furthest to the camera using camera-space depth, then return those object names with needs_visual_color_check. Do not infer color from graph node names.
+            Clock reading questions cannot be solved from graph.position. Return needs_visual_clock_reading with the clock object and requested output format; do not parse hour/minute from clock.position.
+            For "falling directly forward", "falling directly towards the camera", or collision questions, do not decide hit using only one z-axis threshold such as fall_end_z <= target_z. Approximate the motion path and require projected bbox overlap with the target in the relevant plane, such as x/y or x/z overlap plus the target being in the forward path. If the geometry is not reliable, return needs_visual_collision_check so the answer step can use the visual clue.
+            For apparent-size or visibility questions such as "appear taller" or "remain visible" after moving an object, do not rely only on physical height or a single-axis move. Use camera-view projection/overlap evidence when available; otherwise return needs_visual_apparent_size_check or needs_visual_visibility_check for the answer step.
 
         Hypothetical reasoning APIs:
             graph.move_object(name, delta)
@@ -368,15 +377,87 @@ example_problems = """
     Example 17: compass direction facing camera
     ```python
     def program(input_scene: Scene):
+        import math
         graph = pySpatial.build_graph(input_scene)
         nodes = graph.list_nodes()
         # Do not use observer_from_to("stool", "camera"). Camera is not a node.
-        # Use camera-view coordinates around the standing object and map to one compass label.
+        # North is the direction from the standing object toward the camera/viewer.
         origin = graph.get_node("right-most stool").position
         target = graph.get_node("fireplace").position
-        dx = float(target[0] - origin[0])
-        dz = float(target[2] - origin[2])
-        return {"computed_results": {"answer": "NE", "dx": dx, "dz": dz, "nodes": nodes}}
+        north = [0.0, -1.0]
+        right = [1.0, 0.0]
+        vector = [float(target[0] - origin[0]), float(target[2] - origin[2])]
+        east_score = vector[0] * right[0] + vector[1] * right[1]
+        north_score = vector[0] * north[0] + vector[1] * north[1]
+        angle = math.degrees(math.atan2(east_score, north_score))
+        labels = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+        direction = labels[int((angle + 22.5) % 360 // 45)]
+        return {"computed_results": {"answer": direction, "east_score": east_score, "north_score": north_score, "nodes": nodes}}
+    ```
+
+    Example 18: falling collision uses path overlap, not one z threshold
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        tv = graph.get_node("tv")
+        table = graph.get_node("light blue table")
+        # Approximate falling forward from camera view with bbox overlap evidence.
+        x_overlap = not (tv.box3d_max[0] < table.box3d_min[0] or tv.box3d_min[0] > table.box3d_max[0])
+        y_overlap = not (tv.box3d_max[1] < table.box3d_min[1] or tv.box3d_min[1] > table.box3d_max[1])
+        target_in_forward_path = table.position[2] < tv.position[2]
+        answer = bool(x_overlap and y_overlap and target_in_forward_path)
+        return {"computed_results": {"answer": answer, "x_overlap": x_overlap, "y_overlap": y_overlap, "target_in_forward_path": target_in_forward_path, "nodes": nodes}}
+    ```
+
+
+    Example 19: TV screen diagonal calibration uses width and height only
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        tv_width = graph.width("tv")
+        tv_height = graph.height("tv")
+        tv_screen_diagonal = (tv_width ** 2 + tv_height ** 2) ** 0.5
+        scale = graph.ratio(1.5, tv_screen_diagonal)
+        sofa_height = graph.height("left-most sofa") * scale
+        return {"computed_results": {"answer": sofa_height, "tv_screen_diagonal": tv_screen_diagonal}}
+    ```
+
+    Example 20: volume fit questions use continuous ratio, not integer division
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        table = graph.get_node("sofa-side table")
+        sofa = graph.get_node("sofa")
+        table_volume = table.box3d_size[0] * table.box3d_size[1] * table.box3d_size[2]
+        sofa_volume = sofa.box3d_size[0] * sofa.box3d_size[1] * sofa.box3d_size[2]
+        answer = graph.ratio(sofa_volume, table_volume)
+        return {"computed_results": {"answer": answer, "sofa_volume": sofa_volume, "table_volume": table_volume}}
+    ```
+
+    Example 21: clock reading uses visual clue, not graph position
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        return {"computed_results": {"answer": None, "needs_visual_clock_reading": True, "objects": ["clock"], "format": "xx:yy", "nodes": nodes}}
+    ```
+
+    Example 22: shelf book block uses shelf order and adjacency
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        shelves = [name for name in nodes if name.startswith("shelf")]
+        books = [name for name in nodes if name.startswith("yellow_book_")]
+        shelves_top_to_bottom = sorted(shelves, key=lambda name: graph.get_node(name).position[1], reverse=True)
+        for shelf_index, shelf in enumerate(shelves_top_to_bottom, start=1):
+            shelf_box = graph.get_node(shelf)
+            books_on_shelf = [book for book in books if shelf_box.box3d_min[1] <= graph.get_node(book).position[1] <= shelf_box.box3d_max[1]]
+            ordered = sorted(books_on_shelf, key=lambda book: graph.get_node(book).position[0])
+            if len(ordered) >= 3:
+                return {"computed_results": {"answer": shelf_index, "books_on_shelf": ordered, "nodes": nodes}}
+        return {"computed_results": {"answer": None, "nodes": nodes}}
     ```
 
     These examples use illustrative object names only. When generating a real program, use the real node names that exist in graph.list_nodes().
@@ -395,14 +476,22 @@ code_generation_prompt = f"""
     For generic surface counting, use unified indexed nodes such as fridge_object_1, fridge_object_2.
     For count-ratio questions, count the two indexed prefixes separately and compute graph.ratio(count_a, count_b).
     Do not use a single aggregate node such as handles when indexed instance nodes are available.
+    Inspect graph.list_nodes() before choosing singular/plural prefixes; use prefixes that actually exist.
+    Do not create object names from question fragments such as "right-most chair closer", "blue stool can you fit", or "furthest point".
+    For float fit/reach/volume questions, return a continuous ratio with graph.ratio; do not use //, int(), or round() unless explicitly requested.
+    For TV/monitor/screen diagonal length, compute sqrt(width^2 + height^2) and do not include depth.
+    For shelf/book block questions, sort shelves and books by positions and check adjacency; do not use graph.objects_in_view to infer adjacent books.
     Before writing code for left/right/front/back relations, first choose the observer.
     For Omni3D-Bench single-image tasks, "camera" means the current image viewpoint.
     If the question says "from the camera's perspective", use graph.observer_from_camera().
     Do not call graph.observer_from_object("camera").
     Do not treat camera as a graph node.
     Do not write graph.distance(obj, "camera") or graph.observer_from_to(obj, "camera"); use camera-space depth/positions from graph.get_node(obj) or camera-view semantics instead.
-    For compass direction questions where the person stands at X and faces the camera, output exactly one of N, NE, E, SE, S, SW, W, NW.
+    For compass direction questions where the person stands at X and faces the camera, build a local north/right basis and output exactly one of N, NE, E, SE, S, SW, W, NW; do not classify direction from raw dx/dz alone.
     For color comparison questions, Do not invent get_color; return visual evidence and let the answer step output yes/no.
+    For clock reading questions, do not parse time from graph.position; return needs_visual_clock_reading.
+    For falling/collision questions, do not use only a z-axis comparison such as fall_end_z <= target_z; check whether the motion path projection overlaps the target bbox and return needs_visual_collision_check when uncertain.
+    For apparent-size or visibility questions after moving an object, do not rely only on physical height or a single-axis move; return needs_visual_visibility_check or needs_visual_apparent_size_check when projection is uncertain.
     For Omni3D-Bench single-image tasks, default to graph.observer_from_camera() unless an explicit object perspective or from-to perspective is stated.
     Also, the function written should be named as program and the input parameter should be a Scene object.
     for example,
@@ -435,6 +524,8 @@ Final answer formatting rules:
 - If the question asks front/back or in front/behind, answer exactly one of: "front", "back", "in front", "behind", depending on the wording of the question.
 - If the question provides options, answer with exactly one option from the provided options. Do not invent a new option.
 - If the question asks for a number, answer with a single numeric value using digits, not words or a sentence. Include the unit only if the question explicitly requires a unit.
+- If computed_results contains a float such as 0.58, preserve it as a decimal; do not round it to 0 or convert it to an integer unless the question explicitly asks for rounding or an integer.
+- If computed_results contains needs_visual_color_check, needs_visual_clock_reading, needs_visual_visibility_check, needs_visual_apparent_size_check, or needs_visual_collision_check, use the visual clue to answer but still obey the strict final format.
 - If the question asks which object satisfies a relation, answer with the exact object name from the graph nodes or the provided options, not a full sentence.
 - Do not include unnecessary explanation in the final answer.
 - Do not output Python code in the final answer.

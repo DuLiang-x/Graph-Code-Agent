@@ -86,6 +86,7 @@ class Object3DLocator:
                         visualize=visualize,
                         save_dir=save_dir,
                         question=question,
+                        question_type=question_type,
                     )
                     results[object_name] = {
                         "error": "Count target expanded into indexed instances",
@@ -93,6 +94,7 @@ class Object3DLocator:
                         "counting_instances": instance_names,
                         "counting_instance_count": len(instance_names),
                         "counting_group_target": counting_info.get("counting_group_target"),
+                        "counting_recovery_reason": counting_info.get("counting_recovery_reason"),
                         "prompts_tried": prompts_tried,
                         "candidates_considered": summarize_candidates(candidates),
                     }
@@ -256,6 +258,7 @@ class Object3DLocator:
         visualize: bool,
         save_dir: Optional[Union[str, Path]],
         question: str = "",
+        question_type: str = None,
     ) -> Tuple[Dict[str, Dict[str, object]], List[str], Any, Dict[str, object]]:
         instances = {}  # type: Dict[str, Dict[str, object]]
         instance_names = []  # type: List[str]
@@ -269,8 +272,10 @@ class Object3DLocator:
             "counting_selection_source": "rule_fallback",
             "counting_rejected_candidates": [],
             "counting_group_target": counting_group_target,
+            "counting_recovery_reason": None,
         }
         selected_candidates = None
+        vlm_reject_mode_attempted = False
         if self.config.detection.use_vlm_refinement and self.vlm_model is not None:
             vlm_candidates, vlm_response, vlm_indices, vlm_rejected_indices = select_count_candidates_with_vlm(
                 self.vlm_model,
@@ -283,6 +288,7 @@ class Object3DLocator:
             counting_info["counting_vlm_response"] = vlm_response
             counting_info["counting_vlm_selected_indices"] = vlm_indices or []
             counting_info["counting_vlm_rejected_indices"] = vlm_rejected_indices or []
+            vlm_reject_mode_attempted = vlm_rejected_indices is not None
             if vlm_candidates:
                 filtered_candidates, rejected = filter_count_instance_candidates(
                     vlm_candidates,
@@ -296,6 +302,25 @@ class Object3DLocator:
                     selected_candidates = filtered_candidates
                     counting_info["counting_selection_mode"] = "vlm_reject_mode"
                     counting_info["counting_selection_source"] = "vlm_reject_mode"
+
+        if selected_candidates is None and question_type == "count_ratio" and vlm_reject_mode_attempted:
+            recovered_candidates, recovered_source, recovered_rejected = recover_empty_count_ratio_candidates(
+                candidates,
+                object_name,
+                selected_boxes,
+                max_instances=max_instances,
+            )
+            if recovered_candidates:
+                selected_candidates = recovered_candidates
+                counting_info["counting_selection_mode"] = recovered_source
+                counting_info["counting_selection_source"] = recovered_source
+                counting_info["counting_vlm_selected_indices"] = [
+                    int(candidate.get("candidate_index"))
+                    for candidate in recovered_candidates
+                    if candidate.get("candidate_index") is not None
+                ]
+                counting_info["counting_rejected_candidates"] = recovered_rejected
+                counting_info["counting_recovery_reason"] = "empty_count_ratio_side"
 
         if selected_candidates is None:
             rule_candidates = select_count_instance_candidates(
@@ -345,6 +370,7 @@ class Object3DLocator:
                     "counting_vlm_response": counting_info["counting_vlm_response"],
                     "counting_vlm_selected_indices": counting_info["counting_vlm_selected_indices"],
                     "counting_vlm_rejected_indices": counting_info["counting_vlm_rejected_indices"],
+                    "counting_recovery_reason": counting_info["counting_recovery_reason"],
                     "counting_filter_reason": detection.get("counting_filter_reason"),
                 }
                 continue
@@ -391,6 +417,7 @@ class Object3DLocator:
                 "counting_vlm_response": counting_info["counting_vlm_response"],
                 "counting_vlm_selected_indices": counting_info["counting_vlm_selected_indices"],
                 "counting_vlm_rejected_indices": counting_info["counting_vlm_rejected_indices"],
+                "counting_recovery_reason": counting_info["counting_recovery_reason"],
                 "counting_filter_reason": detection.get("counting_filter_reason"),
             }
             if "score" in detection:
@@ -780,7 +807,7 @@ def select_count_candidates_with_vlm(
     candidates: List[Dict[str, object]],
     question: str = "",
     save_dir: Optional[Union[str, Path]] = None,
-) -> Tuple[Optional[List[Dict[str, object]]], Optional[str], List[int], List[int]]:
+) -> Tuple[Optional[List[Dict[str, object]]], Optional[str], List[int], Optional[List[int]]]:
     grid = save_candidate_grid(image_pil, object_name, candidates, save_dir)
     overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
     overlay_image = Image.open(overlay_path).convert("RGB") if overlay_path is not None else make_candidate_overlay(image_pil, candidates)
@@ -799,6 +826,7 @@ Coordinate and score notes:
 - Larger x means further right in the image; larger y means lower in the image.
 - dino_score, rank_score, and rank_reasons are supporting evidence only.
 - Recall is important: if a candidate might be a valid counted instance, do not reject it. Hard filters will remove duplicates and group boxes later.
+- For count-ratio questions, both counted categories must keep possible instances; do not reject every candidate for one side unless every candidate is clearly not that category.
 
 Counting reject rules:
 - Return candidate indices that should be rejected, not the valid instance indices.
@@ -842,7 +870,7 @@ Return format:
     response = vlm_model.process_messages(messages, max_new_tokens=128)
     rejected_indices = parse_count_rejected_indices(response, len(candidates))
     if rejected_indices is None:
-        return None, str(response), [], []
+        return None, str(response), [], None
     selected = []
     selected_indices = []
     rejected_set = set(rejected_indices)
@@ -1311,6 +1339,39 @@ def select_count_instance_candidates(
             break
     selected.sort(key=lambda item: (box_center(item.get("box2d", [0, 0, 0, 0]))[1], box_center(item.get("box2d", [0, 0, 0, 0]))[0]))
     return selected
+
+
+def recover_empty_count_ratio_candidates(
+    candidates: List[Dict[str, object]],
+    object_name: str,
+    selected_boxes: Dict[str, List[int]],
+    max_instances: int = 20,
+) -> Tuple[List[Dict[str, object]], str, List[Dict[str, object]]]:
+    rule_candidates = select_count_instance_candidates(
+        candidates,
+        max_instances=max_instances,
+        score_margin=0.55,
+    )
+    filtered, rejected = filter_count_instance_candidates(
+        rule_candidates,
+        candidates,
+        object_name,
+        max_instances=max_instances,
+        existing_boxes=selected_boxes,
+    )
+    if filtered:
+        return filtered, "vlm_reject_mode_rule_recovered", rejected
+
+    for candidate in candidates:
+        box = candidate.get("box2d", [0, 0, 0, 0])
+        if _count_candidate_is_container(candidate, object_name):
+            continue
+        if any(_count_boxes_duplicate(box, existing_box) for existing_box in selected_boxes.values()):
+            continue
+        item = dict(candidate)
+        item["counting_filter_reason"] = None
+        return [item], "vlm_reject_mode_min_recovered", rejected
+    return [], "vlm_reject_mode_min_recovered", rejected
 
 
 def filter_count_instance_candidates(

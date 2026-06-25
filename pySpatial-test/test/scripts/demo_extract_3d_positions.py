@@ -328,7 +328,7 @@ def parse_args() -> argparse.Namespace:
         help="Local Qwen2.5-VL model path for detection candidate refinement.",
     )
     parser.add_argument("--backend", choices=("local_qwen", "openai"), default="local_qwen", help="VLM refinement backend.")
-    parser.add_argument("--api_model", default="gpt-4.1", help="OpenAI model for VLM refinement when --backend openai.")
+    parser.add_argument("--api_model", default="gpt-4o", help="OpenAI model for VLM refinement when --backend openai.")
     parser.add_argument("--api_key", default=None, help="OpenAI API key for VLM refinement; falls back to OPENAI_API_KEY.")
     parser.add_argument("--base_url", default=None, help="OpenAI-compatible base URL; falls back to CLOSEAI_BASE_URL or OPENAI_BASE_URL.")
     parser.add_argument(

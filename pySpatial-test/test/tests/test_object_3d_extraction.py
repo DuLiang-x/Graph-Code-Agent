@@ -286,6 +286,60 @@ def test_count_reject_parser_requires_reject_prefix():
     assert parse_count_rejected_indices("INVALID", 10) is None
 
 
+def test_count_ratio_empty_reject_side_recovers_rule_candidates():
+    vlm = FakeObjectExtractionVLM(["REJECT: [0, 1]"])
+    locator = make_locator(
+        {
+            "solid balls": [
+                {"box2d": [2, 2, 6, 6], "score": 0.90, "prompt": "solid balls"},
+                {"box2d": [10, 2, 14, 6], "score": 0.88, "prompt": "solid balls"},
+            ],
+        },
+        vlm_model=vlm,
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (32, 20), color="white")
+
+    result = locator.extract(
+        image,
+        ["solid balls"],
+        question="What is the ratio of striped balls to solid balls?",
+        question_type="count_ratio",
+    )
+
+    assert result["solid balls"]["counting_selection_source"] == "vlm_reject_mode_rule_recovered"
+    assert result["solid balls"]["counting_recovery_reason"] == "empty_count_ratio_side"
+    assert result["solid balls"]["counting_instances"] == ["solid_ball_1", "solid_ball_2"]
+    assert result["solid balls"]["counting_vlm_rejected_indices"] == [0, 1]
+    assert result["solid balls"]["counting_vlm_selected_indices"] == [0, 1]
+
+
+def test_numeric_count_empty_reject_side_uses_plain_rule_fallback_without_recovery():
+    vlm = FakeObjectExtractionVLM(["REJECT: [0, 1]"])
+    locator = make_locator(
+        {
+            "plates": [
+                {"box2d": [2, 2, 6, 6], "score": 0.90, "prompt": "plates"},
+                {"box2d": [10, 2, 14, 6], "score": 0.88, "prompt": "plates"},
+            ],
+        },
+        vlm_model=vlm,
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (32, 20), color="white")
+
+    result = locator.extract(
+        image,
+        ["plates"],
+        question="How many plates are visible?",
+        question_type="numeric_ct",
+    )
+
+    assert result["plates"]["counting_selection_source"] == "rule_fallback"
+    assert result["plates"].get("counting_recovery_reason") is None
+    assert result["plates"]["counting_instances"] == ["plate_1", "plate_2"]
+
+
 def test_count_filter_removes_group_box_containing_smaller_instances():
     candidates = [
         {"box2d": [0, 0, 80, 80], "score": 0.95, "prompt": "post-it notes", "candidate_index": 0},

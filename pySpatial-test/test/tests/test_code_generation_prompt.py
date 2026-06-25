@@ -117,6 +117,8 @@ def test_answer_prompt_includes_final_format_rules():
     assert "using digits, not words or a sentence" in ANSWER_FORMAT_RULES
     assert "not a full sentence" in ANSWER_FORMAT_RULES
     assert "Do not output Python code" in ANSWER_FORMAT_RULES
+    assert "preserve it as a decimal" in ANSWER_FORMAT_RULES
+    assert "needs_visual_clock_reading" in ANSWER_FORMAT_RULES
     assert "Final answer formatting rules" in answer_prompt
 
 
@@ -199,7 +201,12 @@ def test_code_generation_prompt_documents_badcase_rules():
     assert "SpatialGraph is geometric and does not provide color APIs" in api_specification
     assert "Do not invent get_color" in api_specification
     assert "falling directly towards the camera" in api_specification
+    assert "do not decide hit using only one z-axis threshold" in api_specification
+    assert "projected bbox overlap" in api_specification
+    assert "needs_visual_collision_check" in api_specification
     assert "Do not invent get_color" in code_generation_prompt
+    assert "do not use only a z-axis comparison" in code_generation_prompt
+    assert "motion path projection overlaps the target bbox" in code_generation_prompt
     assert "output exactly one of N, NE, E, SE, S, SW, W, NW" in code_generation_prompt
     assert "Example 14: closer/farther from camera without camera node" in example_problems
     assert 'abs(float(graph.get_node("middle chandelier").position[2]))' in example_problems
@@ -209,3 +216,46 @@ def test_code_generation_prompt_documents_badcase_rules():
     assert "needs_visual_color_check" in example_problems
     assert "Example 17: compass direction facing camera" in example_problems
     assert 'observer_from_to("stool", "camera")' in example_problems
+    assert "Example 18: falling collision uses path overlap" in example_problems
+    assert "x_overlap" in example_problems
+    assert "target_in_forward_path" in example_problems
+    assert "tv_fall_end_z <= table_start_z" not in example_problems
+
+
+def test_code_generation_prompt_documents_60_130_badcase_rules():
+    from agent.prompt.template import example_problems
+
+    assert "return the continuous ratio" in api_specification
+    assert "Do not use //, int(), or round()" in api_specification
+    assert "screen-plane diagonal sqrt(width^2 + height^2)" in api_specification
+    assert "Do not include graph.depth(obj) in the diagonal" in api_specification
+    assert "Clock reading questions cannot be solved from graph.position" in api_specification
+    assert "needs_visual_clock_reading" in api_specification
+    assert "needs_visual_visibility_check" in api_specification
+    assert "needs_visual_apparent_size_check" in api_specification
+    assert "pillow_ rather than blindly writing pillows_" in api_specification
+    assert "Do not use graph.objects_in_view to infer adjacent books" in api_specification
+    assert '"right-most chair closer"' in api_specification
+    assert '"blue stool can you fit"' in api_specification
+    assert '"furthest point"' in api_specification
+
+    assert "do not use //, int(), or round()" in code_generation_prompt
+    assert "compute sqrt(width^2 + height^2) and do not include depth" in code_generation_prompt
+    assert "do not parse time from graph.position" in code_generation_prompt
+    assert "build a local north/right basis" in code_generation_prompt
+    assert "do not classify direction from raw dx/dz alone" in code_generation_prompt
+    assert "do not use graph.objects_in_view" in code_generation_prompt
+
+    assert "Example 19: TV screen diagonal calibration uses width and height only" in example_problems
+    assert "tv_screen_diagonal = (tv_width ** 2 + tv_height ** 2) ** 0.5" in example_problems
+    assert "Example 20: volume fit questions use continuous ratio" in example_problems
+    assert "answer = graph.ratio(sofa_volume, table_volume)" in example_problems
+    assert "Example 21: clock reading uses visual clue" in example_problems
+    assert "needs_visual_clock_reading" in example_problems
+    assert "Example 22: shelf book block uses shelf order and adjacency" in example_problems
+    example_22 = example_problems.split("Example 22: shelf book block uses shelf order and adjacency", 1)[1].split("These examples use illustrative", 1)[0]
+    assert "objects_in_view" not in example_22
+    assert "tv_depth" not in example_problems
+    assert "// stool_volume" not in example_problems
+    assert 'graph.get_node("furthest point")' not in example_problems
+    assert 'graph.get_node("blue stool can you fit")' not in example_problems
