@@ -77,6 +77,7 @@ def test_create_sample_flowchart_uses_extract_output_debug_dir(monkeypatch, tmpd
         "images": [str(image_path)],
         "expected_answer": "yes",
         "generated_answer": "yes",
+        "question_type": "yes_no",
         "answer_correct": True,
         "fallback_used": False,
         "generated_code": "def program(input_scene): pass",
@@ -100,6 +101,9 @@ def test_summarize_result_for_output_removes_large_intermediate_fields():
         "answer_correct": True,
         "float_relative_error": 0.01,
         "float_mra": 1.0,
+        "numeric_relative_error": 0.01,
+        "numeric_mra": 1.0,
+        "numeric_score": 1.0,
         "flowchart_path": "flowcharts/omni3d_0_flowchart.png",
         "object_3d_boxes": {"tv": _box()},
         "visual_clue": {"computed_results": {"answer": "yes"}},
@@ -110,10 +114,14 @@ def test_summarize_result_for_output_removes_large_intermediate_fields():
 
     assert summary["scene_id"] == "omni3d_0"
     assert summary["generated_answer"] == "yes"
+    assert summary["question_type"] == "yes_no"
     assert summary["generated_code"] == "def program(input_scene): pass"
     assert summary["flowchart_path"] == "flowcharts/omni3d_0_flowchart.png"
     assert summary["float_relative_error"] == 0.01
     assert summary["float_mra"] == 1.0
+    assert summary["numeric_relative_error"] == 0.01
+    assert summary["numeric_mra"] == 1.0
+    assert summary["numeric_score"] == 1.0
     assert "object_3d_boxes" not in summary
     assert "visual_clue" not in summary
     assert "generated_response" not in summary

@@ -14,6 +14,12 @@ from mindcube import (
     compute_acc_mra,
     compute_float_mra,
     compute_float_relative_error,
+    compute_numeric_mra,
+    compute_numeric_relative_error,
+    compute_summary_statistics,
+    infer_question_type,
+    is_numeric_answer_type,
+    normalize_question_type_for_summary,
     evaluate_answer_correctness,
     filter_entries_by_index_range,
     get_entry_question_index,
@@ -95,15 +101,27 @@ def test_float_mra_metrics():
     assert compute_float_mra("1.0", 0.0) is None
 
 
-def test_acc_mra_uses_mra_for_float_and_accuracy_for_other_types():
+def test_numeric_mra_metrics_include_int_answers():
+    assert is_numeric_answer_type("int", 3) is True
+    assert is_numeric_answer_type("float", 0.5) is True
+    assert is_numeric_answer_type("str", "yes") is False
+    assert compute_numeric_relative_error("2", 3) == 1 / 3
+    assert compute_numeric_mra("0.948", 0.948) == 1.0
+    assert compute_numeric_mra("1.1", 1.0) == 0.8
+    assert compute_numeric_mra("2", 3) == 0.4
+    assert compute_numeric_mra("no number", 1.0) is None
+    assert compute_numeric_mra("1.0", 0.0) is None
+
+
+def test_acc_mra_uses_mra_for_numeric_and_accuracy_for_other_types():
     results = [
-        {"answer_type": "float", "expected_answer": 1.0, "generated_answer": "1.0", "float_mra": 1.0, "answer_correct": True},
-        {"answer_type": "float", "expected_answer": 1.0, "generated_answer": "1.1", "float_mra": 0.8, "answer_correct": False},
+        {"answer_type": "float", "expected_answer": 1.0, "generated_answer": "1.0", "float_mra": 1.0, "numeric_mra": 1.0, "answer_correct": True},
+        {"answer_type": "float", "expected_answer": 1.0, "generated_answer": "1.1", "float_mra": 0.8, "numeric_mra": 0.8, "answer_correct": False},
         {"answer_type": "str", "expected_answer": "yes", "generated_answer": "yes", "answer_correct": True},
-        {"answer_type": "int", "expected_answer": 2, "generated_answer": "3", "answer_correct": False},
+        {"answer_type": "int", "expected_answer": 3, "generated_answer": "2", "numeric_mra": 0.4, "answer_correct": False},
     ]
 
-    assert compute_acc_mra(results) == {"acc_mra": 0.7, "acc_mra_count": 4}
+    assert compute_acc_mra(results) == {"acc_mra": 0.8, "acc_mra_count": 4, "mra_score": 0.8, "mra_score_count": 4}
 
 
 def test_entry_question_index_parsing_priority():
@@ -189,3 +207,77 @@ def test_load_omni3d_entries_builds_scene_fields(tmpdir):
 def test_omni3d_object_names_without_options():
     question = "What is the ratio of the height of the fireplace to the combined height of the coffee table and the sofa to the right of the coffee table?"
     assert extract_object_names_from_omni3d_question(question) == ["fireplace", "coffee table", "sofa"]
+
+
+def test_question_type_normalization_and_fallback_classification():
+    assert normalize_question_type_for_summary("count_ratio") == "numeric_ct"
+    assert normalize_question_type_for_summary("numeric_other") == "numeric_other"
+    assert normalize_question_type_for_summary("unknown_kind") == "unknown"
+    assert infer_question_type("How many chairs are visible?", 3, "int") == "numeric_ct"
+    assert infer_question_type("What is the height ratio?", 0.5, "float") == "numeric_other"
+    assert infer_question_type("Is the chair visible?", "yes", "str") == "yes_no"
+    assert infer_question_type("Which object is closer?", "chair", "str") == "choice_object"
+
+
+def test_summary_statistics_group_by_question_type_not_answer_type():
+    results = [
+        {
+            "scene_type": "unknown",
+            "question_type": "numeric_ct",
+            "answer_type": "int",
+            "expected_answer": 3,
+            "generated_answer": "2",
+            "answer_correct": False,
+            "numeric_mra": 0.4,
+            "parse_success": True,
+            "execution_success": True,
+            "answer_generation_success": True,
+        },
+        {
+            "scene_type": "unknown",
+            "question_type": "numeric_other",
+            "answer_type": "float",
+            "expected_answer": 1.0,
+            "generated_answer": "1.0",
+            "answer_correct": True,
+            "numeric_mra": 1.0,
+            "parse_success": True,
+            "execution_success": True,
+            "answer_generation_success": True,
+        },
+        {
+            "scene_type": "unknown",
+            "question_type": "yes_no",
+            "answer_type": "str",
+            "expected_answer": "yes",
+            "generated_answer": "yes",
+            "answer_correct": True,
+            "parse_success": True,
+            "execution_success": True,
+            "answer_generation_success": True,
+        },
+        {
+            "scene_type": "unknown",
+            "question_type": "count_ratio",
+            "answer_type": "float",
+            "expected_answer": 1.0,
+            "generated_answer": "1.1",
+            "answer_correct": False,
+            "numeric_mra": 0.8,
+            "parse_success": True,
+            "execution_success": True,
+            "answer_generation_success": True,
+        },
+    ]
+
+    stats = compute_summary_statistics(results)
+
+    assert "question_type_metrics" in stats
+    assert "answer_type_metrics" not in stats
+    metrics = stats["question_type_metrics"]
+    assert metrics["numeric_ct"]["count"] == 2
+    assert metrics["numeric_ct"]["mra"] == 0.6
+    assert metrics["numeric_ct"]["mra_count"] == 2
+    assert metrics["numeric_other"]["mra"] == 1.0
+    assert "mra" not in metrics["yes_no"]
+    assert stats["overall_metrics"]["mra_score"] == 0.8
