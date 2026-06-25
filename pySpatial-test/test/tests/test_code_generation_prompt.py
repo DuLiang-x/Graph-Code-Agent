@@ -85,6 +85,9 @@ def test_graph_api_prompt_documents_indexed_counting_nodes():
     assert 'name.startswith("handle_")' in api_specification
     assert "Do not answer counting questions by checking only graph.get_node" in api_specification
     assert "inspect graph.list_nodes() and count indexed same-category instance nodes" in code_generation_prompt
+    assert "do not add fragile relation filters" in code_generation_prompt
+    assert "fridge_object_1" in code_generation_prompt
+    assert "count the two indexed prefixes separately" in code_generation_prompt
     assert "Do not use a single aggregate node such as handles" in code_generation_prompt
 
 
@@ -111,6 +114,8 @@ def test_answer_prompt_includes_final_format_rules():
     assert "computed_results" in ANSWER_FORMAT_RULES
     assert 'answer exactly "yes" or "no"' in ANSWER_FORMAT_RULES
     assert "answer with a single numeric value" in ANSWER_FORMAT_RULES
+    assert "using digits, not words or a sentence" in ANSWER_FORMAT_RULES
+    assert "not a full sentence" in ANSWER_FORMAT_RULES
     assert "Do not output Python code" in ANSWER_FORMAT_RULES
     assert "Final answer formatting rules" in answer_prompt
 
@@ -168,6 +173,9 @@ def test_camera_semantics_are_documented_for_graph_prompt():
     assert "visible object's own perspective" in api_specification
     assert 'Do not call graph.observer_from_object("camera").' in code_generation_prompt
     assert "Do not treat camera as a graph node" in code_generation_prompt
+    assert 'Do not write graph.distance(obj, "camera")' in code_generation_prompt
+    assert 'graph.observer_from_to(obj, "camera")' in code_generation_prompt
+    assert 'camera-space depth' in api_specification
     assert "Example 12: camera perspective is not a graph node" in example_problems
     assert 'camera = graph.observer_from_camera()' in example_problems
     assert 'graph.is_left_of("chair", "table", camera)' in example_problems
@@ -181,3 +189,23 @@ def test_graph_examples_include_indexed_counting_pattern():
     assert 'handles = [name for name in nodes if name.startswith("handle_")]' in example_problems
     assert "answer = len(handles)" in example_problems
     assert '"counted_nodes": handles' in example_problems
+
+
+def test_code_generation_prompt_documents_badcase_rules():
+    from agent.prompt.template import example_problems
+
+    assert "If the question says dials count as handles" in api_specification
+    assert "count both handle_ and dial_" in api_specification
+    assert "SpatialGraph is geometric and does not provide color APIs" in api_specification
+    assert "Do not invent get_color" in api_specification
+    assert "falling directly towards the camera" in api_specification
+    assert "Do not invent get_color" in code_generation_prompt
+    assert "output exactly one of N, NE, E, SE, S, SW, W, NW" in code_generation_prompt
+    assert "Example 14: closer/farther from camera without camera node" in example_problems
+    assert 'abs(float(graph.get_node("middle chandelier").position[2]))' in example_problems
+    assert "Example 15: dials count as handles" in example_problems
+    assert 'name.startswith("handle_") or name.startswith("dial_")' in example_problems
+    assert "Example 16: color comparison uses visual clue" in example_problems
+    assert "needs_visual_color_check" in example_problems
+    assert "Example 17: compass direction facing camera" in example_problems
+    assert 'observer_from_to("stool", "camera")' in example_problems

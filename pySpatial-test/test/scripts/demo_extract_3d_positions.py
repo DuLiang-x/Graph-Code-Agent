@@ -453,6 +453,8 @@ def get_sample_key(sample, fallback_index: int) -> str:
 
 
 COUNT_QUESTION_RE = re.compile(r"\b(how many|number of|count|total number)\b", re.IGNORECASE)
+COUNT_RATIO_RE = re.compile(r"\bratio of\b", re.IGNORECASE)
+MEASUREMENT_RATIO_RE = re.compile(r"\b(height|width|length|depth|volume|distance|radius|diagonal|area)\b", re.IGNORECASE)
 YES_NO_ANSWER_RE = re.compile(r"^\s*(yes|no)\s*[.!]?\s*$", re.IGNORECASE)
 
 
@@ -474,6 +476,8 @@ def classify_question_type(sample) -> str:
 
     if _is_yes_no_answer(answer):
         return "yes_no"
+    if answer_type == "float" and COUNT_RATIO_RE.search(question) and not MEASUREMENT_RATIO_RE.search(question):
+        return "count_ratio"
     if answer_type == "float":
         return "numeric_other"
     if answer_type == "int" or COUNT_QUESTION_RE.search(question):
@@ -509,20 +513,17 @@ def resolve_object_names(
         except Exception as exc:
             vlm_response = "ERROR: {}".format(exc)
 
-    if vlm_objects:
+    merged_objects = merge_vlm_and_rule_objects(question, vlm_objects, rule_objects)
+    if merged_objects:
+        if vlm_objects and rule_objects and merged_objects != filter_object_names_for_question(question, vlm_objects):
+            method = "vlm_rule_union"
+        elif vlm_objects:
+            method = "vlm"
+        else:
+            method = "rule_fallback" if use_vlm_object_extraction else "rule"
         return {
-            "objects": vlm_objects,
-            "method": "vlm",
-            "vlm_extracted_objects": vlm_objects,
-            "rule_extracted_objects": rule_objects,
-            "object_extraction_response": vlm_response,
-            "question_type": question_type,
-        }
-
-    if rule_objects:
-        return {
-            "objects": rule_objects,
-            "method": "rule_fallback" if use_vlm_object_extraction else "rule",
+            "objects": merged_objects,
+            "method": method,
             "vlm_extracted_objects": vlm_objects,
             "rule_extracted_objects": rule_objects,
             "object_extraction_response": vlm_response,
@@ -532,13 +533,58 @@ def resolve_object_names(
     raise ValueError("Could not extract object names from sample question")
 
 
+def merge_vlm_and_rule_objects(question: str, vlm_objects: list, rule_objects: list) -> list:
+    merged = []
+    for name in list(vlm_objects or []) + list(rule_objects or []):
+        cleaned = _normalize_object_name(name)
+        if cleaned and not _looks_like_non_object_phrase(cleaned) and not _is_camera_viewpoint_object(cleaned, question):
+            merged.append(cleaned)
+    return _dedupe_object_names_by_normalized_form(merged)
+
+
+def filter_object_names_for_question(question: str, names: list) -> list:
+    output = []
+    for name in names or []:
+        cleaned = _normalize_object_name(name)
+        if cleaned and not _looks_like_non_object_phrase(cleaned) and not _is_camera_viewpoint_object(cleaned, question):
+            output.append(cleaned)
+    return _dedupe_object_names_by_normalized_form(output)
+
+
+def _normalize_object_name(name: str) -> str:
+    value = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    value = value.strip(" \"'`({[])}.,;:!?")
+    value = value.replace("leftmost", "left-most") if value.startswith("leftmost ") else value
+    value = value.replace("rightmost", "right-most") if value.startswith("rightmost ") else value
+    return value
+
+
+def _dedupe_object_names_by_normalized_form(names: list) -> list:
+    seen = set()
+    output = []
+    for name in names:
+        key = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+        if key and key not in seen:
+            seen.add(key)
+            output.append(name)
+    return output
+
+
+def _is_camera_viewpoint_object(name: str, question: str) -> bool:
+    if name.strip().lower() != "camera":
+        return False
+    question_text = str(question or "").lower()
+    physical_markers = ("physical camera", "visible camera", "security camera", "camera object", "camera on")
+    return not any(marker in question_text for marker in physical_markers)
+
+
 def resolve_object_names_by_rule(sample) -> list:
     question = sample.get("question", "")
     object_names = extract_object_names_from_omni3d_question(question)
     if not object_names:
         object_names = extract_object_names_from_question_options(question)
     object_names = [name for name in object_names if not _looks_like_non_object_phrase(name)]
-    return _dedupe_preserve_order(object_names)
+    return filter_object_names_for_question(question, object_names)
 
 
 def extract_object_names_with_vlm(image, question: str, vlm_model, num_tries: int = 2, question_type: str = "generic") -> tuple:
@@ -628,6 +674,8 @@ def _looks_like_non_object_phrase(text: str) -> bool:
         "radius",
         "volume",
         "distance",
+        "diagonal",
+        "decimal",
         "color",
         "number",
         "objects",

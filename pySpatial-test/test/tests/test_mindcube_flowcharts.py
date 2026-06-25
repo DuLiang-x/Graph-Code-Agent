@@ -96,6 +96,7 @@ def test_summarize_result_for_output_removes_large_intermediate_fields():
         "scene_id": "omni3d_0",
         "question": "Question",
         "generated_answer": "yes",
+        "question_type": "yes_no",
         "generated_code": "def program(input_scene): pass",
         "answer_correct": True,
         "float_relative_error": 0.01,
@@ -110,6 +111,7 @@ def test_summarize_result_for_output_removes_large_intermediate_fields():
 
     assert summary["scene_id"] == "omni3d_0"
     assert summary["generated_answer"] == "yes"
+    assert summary["question_type"] == "yes_no"
     assert summary["generated_code"] == "def program(input_scene): pass"
     assert summary["flowchart_path"] == "flowcharts/omni3d_0_flowchart.png"
     assert summary["float_relative_error"] == 0.01

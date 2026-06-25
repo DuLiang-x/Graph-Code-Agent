@@ -237,6 +237,89 @@ def compute_acc_mra(results: List[Dict[str, Any]]) -> Dict[str, float]:
     return {"acc_mra": round(score / total, 6) if total else 0.0, "acc_mra_count": total}
 
 
+
+QUESTION_TYPE_DISPLAY_ORDER = ["numeric_ct", "numeric_other", "yes_no", "choice_object"]
+
+
+def normalize_question_type(question_type: str) -> str:
+    value = str(question_type or "").strip().lower()
+    if value == "count_ratio":
+        return "numeric_ct"
+    if value in set(QUESTION_TYPE_DISPLAY_ORDER):
+        return value
+    return "choice_object" if value == "str" else "unknown"
+
+
+def infer_question_type_for_entry(entry: Dict[str, Any], object_boxes: Any = None) -> str:
+    if isinstance(object_boxes, dict):
+        if object_boxes.get("question_type"):
+            return normalize_question_type(object_boxes.get("question_type"))
+        scene_id = entry.get("id") or entry.get("scene_id")
+        scene_record = object_boxes.get(scene_id) if scene_id else None
+        if isinstance(scene_record, dict) and scene_record.get("question_type"):
+            return normalize_question_type(scene_record.get("question_type"))
+    try:
+        from scripts.demo_extract_3d_positions import classify_question_type
+        return normalize_question_type(classify_question_type({
+            "question": entry.get("question", ""),
+            "answer_type": entry.get("answer_type"),
+            "answer": entry.get("answer", entry.get("gt_answer", entry.get("expected_answer"))),
+        }))
+    except Exception:
+        answer = str(entry.get("answer", entry.get("gt_answer", ""))).strip().lower()
+        answer_type = str(entry.get("answer_type") or "").lower()
+        question = str(entry.get("question") or "").lower()
+        if answer in {"yes", "no"}:
+            return "yes_no"
+        if answer_type == "int" or re.search(r"\b(how many|number of|count|total number)\b", question):
+            return "numeric_ct"
+        if answer_type == "float":
+            return "numeric_other"
+        if answer_type == "str":
+            return "choice_object"
+        return "unknown"
+
+
+def _new_question_type_stats():
+    return {
+        'total': 0.0,
+        'parse_success': 0.0,
+        'execution_success': 0.0,
+        'answer_generation_success': 0.0,
+        'correct_answers': 0.0,
+        'evaluable_answers': 0.0,
+        'errors': 0.0,
+        'mra_sum': 0.0,
+        'mra_count': 0.0,
+    }
+
+
+def build_question_type_metrics(question_type_stats: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    metrics = {}
+    ordered_keys = QUESTION_TYPE_DISPLAY_ORDER + sorted(
+        key for key in question_type_stats.keys() if key not in set(QUESTION_TYPE_DISPLAY_ORDER)
+    )
+    for question_type in ordered_keys:
+        stats = question_type_stats.get(question_type, _new_question_type_stats())
+        total = stats['total']
+        item = {
+            'count': total,
+            'parse_rate': round(stats['parse_success'] / total * 100, 2) if total > 0 else 0,
+            'execution_rate': round(stats['execution_success'] / total * 100, 2) if total > 0 else 0,
+            'answer_generation_rate': round(stats['answer_generation_success'] / total * 100, 2) if total > 0 else 0,
+            'correctness_rate': round(stats['correct_answers'] / stats['evaluable_answers'] * 100, 2) if stats['evaluable_answers'] > 0 else 0,
+            'error_rate': round(stats['errors'] / total * 100, 2) if total > 0 else 0,
+            'evaluable_count': stats['evaluable_answers'],
+            'correct_answers': stats['correct_answers'],
+            'error_count': stats['errors'],
+        }
+        if stats['mra_count'] > 0:
+            item['mra'] = round(stats['mra_sum'] / stats['mra_count'], 6)
+            item['mra_count'] = stats['mra_count']
+        metrics[question_type] = item
+    return metrics
+
+
 def _load_flowchart_font(size: int, mono: bool = False):
     from PIL import ImageFont
 
@@ -392,6 +475,7 @@ SUMMARY_RESULT_KEYS = [
     "images",
     "expected_answer",
     "answer_type",
+    "question_type",
     "generated_answer",
     "answer_reasoning",
     "answer_source",
@@ -763,6 +847,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
     images = entry.get('images', [])
     expected_answer = entry.get('answer', entry.get('gt_answer'))
     answer_type = entry.get('answer_type')
+    question_type = infer_question_type_for_entry(entry)
     
     # Extract type from image paths
     scene_type = extract_type_from_images(images)
@@ -805,6 +890,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
                 use_vlm_object_extraction=use_vlm_object_extraction,
             )
             pySpatial.build_graph(scene)
+            question_type = infer_question_type_for_entry(entry, scene.object_3d_boxes)
 
         # Step 1-2: Generate, parse, execute code, with optional repair retry.
         code_result = generate_parse_execute_with_repair(
@@ -863,6 +949,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
             "images": images,
             "expected_answer": expected_answer,
             "answer_type": answer_type,
+            "question_type": question_type,
             "parse_success": parse_success,
             "execution_success": execution_success,
             "answer_generation_success": answer_generation_success,
@@ -925,6 +1012,7 @@ def process_scene_with_agent(entry: Dict[str, Any], agent: Agent, mode: str = "r
             "images": images,
             "expected_answer": expected_answer,
             "answer_type": answer_type,
+            "question_type": question_type,
             "parse_success": False,
             "execution_success": False,
             "answer_generation_success": fallback_success,
@@ -1210,13 +1298,7 @@ def main():
         'evaluable_answers': 0.0,
         'errors': 0.0
     })
-    answer_type_stats = defaultdict(lambda: {
-        'total': 0.0,
-        'correct_answers': 0.0,
-        'evaluable_answers': 0.0,
-        'mra_sum': 0.0,
-        'mra_count': 0.0,
-    })
+    question_type_stats = defaultdict(_new_question_type_stats)
     
     overall_stats = {
         'total_processed': 0,
@@ -1230,42 +1312,46 @@ def main():
     
     for result in results:
         scene_type = result['scene_type']
+        answer_type = str(result.get('answer_type') or 'unknown')
+        question_type = normalize_question_type(result.get('question_type'))
         
         # Update statistics
         type_stats[scene_type]['total'] += 1
         overall_stats['total_processed'] += 1
+        question_type_stats[question_type]['total'] += 1
         
         if result.get('error'):
             type_stats[scene_type]['errors'] += 1
             overall_stats['errors'] += 1
+            question_type_stats[question_type]['errors'] += 1
 
         if result['parse_success']:
             type_stats[scene_type]['parse_success'] += 1
             overall_stats['parse_success'] += 1
+            question_type_stats[question_type]['parse_success'] += 1
         
         if result['execution_success']:
             type_stats[scene_type]['execution_success'] += 1
             overall_stats['execution_success'] += 1
+            question_type_stats[question_type]['execution_success'] += 1
         
         if result['answer_generation_success']:
             type_stats[scene_type]['answer_generation_success'] += 1
             overall_stats['answer_generation_success'] += 1
-        
-        answer_type = str(result.get('answer_type') or 'unknown')
-        answer_type_stats[answer_type]['total'] += 1
+            question_type_stats[question_type]['answer_generation_success'] += 1
 
         if result.get('expected_answer') is not None and result.get('generated_answer') is not None:
             type_stats[scene_type]['evaluable_answers'] += 1
             overall_stats['evaluable_answers'] += 1
-            answer_type_stats[answer_type]['evaluable_answers'] += 1
+            question_type_stats[question_type]['evaluable_answers'] += 1
             
             if result['answer_correct']:
                 type_stats[scene_type]['correct_answers'] += 1
                 overall_stats['correct_answers'] += 1
-                answer_type_stats[answer_type]['correct_answers'] += 1
+                question_type_stats[question_type]['correct_answers'] += 1
             if answer_type == 'float' and result.get('float_mra') is not None:
-                answer_type_stats[answer_type]['mra_sum'] += float(result.get('float_mra'))
-                answer_type_stats[answer_type]['mra_count'] += 1
+                question_type_stats[question_type]['mra_sum'] += float(result.get('float_mra'))
+                question_type_stats[question_type]['mra_count'] += 1
     
     # Calculate rates for each type
     type_metrics = {}
@@ -1282,18 +1368,7 @@ def main():
             'error_count': stats['errors']
         }
     
-    answer_type_metrics = {}
-    for answer_type, stats in answer_type_stats.items():
-        metrics = {
-            'count': stats['total'],
-            'evaluable_count': stats['evaluable_answers'],
-            'correct_answers': stats['correct_answers'],
-            'correctness_rate': round(stats['correct_answers'] / stats['evaluable_answers'] * 100, 2) if stats['evaluable_answers'] > 0 else 0,
-        }
-        if answer_type == 'float':
-            metrics['mra'] = round(stats['mra_sum'] / stats['mra_count'], 6) if stats['mra_count'] > 0 else 0.0
-            metrics['mra_count'] = stats['mra_count']
-        answer_type_metrics[answer_type] = metrics
+    question_type_metrics = build_question_type_metrics(question_type_stats)
 
     acc_mra_metrics = compute_acc_mra(results)
 
@@ -1341,8 +1416,9 @@ def main():
         "max_code_repair_attempts": args.max_code_repair_attempts,
         "overall_metrics": overall_metrics,
         "type_metrics": type_metrics,
-        "answer_type_metrics": answer_type_metrics,
+        "question_type_metrics": question_type_metrics,
         "raw_statistics": dict(type_stats),
+        "raw_question_type_statistics": dict(question_type_stats),
         "results": [summarize_result_for_output(result) for result in results]
     }
     
@@ -1360,13 +1436,17 @@ def main():
     print(f"Answer correctness: {overall_stats['correct_answers']}/{overall_stats['evaluable_answers']} ({overall_metrics['correctness_rate']:.1f}%)")
     print(f"ACC_MRA: {overall_metrics['acc_mra']:.4f} over {overall_metrics['acc_mra_count']} samples")
 
-    print(f"\n=== Statistics by Answer Type ===")
-    for answer_type, metrics in sorted(answer_type_metrics.items()):
-        print(f"\n{answer_type.upper()}:")
+    print(f"\n=== Statistics by Question Type ===")
+    for question_type, metrics in question_type_metrics.items():
+        print(f"\n{question_type.upper()}:")
         print(f"  Count: {metrics['count']}")
+        print(f"  Parse rate: {metrics['parse_rate']:.1f}%")
+        print(f"  Execution rate: {metrics['execution_rate']:.1f}%")
+        print(f"  Answer generation rate: {metrics['answer_generation_rate']:.1f}%")
         print(f"  Correctness rate: {metrics['correctness_rate']:.1f}% ({metrics['correct_answers']}/{metrics['evaluable_count']})")
-        if answer_type == 'float':
+        if 'mra' in metrics:
             print(f"  MRA: {metrics.get('mra', 0.0):.4f} ({metrics.get('mra_count', 0)} samples)")
+        print(f"  Error rate: {metrics['error_rate']:.1f}% ({metrics['error_count']}/{metrics['count']})")
 
     
     print(f"\n=== Statistics by Type ===")

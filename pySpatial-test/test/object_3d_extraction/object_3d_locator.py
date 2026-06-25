@@ -92,6 +92,7 @@ class Object3DLocator:
                         "counting_target": True,
                         "counting_instances": instance_names,
                         "counting_instance_count": len(instance_names),
+                        "counting_group_target": counting_info.get("counting_group_target"),
                         "prompts_tried": prompts_tried,
                         "candidates_considered": summarize_candidates(candidates),
                     }
@@ -259,15 +260,19 @@ class Object3DLocator:
         instances = {}  # type: Dict[str, Dict[str, object]]
         instance_names = []  # type: List[str]
         max_instances = max(20, self.config.detection.num_candidates * 4)
+        counting_group_target = count_instance_prefix(object_name)
         counting_info = {
             "counting_vlm_response": None,
             "counting_vlm_selected_indices": [],
+            "counting_vlm_rejected_indices": [],
+            "counting_selection_mode": "rule_fallback",
             "counting_selection_source": "rule_fallback",
             "counting_rejected_candidates": [],
+            "counting_group_target": counting_group_target,
         }
         selected_candidates = None
         if self.config.detection.use_vlm_refinement and self.vlm_model is not None:
-            vlm_candidates, vlm_response, vlm_indices = select_count_candidates_with_vlm(
+            vlm_candidates, vlm_response, vlm_indices, vlm_rejected_indices = select_count_candidates_with_vlm(
                 self.vlm_model,
                 image_pil,
                 object_name,
@@ -277,17 +282,20 @@ class Object3DLocator:
             )
             counting_info["counting_vlm_response"] = vlm_response
             counting_info["counting_vlm_selected_indices"] = vlm_indices or []
+            counting_info["counting_vlm_rejected_indices"] = vlm_rejected_indices or []
             if vlm_candidates:
                 filtered_candidates, rejected = filter_count_instance_candidates(
                     vlm_candidates,
                     candidates,
                     object_name,
                     max_instances=max_instances,
+                    existing_boxes=selected_boxes,
                 )
                 counting_info["counting_rejected_candidates"] = rejected
                 if filtered_candidates:
                     selected_candidates = filtered_candidates
-                    counting_info["counting_selection_source"] = "vlm_multi_select"
+                    counting_info["counting_selection_mode"] = "vlm_reject_mode"
+                    counting_info["counting_selection_source"] = "vlm_reject_mode"
 
         if selected_candidates is None:
             rule_candidates = select_count_instance_candidates(
@@ -300,6 +308,7 @@ class Object3DLocator:
                 candidates,
                 object_name,
                 max_instances=max_instances,
+                existing_boxes=selected_boxes,
             )
             counting_info["counting_rejected_candidates"] = rejected
 
@@ -320,6 +329,7 @@ class Object3DLocator:
                 instances[instance_name] = {
                     "error": f"Segmentation mask too small: {mask_area} < {self.config.min_mask_area}",
                     "counting_source_object": object_name,
+                    "counting_group_target": counting_info["counting_group_target"],
                     "box2d": box2d,
                     "bbox_wh": bbox_wh(box2d),
                     "mask_area": mask_area,
@@ -331,8 +341,10 @@ class Object3DLocator:
                     "mask_fallback_reason": mask_fallback_reason,
                     "candidates_considered": summarize_candidates([detection]),
                     "counting_selection_source": counting_info["counting_selection_source"],
+                    "counting_selection_mode": counting_info["counting_selection_mode"],
                     "counting_vlm_response": counting_info["counting_vlm_response"],
                     "counting_vlm_selected_indices": counting_info["counting_vlm_selected_indices"],
+                    "counting_vlm_rejected_indices": counting_info["counting_vlm_rejected_indices"],
                     "counting_filter_reason": detection.get("counting_filter_reason"),
                 }
                 continue
@@ -372,10 +384,13 @@ class Object3DLocator:
                 "overlap_warnings": overlap_warnings(instance_name, box2d, selected_boxes),
                 "candidates_considered": summarize_candidates([detection]),
                 "counting_source_object": object_name,
+                "counting_group_target": counting_info["counting_group_target"],
                 "counting_instance_id": idx,
                 "counting_selection_source": counting_info["counting_selection_source"],
+                "counting_selection_mode": counting_info["counting_selection_mode"],
                 "counting_vlm_response": counting_info["counting_vlm_response"],
                 "counting_vlm_selected_indices": counting_info["counting_vlm_selected_indices"],
+                "counting_vlm_rejected_indices": counting_info["counting_vlm_rejected_indices"],
                 "counting_filter_reason": detection.get("counting_filter_reason"),
             }
             if "score" in detection:
@@ -457,6 +472,9 @@ class Object3DLocator:
 
 def detection_prompts_for_object(object_name: str) -> List[str]:
     original = str(object_name).strip().lower()
+    generic_count = parse_generic_surface_count_target(original)
+    if generic_count is not None:
+        return _generic_surface_count_prompts(generic_count)
     context = parse_object_relation_context(original)
     target = context["target_phrase"]
     prompt_target = target or original
@@ -712,7 +730,10 @@ Relation modifier rules:
 Counting and instance rules:
 - For counting targets such as handles, curtains, frames, shelves, shoeboxes, lightbulbs, towels, plates, and post-it notes, select candidates that tightly cover one visible instance.
 - Do not select the same instance twice.
+- If two candidates strongly overlap or cover the same visible item, choose only the tighter/better one even if their prompts use different category names.
 - Do not select a large box that contains multiple counted instances when a tighter single-instance candidate exists.
+- Water bottles: select individual bottles; do not select one group box containing several bottles.
+- Generic surface objects such as objects stuck on a fridge: select every separate visible item once, not once per guessed category.
 - Do not use a container or support object such as a cabinet, door, basket, bed, or shelf as the counted item.
 - If a candidate mostly covers background, floor, or several unrelated objects, return INVALID unless the target is an area object.
 
@@ -759,13 +780,13 @@ def select_count_candidates_with_vlm(
     candidates: List[Dict[str, object]],
     question: str = "",
     save_dir: Optional[Union[str, Path]] = None,
-) -> Tuple[Optional[List[Dict[str, object]]], Optional[str], List[int]]:
+) -> Tuple[Optional[List[Dict[str, object]]], Optional[str], List[int], List[int]]:
     grid = save_candidate_grid(image_pil, object_name, candidates, save_dir)
     overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
     overlay_image = Image.open(overlay_path).convert("RGB") if overlay_path is not None else make_candidate_overlay(image_pil, candidates)
     candidate_metadata = format_candidate_metadata_for_vlm(candidates, image_pil.size)
     prompt = f"""
-Select every numbered candidate box that tightly covers one visible instance of the count target.
+Reject numbered candidate boxes that should NOT be counted as instances of the count target.
 
 Count target: {object_name}
 Question context: {question}
@@ -777,29 +798,36 @@ Coordinate and score notes:
 - box2d is [x1, y1, x2, y2] in image coordinates.
 - Larger x means further right in the image; larger y means lower in the image.
 - dino_score, rank_score, and rank_reasons are supporting evidence only.
-- Prefer all true visible instances over only the clearest or highest-score candidates.
+- Recall is important: if a candidate might be a valid counted instance, do not reject it. Hard filters will remove duplicates and group boxes later.
 
-Counting selection rules:
-- Return all candidate indices that correspond to separate visible instances of the count target.
-- Do not select the same instance twice.
-- Do not select a large box that contains multiple counted instances when tighter single-instance candidates exist.
-- Do not select a container or support object as the counted item, such as cabinet, door, basket, bed, shelf, chandelier, or fridge, unless that container is itself the count target.
-- Do not select mostly background, floor, wall, or a whole group box as a single counted item.
-- Use the full-image overlay to check whether candidates are duplicates or group boxes.
+Counting reject rules:
+- Return candidate indices that should be rejected, not the valid instance indices.
+- Reject candidates that are clearly not the count target.
+- Reject a container or support object such as cabinet, door, basket, bed, shelf, chandelier, fixture, fridge, word, sign, or text block unless that object itself is the count target.
+- Reject mostly background, floor, wall, or whole group boxes.
+- Reject the worse duplicate when two candidates strongly overlap or cover the same visible item.
+- Do not reject uncertain candidates that may be valid count instances; leave them for hard filtering.
+- Use the full-image overlay to identify containers, group boxes, and duplicates.
 - Use the crop grid only as supporting evidence for object identity and box quality.
 
 Badcase-guided counting examples:
 - Plates: select all visible plates, not only the clearest one or two.
-- Lightbulbs: select individual bulbs; do not select the entire chandelier as a lightbulb.
+- Lightbulbs: select individual bulbs; do not select the entire chandelier, lampshade, or fixture as a lightbulb.
+- Letters: select single visible characters; do not select an entire word, sign, or text block.
+- Plates: count each visible plate; if plates overlap, count only independently visible plates.
+- Water bottles: select individual bottles; do not select one group box containing several bottles.
 - Post-it notes: select individual notes; do not select one large box containing several notes.
 - Towels: select each towel once; overlapping boxes for the same towel should not both be selected.
 - Handles/dials: if the question says dials count as handles, select dials as handle instances too.
 - Letters: select individual letters; do not select an entire word or text block as one letter.
 - Computer mice: select every visible computer mouse instance; do not keep only one aggregate mouse box.
+- Coasters/remotes: count each visible coaster or remote separately for ratio questions such as coasters to black TV remotes.
+- Generic surface objects such as objects stuck on a fridge: select every separate visible item once, not once per guessed category.
 
 Return format:
-- Return only a Python-style list of integer indices, for example [0, 2, 5].
-- If none of the numbered candidates are valid count instances, return INVALID.
+- Return only REJECT: followed by a Python-style list of integer indices, for example REJECT: [1, 4, 7].
+- If no candidates should be rejected, return REJECT: [].
+- If you cannot understand the candidates or target, return INVALID.
 """
     messages = [
         {
@@ -812,16 +840,38 @@ Return format:
         }
     ]
     response = vlm_model.process_messages(messages, max_new_tokens=128)
-    selected_indices = parse_count_candidate_indices(response, len(candidates))
-    if not selected_indices:
-        return None, str(response), []
+    rejected_indices = parse_count_rejected_indices(response, len(candidates))
+    if rejected_indices is None:
+        return None, str(response), [], []
     selected = []
-    for idx in selected_indices:
-        item = dict(candidates[idx])
+    selected_indices = []
+    rejected_set = set(rejected_indices)
+    for idx, candidate in enumerate(candidates):
+        if idx in rejected_set:
+            continue
+        item = dict(candidate)
         item["candidate_index"] = idx
         selected.append(item)
-    return selected, str(response), selected_indices
+        selected_indices.append(idx)
+    return selected, str(response), selected_indices, rejected_indices
 
+
+
+def parse_count_rejected_indices(response: object, num_candidates: int) -> Optional[List[int]]:
+    text = str(response or "")
+    if "INVALID" in text.upper():
+        return None
+    if "REJECT" not in text.upper():
+        return None
+    match = re.search(r"\[([^\]]*)\]", text)
+    if not match:
+        return None
+    result = []
+    for value in re.findall(r"\d+", match.group(1)):
+        idx = int(value)
+        if 0 <= idx < num_candidates and idx not in result:
+            result.append(idx)
+    return result
 
 def parse_count_candidate_indices(response: object, num_candidates: int) -> Optional[List[int]]:
     text = str(response or "")
@@ -849,8 +899,12 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
     best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
     if _candidate_matches_reference_object(object_name, selected):
         return False, "reference_object_selected"
+    if _support_object_selected_as_display(object_name, selected, candidates):
+        return False, "support_object_confused_with_display"
     if _weak_phrase_low_score_selection(object_name, selected, candidates):
         return False, "weak_phrase_low_score"
+    if _same_target_low_score_selection(object_name, selected, candidates):
+        return False, "same_target_low_score"
     if not _selection_matches_relation(object_name, selected, candidates):
         return False, "relation_mismatch"
     if not is_area_object(object_name):
@@ -1101,16 +1155,59 @@ def _remove_leading_color(prompt: str) -> str:
     ).strip()
 
 
+GENERIC_SURFACE_COUNT_RE = re.compile(
+    r"\b(?P<target>objects|items|things)\s+(?P<relation>stuck\s+on|attached\s+to|on)\s+(?:the\s+)?(?P<reference>[a-z0-9][a-z0-9\s_-]*?)\s*$"
+)
+
+
+def parse_generic_surface_count_target(object_name: str) -> Optional[Dict[str, str]]:
+    value = re.sub(r"\s+", " ", str(object_name or "").strip().lower())
+    match = GENERIC_SURFACE_COUNT_RE.search(value)
+    if not match:
+        return None
+    reference = re.sub(r"\b(?:corner|surface|area)\b", "", match.group("reference")).strip()
+    return {"target": match.group("target"), "relation": match.group("relation"), "reference": reference or "surface"}
+
+
+def _generic_surface_count_prompts(context: Dict[str, str]) -> List[str]:
+    reference = context.get("reference", "")
+    prompts = ["magnet", "sticker", "note", "paper", "picture", "photo", "small object"]
+    if reference in {"fridge", "refrigerator"}:
+        prompts.extend(["fridge magnet", "fridge sticker", "fridge note", "fridge photo"] )
+    return _dedupe_preserve_order(prompts)
+
+
+def _count_boxes_duplicate(box_a: List[int], box_b: List[int]) -> bool:
+    if box_iou(box_a, box_b) > 0.75:
+        return True
+    area_a = box_area(box_a)
+    area_b = box_area(box_b)
+    if area_a <= 0 or area_b <= 0:
+        return False
+    ax, ay = box_center(box_a)
+    bx, by = box_center(box_b)
+    diag = math.sqrt(min(area_a, area_b))
+    return math.hypot(ax - bx, ay - by) <= max(4.0, diag * 0.2)
+
+
 NON_VISUAL_COUNT_RE = re.compile(r"\b(?:need|needed|stack|stacked|achieve|match|reach|same height|have to)\b")
 
 
 def is_visual_count_target(question_type: Optional[str], question: str, object_name: str) -> bool:
-    if question_type != "numeric_ct":
+    if question_type not in {"numeric_ct", "count_ratio"}:
         return False
     question_text = re.sub(r"\s+", " ", str(question or "").lower())
-    if NON_VISUAL_COUNT_RE.search(question_text):
+    if question_type == "numeric_ct" and NON_VISUAL_COUNT_RE.search(question_text):
         return False
     forms = _object_name_forms(object_name)
+    if question_type == "count_ratio":
+        return True
+    if _question_counts_generic_objects(question_text) and parse_generic_surface_count_target(object_name) is not None:
+        return True
+    if _question_counts_generic_objects(question_text) and not _is_count_reference_object(question_text, forms):
+        return True
+    if _question_counts_dials_as_handles(question_text, forms):
+        return True
     for form in forms:
         escaped = re.escape(form)
         if re.search(r"\bhow many\s+" + escaped + r"\b", question_text):
@@ -1120,15 +1217,44 @@ def is_visual_count_target(question_type: Optional[str], question: str, object_n
     return False
 
 
+def _question_counts_generic_objects(question_text: str) -> bool:
+    return bool(re.search(r"\bhow many\s+(?:objects|items|things)\b", question_text))
+
+
+def _question_counts_dials_as_handles(question_text: str, forms: List[str]) -> bool:
+    if not re.search(r"\bdials?\s+as\s+handles?\b", question_text):
+        return False
+    return any(form in {"dial", "dials", "handle", "handles"} for form in forms)
+
+
+def _is_count_reference_object(question_text: str, forms: List[str]) -> bool:
+    for form in forms:
+        escaped = re.escape(form)
+        if re.search(r"\b(?:on|onto|in|inside|under|below|above|stuck on|attached to)\s+(?:the\s+)?" + escaped + r"\b", question_text):
+            return True
+    return False
+
+
 def _object_name_forms(object_name: str) -> List[str]:
     name = re.sub(r"\s+", " ", str(object_name or "").strip().lower())
     singular = singularize_count_name(name)
     plural = pluralize_count_name(singular)
-    return _dedupe_preserve_order([name, singular, plural])
+    forms = [name, singular, plural]
+    if singular.endswith(" mouse"):
+        forms.append(singular[:-6] + " mice")
+    if singular == "mouse":
+        forms.append("mice")
+    if " mice" in name:
+        forms.append(name.replace(" mice", " mouse"))
+    return _dedupe_preserve_order(forms)
 
 
 def singularize_count_name(name: str) -> str:
     value = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    if value == "mice":
+        return "mouse"
+    if value.endswith(" mice"):
+        return value[:-5] + " mouse"
     if value.endswith("ies") and len(value) > 3:
         return value[:-3] + "y"
     if value.endswith("ves") and len(value) > 3:
@@ -1150,9 +1276,18 @@ def pluralize_count_name(name: str) -> str:
 
 
 def make_count_instance_name(object_name: str, idx: int) -> str:
-    prefix = singularize_count_name(_remove_leading_color(_remove_relation_words(object_name.lower())))
-    prefix = re.sub(r"[^a-z0-9]+", "_", prefix).strip("_") or "object"
+    prefix = count_instance_prefix(object_name)
     return f"{prefix}_{idx}"
+
+
+def count_instance_prefix(object_name: str) -> str:
+    generic_count = parse_generic_surface_count_target(object_name)
+    if generic_count is not None:
+        reference = singularize_count_name(generic_count["reference"])
+        reference = re.sub(r"[^a-z0-9]+", "_", reference).strip("_") or "surface"
+        return f"{reference}_object"
+    prefix = singularize_count_name(_remove_leading_color(_remove_relation_words(str(object_name).lower())))
+    return re.sub(r"[^a-z0-9]+", "_", prefix).strip("_") or "object"
 
 
 def select_count_instance_candidates(
@@ -1183,11 +1318,12 @@ def filter_count_instance_candidates(
     candidate_pool: List[Dict[str, object]],
     object_name: str,
     max_instances: int = 20,
+    existing_boxes: Optional[Dict[str, List[int]]] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     kept = []
     rejected = []
     for candidate in selected_candidates:
-        reason = count_candidate_reject_reason(candidate, kept, candidate_pool, object_name)
+        reason = count_candidate_reject_reason(candidate, kept, candidate_pool, object_name, existing_boxes or {})
         if reason is not None:
             rejected.append(_summarize_rejected_count_candidate(candidate, reason))
             continue
@@ -1205,10 +1341,13 @@ def count_candidate_reject_reason(
     kept: List[Dict[str, object]],
     candidate_pool: List[Dict[str, object]],
     object_name: str,
+    existing_boxes: Optional[Dict[str, List[int]]] = None,
 ) -> Optional[str]:
     box = candidate.get("box2d", [0, 0, 0, 0])
-    if any(box_iou(box, item.get("box2d", [0, 0, 0, 0])) > 0.75 for item in kept):
+    if any(_count_boxes_duplicate(box, item.get("box2d", [0, 0, 0, 0])) for item in kept):
         return "duplicate_iou"
+    if any(_count_boxes_duplicate(box, existing_box) for existing_box in (existing_boxes or {}).values()):
+        return "duplicate_existing_count_box"
     if _count_candidate_is_container(candidate, object_name):
         return "container_object"
     if _candidate_contains_multiple_smaller_boxes(candidate, candidate_pool):
@@ -1407,6 +1546,41 @@ def _candidate_matches_target_phrase(object_name: str, candidate: Dict[str, obje
     if prompt in detection_prompts_for_object(target):
         return True
     return False
+
+
+def _support_object_selected_as_display(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:
+    target = parse_object_relation_context(object_name).get("target_phrase", object_name).lower()
+    if target not in {"tv stand", "television stand", "tv cabinet"}:
+        return False
+    if not candidates:
+        return False
+    best = candidates[0]
+    selected_box = selected.get("box2d", [0, 0, 0, 0])
+    best_box = best.get("box2d", [0, 0, 0, 0])
+    if _same_box(selected_box, best_box):
+        return False
+    selected_cy = box_center(selected_box)[1]
+    best_cy = box_center(best_box)[1]
+    selected_area = box_area(selected_box)
+    best_area = max(1, box_area(best_box))
+    return selected_cy < best_cy - 60 and selected_area > best_area * 1.25
+
+
+def _same_target_low_score_selection(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:
+    if not candidates:
+        return False
+    best = candidates[0]
+    if not _candidate_matches_target_phrase(object_name, selected):
+        return False
+    if not _candidate_matches_target_phrase(object_name, best):
+        return False
+    if relation_modifier(object_name) and _selection_matches_relation(object_name, selected, candidates):
+        pass
+    selected_rank = float(selected.get("rank_score", selected.get("score", 0.0)))
+    best_rank = float(best.get("rank_score", best.get("score", 0.0)))
+    selected_dino = float(selected.get("score", 0.0))
+    best_dino = float(best.get("score", 0.0))
+    return best_dino >= 0.45 and selected_dino <= max(0.18, best_dino * 0.35) and selected_rank <= best_rank - 0.45
 
 
 def _weak_phrase_low_score_selection(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:

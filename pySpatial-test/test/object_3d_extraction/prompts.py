@@ -1,6 +1,18 @@
 """Prompt templates for object 3D extraction."""
 
 QUESTION_TYPE_RULES = {
+    "count_ratio": """
+Question type: counting ratio.
+Counting-ratio rules:
+- The question asks for a ratio between counts of visible object categories, not a geometric size ratio.
+- Detect every countable category in the ratio and preserve attributes such as black, white, TV, or remote.
+- The extraction pipeline will expand count targets into indexed instances such as coaster_1 and black_tv_remote_1 after detection.
+- Do not collapse plural count targets into one aggregate object.
+
+# Example: ratio of two count categories
+[Question] What is the ratio of coasters to black TV remotes? Answer with a decimal
+[Detect] [coasters, black TV remotes]
+""",
     "numeric_ct": """
 Question type: numeric count.
 Count-question rules:
@@ -10,6 +22,8 @@ Count-question rules:
 - Include supporting or reference objects only when they are needed to locate or disambiguate the counted instances.
 - For count questions, the extraction pipeline will assign instance IDs such as handle_1, handle_2 after detection; your [Detect] output should still be [handles, cabinets].
 - Do not convert plural count targets into a different broad object category.
+- For generic questions like "how many objects/items/things are stuck, attached, or on a reference surface", output one unified count target plus the reference object, for example [objects stuck on fridge, fridge]. Do not split the same visible items into overlapping categories such as magnets, pictures, notes, and stickers.
+- If the question says "dials count as handles", include both dials and handles so both can be counted.
 
 # Example: count handles on cabinets
 [Question] How many handles are on the cabinets?
@@ -18,6 +32,14 @@ Count-question rules:
 # Example: count visible shoeboxes
 [Question] How many shoeboxes are visible on the shelf?
 [Detect] [shoeboxes, shelf]
+
+# Example: count all objects stuck on a reference object
+[Question] Including all objects, how many objects are stuck on the fridge?
+[Detect] [objects stuck on fridge, fridge]
+
+# Example: dials count as handles
+[Question] Counting the dials as handles, how many handles are shown?
+[Detect] [dials, handles]
 """,
     "numeric_other": """
 Question type: numeric measurement or ratio.
@@ -94,7 +116,7 @@ Given an image and a spatial reasoning question, we need to all entities that ar
 
 Camera rule:
 - In Omni3D-Bench single-image tasks, "camera" usually means the viewpoint of the current image, not a visible object.
-- Do not include "camera" in [Detect] when it refers to the image/camera perspective.
+- Do not include "camera" in [Detect] when it refers to the image/camera perspective, including "facing the camera", "towards the camera", "closer to the camera", and "from the camera".
 - Only include "camera" in [Detect] if the question explicitly refers to a visible physical camera object in the scene.
 
 Similar object rule:
@@ -186,12 +208,15 @@ Rules:
 - Do not merge same-category attributed objects such as "gray chair" and "black chair" into "chair".
 - Keep transparency phrases such as "translucent cube", "transparent box", or "clear container" intact.
 - For counting questions, keep the countable category as a natural plural/category phrase such as "handles" or "chairs"; do not invent indexed names such as "handle_1" in [Detect].
+- For generic surface counting such as "objects/items/things stuck on the fridge", use one unified count target such as "objects stuck on fridge" plus the reference object; do not split the same items into multiple overlapping categories.
+- Example repair target: objects stuck on the fridge -> [objects stuck on fridge, fridge].
 - Do not collapse a count target into a support object such as cabinet, shelf, table, or wall.
 - Do not replace "stool" with "chair".
 - Do not replace "chair" with "stool".
 - Do not replace "bench", "sofa", "couch", "ottoman", or "seat" with "chair" unless the question itself uses that word.
 - Do not include relation words such as left, right, closer, farther, above, below, front, behind.
 - Do not include "camera" unless it is a visible physical camera object.
+- For "dials count as handles", keep both "dials" and "handles".
 
 [Question] {question}
 [Detect]

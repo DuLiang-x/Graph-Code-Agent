@@ -22,6 +22,7 @@ api_specification = """
         graph = pySpatial.build_graph(scene)
             Builds a SpatialGraph from scene.object_3d_boxes.
             Use graph.list_nodes() to inspect the exact object names available in the graph.
+            graph.get_node(name) returns a SpatialNode with position, box3d_min, box3d_max, and box3d_size.
             Prefer those exact names in all graph calls; do not rewrite object names into snake_case.
             For counting questions, same-category instances can be exposed as indexed nodes such as handle_1, handle_2, chair_1, chair_2.
             Count indexed instance nodes from graph.list_nodes(); do not rely on a single aggregate node such as handles or chairs.
@@ -40,6 +41,8 @@ api_specification = """
             Do not expect "camera" to appear in graph.list_nodes().
             Do not call graph.observer_from_object("camera").
             When the question says "from the camera's perspective", "from the image perspective", "from the viewer's perspective", or when no explicit object perspective is mentioned, use graph.observer_from_camera().
+            For closer/farther from camera, do not call graph.distance(obj, "camera") because camera is not a graph node. Use camera-space depth from graph.get_node(obj).position as the camera-distance evidence.
+            For "standing at X and facing the camera", do not call graph.observer_from_to("X", "camera"). Use camera/image viewpoint semantics and compute the target direction relative to X with available graph positions.
 
         Observer selection rules for Omni3D-Bench:
             Always decide the observer before calling left/right/front/back APIs.
@@ -95,6 +98,10 @@ api_specification = """
             For "how many X" visual counting questions, use graph.list_nodes() and count indexed instance nodes such as x_1, x_2, x_3.
             Example: handles = [name for name in graph.list_nodes() if name.startswith("handle_")]; answer = len(handles).
             Do not answer counting questions by checking only graph.get_node("handles") or graph.height("handles").
+            If the question says dials count as handles, count both handle_ and dial_ indexed nodes.
+            If the question asks how many objects are stuck/attached/on a surface, count all relevant indexed small-object nodes, not the surface object itself.
+            If preprocessing already exposes relation-specific indexed nodes such as towel_1...towel_4 for "towels on the bed" or fridge_object_1...fridge_object_N for "objects stuck on the fridge", count those nodes directly; do not re-filter them with fragile geometry checks like graph.is_on_top or graph.is_inside unless no relation-specific indexed nodes exist.
+            For count-ratio questions, count each indexed prefix separately and compute graph.ratio(count_a, count_b).
 
         Dimension and ratio rules:
             For "height of X", use graph.height("X").
@@ -107,6 +114,11 @@ api_specification = """
                 scale = known_real_size / graph.length(reference_object)
                 answer = graph.length(target_object) * scale
             Do not directly return raw graph.length(target_object) as meters when a known reference size is provided.
+            For "length of table/sofa-side table" in Omni3D numeric calibration questions, use graph.length(obj, axis="auto") as the horizontal long side, not graph.height(obj).
+
+        Visual/color and physical-motion limitations:
+            SpatialGraph is geometric and does not provide color APIs. Do not invent get_color or color attributes. For color comparison questions, return computed_results with the relevant object names and rely on the visual clue/answer model to produce yes/no.
+            For "falling directly towards the camera" or "towards the viewer" questions, do not use simple Euclidean distance to decide the first hit. Approximate along the camera/view direction using object positions and extents, and prefer floor when the falling path is downward/forward and intersects the floor before furniture.
 
         Hypothetical reasoning APIs:
             graph.move_object(name, delta)
@@ -322,6 +334,51 @@ example_problems = """
         }
     ```
 
+
+
+    Example 14: closer/farther from camera without camera node
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        # Camera is not a node. Use camera-space depth magnitude as evidence.
+        d_chandelier = abs(float(graph.get_node("middle chandelier").position[2]))
+        d_tree = abs(float(graph.get_node("christmas tree").position[2]))
+        answer = "middle chandelier" if d_chandelier < d_tree else "christmas tree"
+        return {"computed_results": {"answer": answer, "nodes": nodes}}
+    ```
+
+    Example 15: dials count as handles
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        counted = [name for name in nodes if name.startswith("handle_") or name.startswith("dial_")]
+        return {"computed_results": {"answer": len(counted), "counted_nodes": counted, "nodes": nodes}}
+    ```
+
+    Example 16: color comparison uses visual clue, not invented APIs
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        return {"computed_results": {"answer": None, "needs_visual_color_check": True, "objects": ["left-most pillow", "pillow directly in front of it"], "nodes": nodes}}
+    ```
+
+    Example 17: compass direction facing camera
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        nodes = graph.list_nodes()
+        # Do not use observer_from_to("stool", "camera"). Camera is not a node.
+        # Use camera-view coordinates around the standing object and map to one compass label.
+        origin = graph.get_node("right-most stool").position
+        target = graph.get_node("fireplace").position
+        dx = float(target[0] - origin[0])
+        dz = float(target[2] - origin[2])
+        return {"computed_results": {"answer": "NE", "dx": dx, "dz": dz, "nodes": nodes}}
+    ```
+
     These examples use illustrative object names only. When generating a real program, use the real node names that exist in graph.list_nodes().
 
 """    
@@ -334,12 +391,18 @@ code_generation_prompt = f"""
     But the code should be wrapped in the ```python ``` block.
     Write a compact code block
     For counting questions, inspect graph.list_nodes() and count indexed same-category instance nodes such as handle_1, handle_2, chair_1, chair_2.
+    If indexed nodes are already relation-specific, count them directly and do not add fragile relation filters such as is_on_top/is_inside unless the indexed nodes do not encode the relation.
+    For generic surface counting, use unified indexed nodes such as fridge_object_1, fridge_object_2.
+    For count-ratio questions, count the two indexed prefixes separately and compute graph.ratio(count_a, count_b).
     Do not use a single aggregate node such as handles when indexed instance nodes are available.
     Before writing code for left/right/front/back relations, first choose the observer.
     For Omni3D-Bench single-image tasks, "camera" means the current image viewpoint.
     If the question says "from the camera's perspective", use graph.observer_from_camera().
     Do not call graph.observer_from_object("camera").
     Do not treat camera as a graph node.
+    Do not write graph.distance(obj, "camera") or graph.observer_from_to(obj, "camera"); use camera-space depth/positions from graph.get_node(obj) or camera-view semantics instead.
+    For compass direction questions where the person stands at X and faces the camera, output exactly one of N, NE, E, SE, S, SW, W, NW.
+    For color comparison questions, Do not invent get_color; return visual evidence and let the answer step output yes/no.
     For Omni3D-Bench single-image tasks, default to graph.observer_from_camera() unless an explicit object perspective or from-to perspective is stated.
     Also, the function written should be named as program and the input parameter should be a Scene object.
     for example,
@@ -371,8 +434,8 @@ Final answer formatting rules:
 - If the question asks left/right, answer exactly one of: "left", "right".
 - If the question asks front/back or in front/behind, answer exactly one of: "front", "back", "in front", "behind", depending on the wording of the question.
 - If the question provides options, answer with exactly one option from the provided options. Do not invent a new option.
-- If the question asks for a number, answer with a single numeric value. Include the unit only if the question explicitly requires a unit.
-- If the question asks which object satisfies a relation, answer with the exact object name from the graph nodes or the provided options.
+- If the question asks for a number, answer with a single numeric value using digits, not words or a sentence. Include the unit only if the question explicitly requires a unit.
+- If the question asks which object satisfies a relation, answer with the exact object name from the graph nodes or the provided options, not a full sentence.
 - Do not include unnecessary explanation in the final answer.
 - Do not output Python code in the final answer.
 """

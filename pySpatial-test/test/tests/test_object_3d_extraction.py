@@ -19,7 +19,7 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, maybe_fallback_mask, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import count_instance_prefix, detection_prompts_for_object, filter_count_instance_candidates, is_visual_count_target, make_count_instance_name, maybe_fallback_mask, parse_candidate_index, parse_count_rejected_indices, parse_generic_surface_count_target, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
@@ -182,8 +182,8 @@ def test_non_count_question_keeps_single_target_node():
     assert "position" in result["handles"]
 
 
-def test_count_question_uses_vlm_multi_select_when_available():
-    vlm = FakeObjectExtractionVLM(["[0, 1, 2]"])
+def test_count_question_uses_vlm_reject_mode_when_available():
+    vlm = FakeObjectExtractionVLM(["REJECT: []"])
     locator = make_locator(
         {
             "handles": [
@@ -204,18 +204,25 @@ def test_count_question_uses_vlm_multi_select_when_available():
         question_type="numeric_ct",
     )
 
-    assert result["handles"]["counting_selection_source"] == "vlm_multi_select"
+    assert result["handles"]["counting_selection_source"] == "vlm_reject_mode"
+    assert result["handles"]["counting_selection_mode"] == "vlm_reject_mode"
     assert result["handles"]["counting_vlm_selected_indices"] == [0, 1, 2]
+    assert result["handles"]["counting_vlm_rejected_indices"] == []
     assert result["handles"]["counting_instances"] == ["handle_1", "handle_2", "handle_3"]
-    assert result["handle_1"]["counting_selection_source"] == "vlm_multi_select"
-    assert result["handle_1"]["counting_vlm_response"] == "[0, 1, 2]"
+    assert result["handle_1"]["counting_selection_source"] == "vlm_reject_mode"
+    assert result["handle_1"]["counting_selection_mode"] == "vlm_reject_mode"
+    assert result["handle_1"]["counting_vlm_response"] == "REJECT: []"
     prompt = vlm.calls[0][0][0]["content"][2]["text"]
-    assert "Return only a Python-style list of integer indices" in prompt
-    assert "[0, 2, 5]" in prompt
+    assert "Return only REJECT:" in prompt
+    assert "REJECT: [1, 4, 7]" in prompt
+    assert "if a candidate might be a valid counted instance, do not reject it" in prompt
     assert "Lightbulbs: select individual bulbs" in prompt
     assert "Post-it notes: select individual notes" in prompt
-    assert "Do not select the same instance twice" in prompt
-    assert "Do not select a large box that contains multiple counted instances" in prompt
+    assert "Reject the worse duplicate" in prompt
+    assert "strongly overlap or cover the same visible item" in prompt
+    assert "Water bottles: select individual bottles" in prompt
+    assert "Generic surface objects such as objects stuck on a fridge" in prompt
+    assert "Reject mostly background, floor, wall, or whole group boxes" in prompt
 
 
 def test_count_question_invalid_vlm_response_falls_back_to_rule_instances():
@@ -244,6 +251,41 @@ def test_count_question_invalid_vlm_response_falls_back_to_rule_instances():
     assert result["handles"]["counting_instances"] == ["handle_1", "handle_2"]
 
 
+def test_count_question_reject_mode_removes_rejected_candidate():
+    vlm = FakeObjectExtractionVLM(["REJECT: [2]"])
+    locator = make_locator(
+        {
+            "plates": [
+                {"box2d": [2, 2, 6, 6], "score": 0.90, "prompt": "plates"},
+                {"box2d": [10, 2, 14, 6], "score": 0.88, "prompt": "plates"},
+                {"box2d": [0, 0, 30, 15], "score": 0.95, "prompt": "cabinet"},
+            ],
+        },
+        vlm_model=vlm,
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (32, 20), color="white")
+
+    result = locator.extract(
+        image,
+        ["plates"],
+        question="How many plates are visible?",
+        question_type="numeric_ct",
+    )
+
+    assert result["plates"]["counting_selection_source"] == "vlm_reject_mode"
+    assert result["plates"]["counting_vlm_rejected_indices"] == [2]
+    assert result["plates"]["counting_vlm_selected_indices"] == [0, 1]
+    assert result["plates"]["counting_instances"] == ["plate_1", "plate_2"]
+
+
+def test_count_reject_parser_requires_reject_prefix():
+    assert parse_count_rejected_indices("REJECT: [1, 4, 7]", 10) == [1, 4, 7]
+    assert parse_count_rejected_indices("REJECT: []", 10) == []
+    assert parse_count_rejected_indices("[1, 2]", 10) is None
+    assert parse_count_rejected_indices("INVALID", 10) is None
+
+
 def test_count_filter_removes_group_box_containing_smaller_instances():
     candidates = [
         {"box2d": [0, 0, 80, 80], "score": 0.95, "prompt": "post-it notes", "candidate_index": 0},
@@ -268,6 +310,56 @@ def test_count_filter_removes_duplicate_iou_and_container_object():
 
     assert [item["candidate_index"] for item in kept] == [0]
     assert {item["counting_filter_reason"] for item in rejected} == {"duplicate_iou", "container_object"}
+
+
+def test_generic_surface_count_uses_unified_target_and_prefix():
+    parsed = parse_generic_surface_count_target("objects stuck on fridge")
+
+    assert parsed == {"target": "objects", "relation": "stuck on", "reference": "fridge"}
+    assert detection_prompts_for_object("objects stuck on fridge") == [
+        "magnet",
+        "sticker",
+        "note",
+        "paper",
+        "picture",
+        "photo",
+        "small object",
+        "fridge magnet",
+        "fridge sticker",
+        "fridge note",
+        "fridge photo",
+    ]
+    assert count_instance_prefix("objects stuck on fridge") == "fridge_object"
+    assert make_count_instance_name("objects stuck on fridge", 2) == "fridge_object_2"
+    assert is_visual_count_target("numeric_ct", "Including all objects, how many objects are stuck on the fridge?", "objects stuck on fridge")
+    assert not is_visual_count_target("numeric_ct", "Including all objects, how many objects are stuck on the fridge?", "fridge")
+
+
+def test_count_filter_rejects_existing_duplicate_count_box():
+    candidates = [
+        {"box2d": [0, 0, 20, 20], "score": 0.95, "prompt": "handles", "candidate_index": 0},
+        {"box2d": [40, 0, 60, 20], "score": 0.90, "prompt": "handles", "candidate_index": 1},
+    ]
+
+    kept, rejected = filter_count_instance_candidates(
+        candidates,
+        candidates,
+        "handles",
+        max_instances=10,
+        existing_boxes={"dial_1": [1, 1, 21, 21]},
+    )
+
+    assert [item["candidate_index"] for item in kept] == [1]
+    assert rejected[0]["counting_filter_reason"] == "duplicate_existing_count_box"
+
+
+def test_count_target_detection_handles_count_ratio_irregular_and_generic_objects():
+    assert is_visual_count_target("count_ratio", "What is the ratio of coasters to black TV remotes?", "coasters")
+    assert is_visual_count_target("count_ratio", "What is the ratio of coasters to black TV remotes?", "black tv remotes")
+    assert is_visual_count_target("numeric_ct", "How many computer mice are shown?", "computer mouse")
+    assert is_visual_count_target("numeric_ct", "Including all objects, how many objects are stuck on the fridge?", "stickers")
+    assert not is_visual_count_target("numeric_ct", "Including all objects, how many objects are stuck on the fridge?", "fridge")
+    assert is_visual_count_target("numeric_ct", "Counting the dials as handles, how many handles are shown?", "dials")
 
 
 def test_success_records_sam_mask_usage_fields():
@@ -463,6 +555,11 @@ def test_classify_question_type_for_omni3d_categories():
         "answer": 0.94,
     }) == "numeric_other"
     assert demo_extract_3d_positions.classify_question_type({
+        "question": "What is the ratio of coasters to black TV remotes? Answer with a decimal",
+        "answer_type": "float",
+        "answer": 0.5,
+    }) == "count_ratio"
+    assert demo_extract_3d_positions.classify_question_type({
         "question": "Are the number of cabinets greater than the number of windows visible?",
         "answer_type": "str",
         "answer": "yes",
@@ -506,6 +603,39 @@ def test_vlm_object_extraction_preferred_over_rule(tmpdir):
     assert info["method"] == "vlm"
     assert info["vlm_extracted_objects"] == ["fireplace", "coffee table", "sofa"]
     assert info["object_extraction_response"] == "[fireplace, coffee table, sofa]"
+
+def test_vlm_and_rule_objects_are_safely_merged(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "If the diagonal length of the tv is 1.5m, how tall is the left-most sofa in meters?",
+        "answer_type": "float",
+    }
+    vlm = FakeObjectExtractionVLM(["[diagonal length of the TV, left-most sofa]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert "left-most sofa" in info["objects"]
+    assert "tv" in info["objects"]
+    assert "diagonal length of the tv" not in info["objects"]
+    assert info["method"] == "vlm_rule_union"
+
+
+def test_camera_viewpoint_is_filtered_from_object_names(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "I'm standing at the christmas tree and facing the camera. What direction is the TV?",
+        "answer_type": "str",
+        "answer": "W",
+    }
+    vlm = FakeObjectExtractionVLM(["[christmas tree, camera, TV]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert "camera" not in info["objects"]
+    assert info["objects"] == ["christmas tree", "tv"]
+
 
 
 def test_vlm_object_extraction_aux_retry(tmpdir):
@@ -903,6 +1033,9 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert "Do not choose a larger, clearer, or more central candidate" in prompt
     assert "Counting and instance rules:" in prompt
     assert "Do not select the same instance twice" in prompt
+    assert "strongly overlap or cover the same visible item" in prompt
+    assert "Water bottles: select individual bottles" in prompt
+    assert "Generic surface objects such as objects stuck on a fridge" in prompt
     assert "Do not select a large box that contains multiple counted instances" in prompt
     assert "Badcase-guided examples:" in prompt
     assert 'for "circular table under the TV"' in prompt
@@ -978,6 +1111,30 @@ def test_vlm_selection_rejects_reference_object_for_relation_target():
 
     assert allowed is False
     assert reject_reason == "reference_object_selected"
+
+
+def test_vlm_selection_rejects_tv_stand_candidate_that_overlaps_tv_box():
+    candidates = [
+        {"box2d": [570, 469, 1111, 948], "score": 0.65, "rank_score": 0.83, "prompt": "tv stand"},
+        {"box2d": [378, 0, 1151, 566], "score": 0.30, "rank_score": 0.48, "prompt": "tv stand"},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("tv stand", candidates[1], candidates)
+
+    assert allowed is False
+    assert reject_reason == "support_object_confused_with_display"
+
+
+def test_vlm_selection_rejects_same_target_low_score_candidate():
+    candidates = [
+        {"box2d": [1173, 354, 1474, 915], "score": 0.70, "rank_score": 1.00, "prompt": "black chair"},
+        {"box2d": [417, 190, 873, 961], "score": 0.10, "rank_score": 0.28, "prompt": "black chair"},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("black chair", candidates[1], candidates)
+
+    assert allowed is False
+    assert reject_reason == "same_target_low_score"
 
 
 def test_vlm_selection_rejects_weak_phrase_low_score_candidate():
@@ -1179,12 +1336,16 @@ def test_object_extraction_prompt_has_question_type_rules():
     from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST, QUESTION_TYPE_RULES
 
     assert "{question_type_rules}" in PROMPT_GET_OBJECTS_OF_INTEREST
-    assert set(["numeric_ct", "numeric_other", "yes_no", "choice_object"]).issubset(QUESTION_TYPE_RULES)
+    assert set(["numeric_ct", "numeric_other", "yes_no", "choice_object", "count_ratio"]).issubset(QUESTION_TYPE_RULES)
+    assert "Question type: counting ratio" in QUESTION_TYPE_RULES["count_ratio"]
+    assert "[Detect] [coasters, black TV remotes]" in QUESTION_TYPE_RULES["count_ratio"]
     assert "Question type: numeric count" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "all visible instances" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "do not invent indexed names" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "handle_1" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["numeric_ct"]
+    assert "[Detect] [objects stuck on fridge, fridge]" in QUESTION_TYPE_RULES["numeric_ct"]
+    assert "one unified count target" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "Question type: numeric measurement or ratio" in QUESTION_TYPE_RULES["numeric_other"]
     assert "combined height" in QUESTION_TYPE_RULES["numeric_other"]
     assert "fit, stack, reach, or match" in QUESTION_TYPE_RULES["numeric_other"]
@@ -1205,6 +1366,7 @@ def test_object_extraction_prompt_documents_attribute_distinction_rule():
     assert "[Detect] [gray chair, table, black chair]" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "translucent cube" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Do not merge same-category attributed objects" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert "objects stuck on the fridge" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
     assert "Keep transparency phrases" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
 
 

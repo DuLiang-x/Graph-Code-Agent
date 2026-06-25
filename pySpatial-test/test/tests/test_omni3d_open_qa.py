@@ -18,6 +18,8 @@ from mindcube import (
     filter_entries_by_index_range,
     get_entry_question_index,
     load_omni3d_entries,
+    normalize_question_type,
+    build_question_type_metrics,
     validate_index_range,
 )
 from scripts.demo_extract_3d_positions import extract_object_names_from_omni3d_question
@@ -189,3 +191,64 @@ def test_load_omni3d_entries_builds_scene_fields(tmpdir):
 def test_omni3d_object_names_without_options():
     question = "What is the ratio of the height of the fireplace to the combined height of the coffee table and the sofa to the right of the coffee table?"
     assert extract_object_names_from_omni3d_question(question) == ["fireplace", "coffee table", "sofa"]
+
+
+def test_question_type_metrics_group_count_ratio_with_numeric_ct():
+    assert normalize_question_type("count_ratio") == "numeric_ct"
+    assert normalize_question_type("numeric_other") == "numeric_other"
+
+    stats = {
+        "numeric_ct": {
+            "total": 1.0,
+            "parse_success": 1.0,
+            "execution_success": 1.0,
+            "answer_generation_success": 1.0,
+            "correct_answers": 1.0,
+            "evaluable_answers": 1.0,
+            "errors": 0.0,
+            "mra_sum": 0.8,
+            "mra_count": 1.0,
+        },
+        "numeric_other": {
+            "total": 1.0,
+            "parse_success": 1.0,
+            "execution_success": 0.0,
+            "answer_generation_success": 1.0,
+            "correct_answers": 0.0,
+            "evaluable_answers": 1.0,
+            "errors": 1.0,
+            "mra_sum": 0.0,
+            "mra_count": 0.0,
+        },
+        "yes_no": {
+            "total": 1.0,
+            "parse_success": 1.0,
+            "execution_success": 1.0,
+            "answer_generation_success": 1.0,
+            "correct_answers": 1.0,
+            "evaluable_answers": 1.0,
+            "errors": 0.0,
+            "mra_sum": 0.0,
+            "mra_count": 0.0,
+        },
+        "choice_object": {
+            "total": 1.0,
+            "parse_success": 0.0,
+            "execution_success": 0.0,
+            "answer_generation_success": 1.0,
+            "correct_answers": 0.0,
+            "evaluable_answers": 1.0,
+            "errors": 0.0,
+            "mra_sum": 0.0,
+            "mra_count": 0.0,
+        },
+    }
+
+    metrics = build_question_type_metrics(stats)
+
+    assert set(["numeric_ct", "numeric_other", "yes_no", "choice_object"]).issubset(metrics)
+    assert metrics["numeric_ct"]["correctness_rate"] == 100.0
+    assert metrics["numeric_ct"]["mra"] == 0.8
+    assert metrics["numeric_other"]["correctness_rate"] == 0.0
+    assert metrics["yes_no"]["correctness_rate"] == 100.0
+    assert metrics["choice_object"]["parse_rate"] == 0.0
