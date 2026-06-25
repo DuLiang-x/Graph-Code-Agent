@@ -474,10 +474,10 @@ def classify_question_type(sample) -> str:
 
     if _is_yes_no_answer(answer):
         return "yes_no"
-    if answer_type == "int" or COUNT_QUESTION_RE.search(question):
-        return "numeric_ct"
     if answer_type == "float":
         return "numeric_other"
+    if answer_type == "int" or COUNT_QUESTION_RE.search(question):
+        return "numeric_ct"
     if answer_type == "str":
         return "choice_object"
     return "generic"

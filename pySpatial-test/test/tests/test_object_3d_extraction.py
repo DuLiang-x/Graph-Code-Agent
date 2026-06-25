@@ -19,7 +19,7 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, maybe_fallback_mask, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, maybe_fallback_mask, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
@@ -180,6 +180,94 @@ def test_non_count_question_keeps_single_target_node():
     assert "handles" in result
     assert "handle_1" not in result
     assert "position" in result["handles"]
+
+
+def test_count_question_uses_vlm_multi_select_when_available():
+    vlm = FakeObjectExtractionVLM(["[0, 1, 2]"])
+    locator = make_locator(
+        {
+            "handles": [
+                {"box2d": [2, 2, 6, 6], "score": 0.90},
+                {"box2d": [10, 2, 14, 6], "score": 0.88},
+                {"box2d": [18, 2, 22, 6], "score": 0.86},
+            ],
+        },
+        vlm_model=vlm,
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (32, 20), color="white")
+
+    result = locator.extract(
+        image,
+        ["handles"],
+        question="How many handles are on the cabinets?",
+        question_type="numeric_ct",
+    )
+
+    assert result["handles"]["counting_selection_source"] == "vlm_multi_select"
+    assert result["handles"]["counting_vlm_selected_indices"] == [0, 1, 2]
+    assert result["handles"]["counting_instances"] == ["handle_1", "handle_2", "handle_3"]
+    assert result["handle_1"]["counting_selection_source"] == "vlm_multi_select"
+    assert result["handle_1"]["counting_vlm_response"] == "[0, 1, 2]"
+    prompt = vlm.calls[0][0][0]["content"][2]["text"]
+    assert "Return only a Python-style list of integer indices" in prompt
+    assert "[0, 2, 5]" in prompt
+    assert "Lightbulbs: select individual bulbs" in prompt
+    assert "Post-it notes: select individual notes" in prompt
+    assert "Do not select the same instance twice" in prompt
+    assert "Do not select a large box that contains multiple counted instances" in prompt
+
+
+def test_count_question_invalid_vlm_response_falls_back_to_rule_instances():
+    vlm = FakeObjectExtractionVLM(["INVALID"])
+    locator = make_locator(
+        {
+            "handles": [
+                {"box2d": [2, 2, 6, 6], "score": 0.90},
+                {"box2d": [10, 2, 14, 6], "score": 0.88},
+            ],
+        },
+        vlm_model=vlm,
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (32, 20), color="white")
+
+    result = locator.extract(
+        image,
+        ["handles"],
+        question="How many handles are on the cabinets?",
+        question_type="numeric_ct",
+    )
+
+    assert result["handles"]["counting_selection_source"] == "rule_fallback"
+    assert result["handles"]["counting_vlm_response"] == "INVALID"
+    assert result["handles"]["counting_instances"] == ["handle_1", "handle_2"]
+
+
+def test_count_filter_removes_group_box_containing_smaller_instances():
+    candidates = [
+        {"box2d": [0, 0, 80, 80], "score": 0.95, "prompt": "post-it notes", "candidate_index": 0},
+        {"box2d": [10, 10, 20, 20], "score": 0.70, "prompt": "post-it notes", "candidate_index": 1},
+        {"box2d": [30, 10, 40, 20], "score": 0.68, "prompt": "post-it notes", "candidate_index": 2},
+    ]
+
+    kept, rejected = filter_count_instance_candidates(candidates, candidates, "post-it notes", max_instances=10)
+
+    assert [item["candidate_index"] for item in kept] == [1, 2]
+    assert rejected[0]["counting_filter_reason"] == "contained_group_box"
+
+
+def test_count_filter_removes_duplicate_iou_and_container_object():
+    candidates = [
+        {"box2d": [0, 0, 20, 20], "score": 0.95, "prompt": "lightbulbs", "candidate_index": 0},
+        {"box2d": [1, 1, 21, 21], "score": 0.94, "prompt": "lightbulbs", "candidate_index": 1},
+        {"box2d": [0, 0, 80, 80], "score": 0.90, "prompt": "chandelier", "candidate_index": 2},
+    ]
+
+    kept, rejected = filter_count_instance_candidates(candidates, candidates, "lightbulbs", max_instances=10)
+
+    assert [item["candidate_index"] for item in kept] == [0]
+    assert {item["counting_filter_reason"] for item in rejected} == {"duplicate_iou", "container_object"}
 
 
 def test_success_records_sam_mask_usage_fields():
@@ -363,7 +451,12 @@ def test_classify_question_type_for_omni3d_categories():
         "question": "How many stools are needed to match the chair height?",
         "answer_type": "float",
         "answer": 1.8,
-    }) == "numeric_ct"
+    }) == "numeric_other"
+    assert demo_extract_3d_positions.classify_question_type({
+        "question": "How many objects with the volume of the combined volume of the two bedside tables would fit in the bed?",
+        "answer_type": "float",
+        "answer": 9.658,
+    }) == "numeric_other"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "What is the ratio of the fireplace height to the sofa height?",
         "answer_type": "float",
@@ -651,6 +744,20 @@ def test_entity_ranker_prefers_tight_white_coffee_table_over_large_carpet_box():
     assert "large_entity_penalty" not in selected["rank_reasons"]
 
 
+def test_large_entity_ranker_allows_exact_bed_box_despite_large_area():
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [0, 0, 95, 95], "score": 0.92, "prompt": "bed"},
+        {"box2d": [0, 35, 25, 70], "score": 0.18, "prompt": "bed"},
+    ]
+
+    selected = rank_detection_candidates(image, "bed", candidates, {})
+
+    assert selected["box2d"] == [0, 0, 95, 95]
+    assert "large_entity_tolerated" in selected["rank_reasons"]
+    assert "broad_entity_tolerated" in selected["rank_reasons"]
+
+
 def test_area_ranker_prefers_low_wide_carpet_over_high_platform():
     image = Image.new("RGB", (100, 100), color="white")
     candidates = [
@@ -758,6 +865,12 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert content[1]["type"] == "image"
     assert content[2]["type"] == "text"
     prompt = content[2]["text"]
+    assert "Candidate metadata table:" in prompt
+    assert "index | prompt | box2d | center | area_ratio | dino_score | rank_score | rank_reasons" in prompt
+    assert "Coordinate and score notes:" in prompt
+    assert "Larger x means further right in the image; larger y means lower in the image" in prompt
+    assert "dino_score, rank_score, and rank_reasons are supporting evidence only" in prompt
+    assert "approx_depth" not in prompt
     assert "Candidate 0 is the rule-ranked best candidate, but you may choose another candidate if it better matches the exact target object category and question context." in prompt
     assert "not just the most visually obvious object of the category" in prompt
     assert "Target object phrase:" in prompt
@@ -788,6 +901,15 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert "Treat words such as rightmost, leftmost, topmost, and bottommost as part of the target object phrase" in prompt
     assert 'For "rightmost chair" or similar targets, choose the rightmost complete candidate' in prompt
     assert "Do not choose a larger, clearer, or more central candidate" in prompt
+    assert "Counting and instance rules:" in prompt
+    assert "Do not select the same instance twice" in prompt
+    assert "Do not select a large box that contains multiple counted instances" in prompt
+    assert "Badcase-guided examples:" in prompt
+    assert 'for "circular table under the TV"' in prompt
+    assert 'for "translucent cube"' in prompt
+    assert 'for "gray chair" versus "black chair"' in prompt
+    assert 'for "brown chair" versus "black chair"' in prompt
+    assert "camera is viewpoint" in prompt
     assert 'For "glass table", choose the actual glass/transparent table' in prompt
     assert "not a black plastic table or ordinary dark table" in prompt
     assert "Treat shape words such as circular, round, square, rectangular, and oval" in prompt
@@ -858,6 +980,18 @@ def test_vlm_selection_rejects_reference_object_for_relation_target():
     assert reject_reason == "reference_object_selected"
 
 
+def test_vlm_selection_rejects_weak_phrase_low_score_candidate():
+    candidates = [
+        {"box2d": [20, 70, 45, 90], "score": 0.80, "rank_score": 0.98, "prompt": "small stool"},
+        {"box2d": [2, 58, 15, 74], "score": 0.05, "rank_score": 0.15, "prompt": "small"},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("small stool", candidates[1], candidates)
+
+    assert allowed is False
+    assert reject_reason == "weak_phrase_low_score"
+
+
 def test_vlm_selection_accepts_larger_translucent_cube_attribute_candidate():
     candidates = [
         {"box2d": [0, 0, 10, 10], "score": 0.70, "rank_score": 0.88, "prompt": "translucent cube"},
@@ -904,29 +1038,16 @@ def test_vlm_refinement_allows_material_specific_lower_rank_candidate():
     assert item["selection_reject_reason"] is None
 
 
-def test_vlm_refinement_rejects_small_unclear_black_table():
-    locator = make_locator(
-        {
-            "black table": [
-                {"box2d": [27, 72, 71, 98], "score": 0.47, "prompt": "black table"},
-                {"box2d": [38, 35, 48, 45], "score": 0.20, "prompt": "black table"},
-            ]
-        },
-        vlm_model=FakeVLM(),
-        use_vlm_refinement=True,
-    )
-    image = Image.new("RGB", (100, 100), color="white")
+def test_vlm_validation_accepts_lower_rank_attribute_candidate():
+    candidates = [
+        {"box2d": [27, 72, 71, 98], "score": 0.47, "rank_score": 0.85, "prompt": "table"},
+        {"box2d": [38, 35, 58, 55], "score": 0.20, "rank_score": 0.30, "prompt": "black table"},
+    ]
 
-    result = locator.extract(image, ["black table"])
+    allowed, reject_reason = validate_vlm_selection("black table", candidates[1], candidates)
 
-    item = result["black table"]
-    assert item["box2d"] == [27, 72, 71, 98]
-    assert item["candidate_rank_reason"] == "rule_ranker"
-    assert item["rule_selected_index"] == 0
-    assert item["vlm_selected_index"] == 1
-    assert item["final_selected_index"] == 0
-    assert item["selection_decision"] == "rule_ranker_vlm_rejected"
-    assert item["selection_reject_reason"] in {"rank_score_too_low", "partial_entity_box"}
+    assert allowed is True
+    assert reject_reason is None
 
 
 def test_vlm_refinement_rejects_partial_cabinet_box():
@@ -1066,6 +1187,9 @@ def test_object_extraction_prompt_has_question_type_rules():
     assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "Question type: numeric measurement or ratio" in QUESTION_TYPE_RULES["numeric_other"]
     assert "combined height" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "fit, stack, reach, or match" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "[Detect] [bedside tables, bed]" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "[Detect] [TV, sofa]" in QUESTION_TYPE_RULES["numeric_other"]
     assert "Question type: yes/no" in QUESTION_TYPE_RULES["yes_no"]
     assert "visibility" in QUESTION_TYPE_RULES["yes_no"]
     assert "Question type: object choice" in QUESTION_TYPE_RULES["choice_object"]
