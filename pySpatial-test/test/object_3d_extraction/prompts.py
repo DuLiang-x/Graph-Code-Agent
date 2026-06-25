@@ -25,9 +25,6 @@ Numeric-measurement rules:
 - Detect every object used as a numeric operand in the calculation.
 - For ratio, difference, sum, combined height, width, length, depth, distance, or volume questions, include all numerator, denominator, and reference objects.
 - For known-size calibration questions, include both the object with the provided size and the object whose size is requested.
-- Questions like "How many objects with the volume/height/width/length of X would fit, stack, reach, or match Y" are numeric ratio questions, not visual counting questions.
-- For fit/stack/reach/match numeric questions, detect the measurement operands such as X and Y; do not treat them as a request to count visible instances.
-- For combined operands such as "two bedside tables" or "combined volume", include the combined object phrase and the comparison object, for example [bedside tables, bed].
 - Preserve relation modifiers such as rightmost, leftmost, topmost, bottommost, under, above, or next to when they identify which instance is needed.
 - Preserve color and material attributes such as white, black, glass, wooden, or metal when they disambiguate the target object.
 
@@ -38,14 +35,6 @@ Numeric-measurement rules:
 # Example: known-size calibration
 [Question] If the black table is 1.5m wide, how tall is the TV?
 [Detect] [black table, TV]
-
-# Example: volume ratio with combined operand
-[Question] How many objects with the volume of the combined volume of the two bedside tables would fit in an object with the volume of the bed?
-[Detect] [bedside tables, bed]
-
-# Example: height ratio phrased as how many objects
-[Question] How many objects of the same height as the TV would reach the height of the sofa?
-[Detect] [TV, sofa]
 """,
     "yes_no": """
 Question type: yes/no relation, visibility, or collision.
