@@ -20,6 +20,7 @@ from object_3d_extraction.prompts import (
     PROMPT_GET_OBJECTS_OF_INTEREST_AUX,
     QUESTION_TYPE_RULES,
 )
+from object_3d_extraction.object_3d_locator import is_count_ratio_question
 from object_3d_extraction.utils import extract_object_names_from_question_options
 
 DEFAULT_LOCAL_QWEN_MODEL_PATH = "/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct"
@@ -462,6 +463,15 @@ def get_sample_key(sample, fallback_index: int) -> str:
 
 
 COUNT_QUESTION_RE = re.compile(r"\b(how many|number of|count|total number)\b", re.IGNORECASE)
+NON_VISUAL_HOW_MANY_RE = re.compile(
+    r"\b(?:stack|stacked|reach|match|same height|fit|volume|width|height|length|depth)\b",
+    re.IGNORECASE,
+)
+OPTION_QUESTION_RE = re.compile(r"\b(options?\s*:|choose from|one of|which of)\b", re.IGNORECASE)
+YES_NO_QUESTION_RE = re.compile(
+    r"^\s*(?:is|are|was|were|will|would|can|could|do|does|did|has|have|should)\b",
+    re.IGNORECASE,
+)
 YES_NO_ANSWER_RE = re.compile(r"^\s*(yes|no)\s*[.!]?\s*$", re.IGNORECASE)
 
 
@@ -481,15 +491,19 @@ def classify_question_type(sample) -> str:
     answer_type = str(sample.get("answer_type") or "").lower()
     answer = _sample_answer(sample)
 
-    if _is_yes_no_answer(answer):
+    if _is_yes_no_answer(answer) or YES_NO_QUESTION_RE.search(question):
         return "yes_no"
-    if answer_type == "int" or COUNT_QUESTION_RE.search(question):
+    if OPTION_QUESTION_RE.search(question):
+        return "choice_object"
+    if is_count_ratio_question(question):
         return "numeric_ct"
-    if answer_type == "float":
-        return "numeric_other"
+    if answer_type == "int":
+        return "numeric_ct"
+    if COUNT_QUESTION_RE.search(question) and not NON_VISUAL_HOW_MANY_RE.search(question):
+        return "numeric_ct"
     if answer_type == "str":
         return "choice_object"
-    return "generic"
+    return "numeric_other"
 
 
 def build_object_extraction_prompt(question: str, question_type: str = "generic") -> str:
@@ -498,6 +512,73 @@ def build_object_extraction_prompt(question: str, question_type: str = "generic"
         question=question,
         question_type_rules=rules.strip(),
     )
+
+
+def _normalize_object_phrase_for_merge(name: str) -> str:
+    text = re.sub(r"[_-]+", " ", str(name or "").lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(
+        r"\b(rightmost|leftmost|topmost|bottommost|right most|left most|top most|bottom most|right|left|middle|center|centered|nearest|closest|furthest|farthest|front|back)\b",
+        " ",
+        text,
+    )
+    text = re.split(r"\b(under|below|above|over|next to|near|beside|to the right of|to the left of|right of|left of|in front of|behind|inside|on top of|on)\b", text)[0]
+    text = re.sub(
+        r"\b(white|black|gray|grey|brown|red|blue|green|yellow|orange|purple|pink|wooden|wood|metal|metallic|glass|transparent|translucent|clear|circular|round|square|striped|solid|polka dot|polka-dot|small|large|big|tall|short)\b",
+        " ",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    words = []
+    for word in text.split():
+        if len(word) > 3 and word.endswith("ies"):
+            word = word[:-3] + "y"
+        elif len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+            word = word[:-1]
+        words.append(word)
+    return " ".join(words)
+
+
+def _has_precise_instance_modifier(name: str) -> bool:
+    text = str(name or "").lower()
+    return bool(re.search(
+        r"\b(rightmost|leftmost|topmost|bottommost|right-most|left-most|top-most|bottom-most|right most|left most|top most|bottom most|white|black|gray|grey|brown|red|blue|green|yellow|glass|wooden|metal|transparent|translucent|clear|circular|round|striped|solid|polka[- ]dot|under|below|above|next to|beside|right of|left of|in front of|behind|inside|on top of)\b",
+        text,
+    ))
+
+
+def _same_general_object_category(a: str, b: str) -> bool:
+    base_a = _normalize_object_phrase_for_merge(a)
+    base_b = _normalize_object_phrase_for_merge(b)
+    if not base_a or not base_b:
+        return False
+    return base_a == base_b or base_a in base_b.split() or base_b in base_a.split()
+
+
+def merge_vlm_and_rule_objects(question_type: str, vlm_objects: list, rule_objects: list) -> list:
+    if question_type != "numeric_other" or not vlm_objects or not rule_objects:
+        return vlm_objects or rule_objects
+
+    precise_rules = [obj for obj in rule_objects if _has_precise_instance_modifier(obj)]
+    if not precise_rules:
+        return vlm_objects
+
+    merged = []
+    for obj in precise_rules:
+        if obj not in merged:
+            merged.append(obj)
+
+    for obj in vlm_objects:
+        if any(_same_general_object_category(obj, rule_obj) for rule_obj in precise_rules):
+            continue
+        if obj not in merged:
+            merged.append(obj)
+
+    for obj in rule_objects:
+        if obj not in merged and not any(_same_general_object_category(obj, current) for current in merged):
+            merged.append(obj)
+
+    return merged or vlm_objects
 
 
 def resolve_object_names(
@@ -519,9 +600,10 @@ def resolve_object_names(
             vlm_response = "ERROR: {}".format(exc)
 
     if vlm_objects:
+        merged_objects = merge_vlm_and_rule_objects(question_type, vlm_objects, rule_objects)
         return {
-            "objects": vlm_objects,
-            "method": "vlm",
+            "objects": merged_objects,
+            "method": "vlm_rule_merged" if merged_objects != vlm_objects else "vlm",
             "vlm_extracted_objects": vlm_objects,
             "rule_extracted_objects": rule_objects,
             "object_extraction_response": vlm_response,

@@ -35,6 +35,7 @@ api_specification = """
 
         Camera semantics:
             In Omni3D-Bench single-image tasks, "camera" means the physical/image-capturing camera viewpoint of the current input image.
+            Camera is the coordinate origin [0, 0, 0] / image viewpoint, not a graph node and not a detectable object.
             It is not a visible scene object by default.
             Do not detect, segment, or localize "camera" as an object.
             Do not expect "camera" to appear in graph.list_nodes().
@@ -103,6 +104,8 @@ api_specification = """
             Wrong: graph.size_ratio("tv", "table")[0]
 
         Counting rules:
+            Plural object words alone do not mean the task is counting. Only count when the question asks for visible instance quantity, count-ratio, or explicitly says two/both/all/multiple/combined same-category instances.
+            For float stack/reach/match/fit questions such as "How many of X would reach the height of Y", compute a continuous size ratio, not a visual count.
             For "how many X" visual counting questions, use graph.list_nodes() and count indexed instance nodes such as x_1, x_2, x_3.
             Example: handles = graph.nodes_with_prefix("handle_"); answer = graph.count_prefix("handle_").
             For count-ratio questions such as "ratio of coasters to remotes", count each indexed prefix separately and compute graph.ratio(count_a, count_b).
@@ -352,6 +355,36 @@ example_problems = """
         }
     ```
 
+    Example 13a: count-ratio with attributed same-category instances
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        brown = graph.count_prefix("brown_chair_")
+        black = graph.count_prefix("black_chair_")
+        answer = graph.ratio(brown, black)
+        return {"computed_results": {"answer": answer, "brown_chairs": brown, "black_chairs": black}}
+    ```
+
+    Example 13b: stack/reach height is a continuous ratio, not counting
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        stool_h = graph.height("rightmost stool")
+        chair_h = graph.height("leftmost chair")
+        answer = graph.ratio(chair_h, stool_h)
+        return {"computed_results": {"answer": answer, "rule": "height ratio, not visual counting"}}
+    ```
+
+    Example 13c: choose whether X is closer to A or B
+    ```python
+    def program(input_scene: Scene):
+        graph = pySpatial.build_graph(input_scene)
+        d_a = graph.distance("rightmost chair", "table")
+        d_b = graph.distance("rightmost chair", "wooden dresser")
+        answer = "table" if d_a < d_b else "wooden dresser"
+        return {"computed_results": {"answer": answer, "distance_to_table": d_a, "distance_to_wooden_dresser": d_b}}
+    ```
+
     Example 14: TV screen diagonal uses width and height only
     ```python
     def program(input_scene: Scene):
@@ -410,12 +443,13 @@ code_generation_prompt = f"""
     Noted that you can first do reasoning and then write the code. 
     But the code should be wrapped in the ```python ``` block.
     Write a compact code block
+    Plural words alone do not automatically mean counting. For float stack/reach/match/fit questions, compute a continuous size ratio instead of counting visible instances.
     For counting questions, use graph.nodes_with_prefix(prefix) and graph.count_prefix(prefix) for indexed same-category instance nodes such as handle_1, handle_2, chair_1, chair_2.
     For count-ratio questions, count each indexed prefix separately and use graph.ratio(count_a, count_b).
     For two/both/combined same-category numeric questions, use indexed nodes such as sink_1 and sink_2 rather than a single aggregate node such as sinks.
     Do not use a single aggregate node such as handles, sinks, coasters, or remotes when indexed instance nodes are available.
     Before writing code for left/right/front/back relations, first choose the observer.
-    For Omni3D-Bench single-image tasks, "camera" means the current image viewpoint.
+    For Omni3D-Bench single-image tasks, "camera" means the current image viewpoint and coordinate origin [0, 0, 0], not a graph node or detectable object.
     If the question says "from the camera's perspective", use graph.observer_from_camera().
     Do not call graph.observer_from_object("camera").
     Do not treat camera as a graph node.

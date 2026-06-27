@@ -163,6 +163,7 @@ def test_camera_semantics_are_documented_for_graph_prompt():
     from agent.prompt.template import example_problems
 
     assert "Camera semantics" in api_specification
+    assert "Camera is the coordinate origin [0, 0, 0] / image viewpoint" in api_specification
     assert 'Do not detect, segment, or localize "camera" as an object' in api_specification
     assert 'Do not expect "camera" to appear in graph.list_nodes()' in api_specification
     assert 'Do not call graph.observer_from_object("camera")' in api_specification
@@ -227,6 +228,29 @@ def test_codeagent_prompt_documents_badcase_semantic_guards():
     assert "does not include depth" in api_specification
     assert "Return needs_visual_visibility_check" in api_specification
     assert "needs_visual_clock_reading" in api_specification
+
+
+def test_codeagent_prompt_documents_plural_not_automatic_counting():
+    assert "Plural words alone do not automatically mean counting" in code_generation_prompt
+    assert "compute a continuous size ratio instead of counting visible instances" in code_generation_prompt
+    assert "coordinate origin [0, 0, 0]" in code_generation_prompt
+    assert "Plural object words alone do not mean the task is counting" in api_specification
+    assert "How many of X would reach the height of Y" in api_specification
+
+
+def test_codeagent_examples_include_stack_ratio_and_closer_to_a_or_b():
+    from agent.prompt.template import example_problems
+
+    assert "Example 13a: count-ratio with attributed same-category instances" in example_problems
+    assert 'graph.count_prefix("brown_chair_")' in example_problems
+    assert 'graph.count_prefix("black_chair_")' in example_problems
+    assert "Example 13b: stack/reach height is a continuous ratio, not counting" in example_problems
+    assert 'graph.height("rightmost stool")' in example_problems
+    assert 'graph.height("leftmost chair")' in example_problems
+    assert "height ratio, not visual counting" in example_problems
+    assert "Example 13c: choose whether X is closer to A or B" in example_problems
+    assert 'graph.distance("rightmost chair", "table")' in example_problems
+    assert 'graph.distance("rightmost chair", "wooden dresser")' in example_problems
 
 
 def test_answer_prompt_preserves_numeric_and_visual_fallback_format():

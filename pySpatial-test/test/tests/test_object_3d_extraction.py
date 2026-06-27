@@ -19,16 +19,21 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, is_count_ratio_question, is_same_category_multi_instance_numeric, is_visual_count_target, maybe_fallback_mask, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, is_count_ratio_question, is_same_category_multi_instance_numeric, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
 class FakeDetectionModule:
     def __init__(self, detections):
         self.detections = detections
+        self.detect_calls = []
 
-    def detect(self, image, category):
-        return self.detections.get(category, [])
+    def detect(self, image, category, max_candidates=None):
+        self.detect_calls.append((category, max_candidates))
+        detections = self.detections.get(category, [])
+        if max_candidates is None:
+            return detections[:5]
+        return detections[:max_candidates]
 
     def run_segmentation(self, image, box2d):
         mask = np.zeros((image.height, image.width), dtype=np.float32)
@@ -69,6 +74,62 @@ def make_locator(detections, vlm_model=None, use_vlm_refinement=False, mask_fall
         orientation_module=FakeOrientationModule(),
         vlm_model=vlm_model,
     )
+
+
+def test_float_how_many_stack_is_numeric_other_not_counting():
+    sample = {
+        "question": "How many of the rightmost stool would you have to stack to reach the same height as the left-most chair?",
+        "answer": 1.803,
+        "answer_type": "float",
+    }
+
+    assert demo_extract_3d_positions.classify_question_type(sample) == "numeric_other"
+
+
+def test_int_how_many_visible_is_numeric_count():
+    sample = {
+        "question": "How many handles are visible on the cabinets?",
+        "answer": 6,
+        "answer_type": "int",
+    }
+
+    assert demo_extract_3d_positions.classify_question_type(sample) == "numeric_ct"
+
+
+class FakePluralGeneralizingObjectExtractionVLM:
+    def process_messages(self, messages, max_new_tokens=128):
+        return "[Detect] [stools, chairs]"
+
+
+def test_numeric_other_keeps_precise_rule_objects_when_vlm_generalizes_to_plural(tmpdir):
+    image_path = Path(str(tmpdir)) / "sample.png"
+    Image.new("RGB", (16, 16), color="white").save(str(image_path))
+    sample = {
+        "question": "How many of the rightmost stool would you have to stack to reach the same height as the left-most chair?",
+        "answer": 1.803,
+        "answer_type": "float",
+    }
+
+    resolved = demo_extract_3d_positions.resolve_object_names(
+        sample,
+        image=str(image_path),
+        vlm_model=FakePluralGeneralizingObjectExtractionVLM(),
+        use_vlm_object_extraction=True,
+    )
+
+    assert resolved["question_type"] == "numeric_other"
+    assert resolved["method"] == "vlm_rule_merged"
+    assert "rightmost stool" in resolved["objects"]
+    assert "leftmost chair" in resolved["objects"]
+    assert "stools" not in resolved["objects"]
+    assert "chairs" not in resolved["objects"]
+
+
+def test_overlap_warnings_flag_different_non_area_same_box():
+    warnings = overlap_warnings("wooden dresser", [10, 10, 50, 50], {"table": [10, 10, 50, 50]})
+
+    assert warnings
+    assert warnings[0]["warning"] == "different_non_area_high_overlap"
 
 
 def test_missing_image_path_has_clear_error():
@@ -207,6 +268,8 @@ def test_count_candidate_pool_uses_independent_limit():
 
     assert len(normal_candidates) == 5
     assert len(count_candidates) == 12
+    assert locator.detection_module.detect_calls[-2] == ("handles", None)
+    assert locator.detection_module.detect_calls[-1] == ("handles", 20)
 
 
 def test_non_count_question_keeps_single_target_node():
@@ -471,6 +534,11 @@ def test_classify_question_type_for_omni3d_categories():
         "question": "How many stools are needed to match the chair height?",
         "answer_type": "float",
         "answer": 1.8,
+    }) == "numeric_other"
+    assert demo_extract_3d_positions.classify_question_type({
+        "question": "What is the ratio of brown chairs to black chairs? Answer as a decimal.",
+        "answer_type": "float",
+        "answer": 0.5,
     }) == "numeric_ct"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "What is the ratio of the fireplace height to the sofa height?",
@@ -486,6 +554,11 @@ def test_classify_question_type_for_omni3d_categories():
         "question": "Which object is closer to the fireplace: the sofa or the coffee table?",
         "answer_type": "str",
         "answer": "sofa",
+    }) == "choice_object"
+    assert demo_extract_3d_positions.classify_question_type({
+        "question": "Which of these is closer to the fireplace? Options: {sofa, coffee table}",
+        "answer_type": "float",
+        "answer": 0.0,
     }) == "choice_object"
 
 
@@ -1025,6 +1098,30 @@ def test_vlm_selection_still_rejects_obviously_huge_translucent_cube_candidate()
     assert reject_reason == "entity_box_too_large"
 
 
+def test_vlm_selection_accepts_complete_large_sofa_candidate():
+    candidates = [
+        {"box2d": [100, 80, 190, 120], "score": 0.20, "rank_score": 0.70, "prompt": "sofa"},
+        {"box2d": [95, 20, 195, 125], "score": 0.80, "rank_score": 0.60, "prompt": "sofa"},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("sofa", candidates[1], candidates)
+
+    assert allowed is True
+    assert reject_reason is None
+
+
+def test_vlm_selection_still_rejects_nearly_whole_image_table_candidate():
+    candidates = [
+        {"box2d": [20, 20, 60, 50], "score": 0.70, "rank_score": 0.90, "prompt": "table", "area_ratio": 0.12},
+        {"box2d": [0, 0, 100, 95], "score": 0.60, "rank_score": 0.80, "prompt": "table", "area_ratio": 0.95},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("table", candidates[1], candidates)
+
+    assert allowed is False
+    assert reject_reason == "entity_box_too_large"
+
+
 def test_vlm_refinement_allows_material_specific_lower_rank_candidate():
     locator = make_locator(
         {
@@ -1203,11 +1300,17 @@ def test_object_extraction_prompt_has_question_type_rules():
     assert "{question_type_rules}" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert set(["numeric_ct", "numeric_other", "yes_no", "choice_object"]).issubset(QUESTION_TYPE_RULES)
     assert "Question type: numeric count" in QUESTION_TYPE_RULES["numeric_ct"]
+    assert "ratio of brown chairs to black chairs" in QUESTION_TYPE_RULES["numeric_ct"]
+    assert "[Detect] [brown chairs, black chairs]" in QUESTION_TYPE_RULES["numeric_ct"]
+    assert "Plural words alone do not mean the task is visual counting" in QUESTION_TYPE_RULES["numeric_ct"]
+    assert "stack/reach/match/fit" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "all visible instances" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "do not invent indexed names" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "handle_1" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "Question type: numeric measurement or ratio" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "How many of X would you stack/reach/match" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "[Detect] [rightmost stool, leftmost chair]" in QUESTION_TYPE_RULES["numeric_other"]
     assert "combined height" in QUESTION_TYPE_RULES["numeric_other"]
     assert "two sinks" in QUESTION_TYPE_RULES["numeric_other"]
     assert "ratio of coasters to black TV remotes" in QUESTION_TYPE_RULES["numeric_other"]
@@ -1231,6 +1334,7 @@ def test_object_extraction_prompt_documents_attribute_distinction_rule():
     assert "decimal, sum, direction" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Do not merge same-category attributed objects" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
     assert "Keep transparency phrases" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    assert "Do not change singular numeric operands" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
 
 
 def test_object_extraction_prompt_documents_camera_viewpoint_rule():
@@ -1238,6 +1342,7 @@ def test_object_extraction_prompt_documents_camera_viewpoint_rule():
 
     assert "Camera rule" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert '"camera" usually means the viewpoint of the current image' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "Camera is the coordinate origin [0, 0, 0] / image viewpoint" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert 'Do not include "camera" in [Detect]' in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "visible physical camera object" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "From the camera's perspective, is the chair on the left or right of the table?" in PROMPT_GET_OBJECTS_OF_INTEREST

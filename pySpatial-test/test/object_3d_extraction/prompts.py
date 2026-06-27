@@ -4,6 +4,9 @@ QUESTION_TYPE_RULES = {
     "numeric_ct": """
 Question type: numeric count.
 Count-question rules:
+- Use these rules only when the question asks for the number/count of visible instances in the image.
+- Plural words alone do not mean the task is visual counting.
+- Do not treat "How many of X would you stack/reach/match/fit..." as visual counting; that is a numeric ratio/measurement question when the answer type is float.
 - Detect all visible instances of the countable object category requested by the question, not only one example instance.
 - If the question asks how many handles, lights, curtains, shoeboxes, shelves, windows, chairs, stools, or other instances are visible, include that countable object category in [Detect].
 - Use natural object category names such as handles, lights, or chairs in [Detect]; do not invent indexed names such as handle_1 or chair_2 in the detection list.
@@ -18,17 +21,24 @@ Count-question rules:
 # Example: count visible shoeboxes
 [Question] How many shoeboxes are visible on the shelf?
 [Detect] [shoeboxes, shelf]
+
+# Example: count-ratio with attributed categories
+[Question] What is the ratio of brown chairs to black chairs? Answer as a decimal.
+[Detect] [brown chairs, black chairs]
 """,
     "numeric_other": """
 Question type: numeric measurement or ratio.
 Numeric-measurement rules:
 - Detect every object used as a numeric operand in the calculation.
+- Plural words alone do not mean the task is visual counting.
+- For "How many of X would you stack/reach/match the height of Y", detect the exact X and Y operands and do not convert them into plural count categories.
+- For "How many objects with the volume/height/width/length of X would fit/reach Y", treat it as a continuous numeric ratio/measurement question, not visual counting.
 - For ratio, difference, sum, combined height, width, length, depth, distance, or volume questions, include all numerator, denominator, and reference objects.
 - For known-size calibration questions, include both the object with the provided size and the object whose size is requested.
 - Preserve relation modifiers such as rightmost, leftmost, topmost, bottommost, under, above, or next to when they identify which instance is needed.
 - Preserve color and material attributes such as white, black, glass, wooden, or metal when they disambiguate the target object.
 - If the question says two X, both X, multiple X, all X, or combined height/width/length/depth/volume of two X, include the natural plural/category phrase so the pipeline can detect each instance separately.
-- Count-ratio questions such as "ratio of coasters to remotes" require all visible instances on both sides of the ratio; include both countable categories.
+- Count-ratio questions such as "ratio of coasters to remotes" or "ratio of brown chairs to black chairs" require all visible instances on both sides of the ratio; include both countable categories with their attributes.
 
 # Example: height ratio with combined denominator
 [Question] What is the ratio of the height of the fireplace to the combined height of the coffee table and the sofa to the right of the coffee table?
@@ -49,6 +59,10 @@ Numeric-measurement rules:
 # Example: combined volume of repeated objects
 [Question] How many objects with the combined volume of two bedside tables fit in the bed?
 [Detect] [bedside tables, bed]
+
+# Example: stack/reach height is not visual counting
+[Question] How many of the rightmost stool would you have to stack to reach the same height as the left-most chair?
+[Detect] [rightmost stool, leftmost chair]
 """,
     "yes_no": """
 Question type: yes/no relation, visibility, or collision.
@@ -97,6 +111,7 @@ Given an image and a spatial reasoning question, we need to all entities that ar
 
 Camera rule:
 - In Omni3D-Bench single-image tasks, "camera" usually means the viewpoint of the current image, not a visible object.
+- Camera is the coordinate origin [0, 0, 0] / image viewpoint, not a graph node and not a detectable object.
 - Do not include "camera" in [Detect] when it refers to the image/camera perspective.
 - Only include "camera" in [Detect] if the question explicitly refers to a visible physical camera object in the scene.
 
@@ -122,6 +137,7 @@ Badcase-guided object mention rules:
 - Do not output color words alone, such as red, white, blue, or black, unless the question explicitly refers to visible color swatches or colored objects as physical candidates.
 - Keep TV and TV stand as different objects; do not replace TV stand with TV or merge them into one target.
 - If the question explicitly says two X, both X, multiple X, or combined size/volume of two X, keep the countable category in [Detect] so the pipeline can produce X_1, X_2, etc.
+- Do not convert a singular attributed or relation-specific target such as rightmost stool, leftmost chair, black chair, or circular table under the TV into a plural category unless the question truly asks to count visible instances.
 - For generic surface counting such as objects stuck on a fridge, keep the counted small-object target and the reference surface; do not collapse the answer to only the fridge.
 
 # Example: camera perspective should not be detected as an object
@@ -195,7 +211,8 @@ Rules:
 - Keep color, material, transparency, shape, size, and texture attributes when they identify the target object.
 - Do not merge same-category attributed objects such as "gray chair" and "black chair" into "chair".
 - Keep transparency phrases such as "translucent cube", "transparent box", or "clear container" intact.
-- For counting questions, keep the countable category as a natural plural/category phrase such as "handles" or "chairs"; do not invent indexed names such as "handle_1" in [Detect].
+- For true visual counting questions, keep the countable category as a natural plural/category phrase such as "handles" or "chairs"; do not invent indexed names such as "handle_1" in [Detect].
+- Do not change singular numeric operands such as "rightmost stool" or "leftmost chair" into plural categories.
 - Do not collapse a count target into a support object such as cabinet, shelf, table, or wall.
 - Do not replace "stool" with "chair".
 - Do not replace "chair" with "stool".

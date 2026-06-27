@@ -6,7 +6,7 @@ apc/vision_modules/detection.py, Apache-2.0 license.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from PIL import Image
@@ -69,7 +69,7 @@ class DetectionModule:
         image_transformed, _ = transform(image, None)
         return image_npy, image_transformed
 
-    def run_detection(self, image_tensor: Any, category: str) -> List[Dict[str, object]]:
+    def run_detection(self, image_tensor: Any, category: str, max_candidates: Optional[int] = None) -> List[Dict[str, object]]:
         try:
             from groundingdino.util.inference import predict
         except ImportError as exc:
@@ -88,8 +88,9 @@ class DetectionModule:
         phrases = list(phrases) if phrases is not None else [""] * len(scores_np)
         order = np.argsort(-scores_np)
 
+        limit = self.config.detection.num_candidates if max_candidates is None else int(max_candidates)
         detections = []  # type: List[Dict[str, object]]
-        for idx in order[: self.config.detection.num_candidates]:
+        for idx in order[: max(1, limit)]:
             detections.append(
                 {
                     "box": boxes_np[int(idx)],
@@ -99,10 +100,10 @@ class DetectionModule:
             )
         return detections
 
-    def detect(self, image: Image.Image, category: str) -> List[Dict[str, object]]:
+    def detect(self, image: Image.Image, category: str, max_candidates: Optional[int] = None) -> List[Dict[str, object]]:
         _, image_tensor = self.detection_process_image(image)
         width, height = image.size
-        detections = self.run_detection(image_tensor, category)
+        detections = self.run_detection(image_tensor, category, max_candidates=max_candidates)
         for det in detections:
             det["box2d"] = cxcywh_to_xyxy(np.asarray(det["box"]), width, height)
         return detections

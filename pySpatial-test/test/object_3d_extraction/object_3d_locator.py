@@ -226,9 +226,15 @@ class Object3DLocator:
         prompts: List[str],
         is_count_target: bool = False,
     ) -> List[Dict[str, object]]:
+        per_prompt_max_candidates = None
+        if is_count_target:
+            per_prompt_max_candidates = max(
+                int(self.config.detection.count_max_instances),
+                int(self.config.detection.num_candidates) * int(self.config.detection.count_candidate_multiplier),
+            )
         candidates = []
         for prompt in prompts:
-            detections = self.detection_module.detect(image_pil, prompt)
+            detections = self.detection_module.detect(image_pil, prompt, max_candidates=per_prompt_max_candidates)
             for det in detections:
                 candidate = dict(det)
                 candidate["prompt"] = prompt
@@ -684,6 +690,41 @@ def vlm_selection_is_plausible(object_name: str, selected: Dict[str, object], ca
     return validate_vlm_selection(object_name, selected, candidates)[0]
 
 
+LARGE_OBJECT_TERMS = {
+    "sofa", "couch", "bed", "fireplace", "cabinet", "bookshelf", "shelf",
+    "chandelier", "table", "dresser", "counter", "nightstand", "stand",
+}
+
+
+def _is_large_object_target(object_name: str) -> bool:
+    target = parse_object_relation_context(object_name).get("target_phrase", object_name).lower()
+    if is_area_object(target):
+        return False
+    words = set(re.findall(r"[a-z]+", target))
+    return any(term in words or term + "s" in words for term in LARGE_OBJECT_TERMS)
+
+
+def _is_nearly_whole_image_candidate(candidate: Dict[str, object]) -> bool:
+    box = candidate.get("box2d", [0, 0, 0, 0])
+    area_ratio = float(candidate.get("area_ratio", 0.0) or 0.0)
+    if area_ratio <= 0.0:
+        # Candidate metadata may not include image-relative area in unit tests.
+        return False
+    return area_ratio > 0.75
+
+
+def _large_object_complete_box_override(object_name: str, selected: Dict[str, object], best: Dict[str, object]) -> bool:
+    if not _is_large_object_target(object_name):
+        return False
+    if not _candidate_matches_target_phrase(object_name, selected):
+        return False
+    if _is_nearly_whole_image_candidate(selected):
+        return False
+    selected_area = box_area(selected.get("box2d", [0, 0, 0, 0]))
+    best_area = max(1, box_area(best.get("box2d", [0, 0, 0, 0])))
+    return selected_area <= best_area * 8.0
+
+
 def validate_vlm_selection(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> Tuple[bool, Optional[str]]:
     if not candidates:
         return False, "no_candidates"
@@ -707,7 +748,10 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
             if not _relation_target_candidate_override(object_name, selected):
                 return False, "partial_entity_box"
         if selected_score < best_score and selected_area > best_area * 2.0:
-            if not (_attribute_target_candidate_override(object_name, selected) and selected_area <= best_area * 4.0):
+            if not (
+                (_attribute_target_candidate_override(object_name, selected) and selected_area <= best_area * 4.0)
+                or _large_object_complete_box_override(object_name, selected, candidates[0])
+            ):
                 return False, "entity_box_too_large"
     return True, None
 
@@ -835,6 +879,12 @@ def overlap_warnings(object_name: str, box2d: List[int], selected_boxes: Dict[st
             continue
         if overlap > 0.55 and (is_area_object(object_name) or is_area_object(selected_name)):
             warnings.append({"object": selected_name, "iou": float(overlap)})
+        elif overlap > 0.85 and not is_area_object(object_name) and not is_area_object(selected_name):
+            warnings.append({
+                "object": selected_name,
+                "iou": float(overlap),
+                "warning": "different_non_area_high_overlap",
+            })
     return warnings
 
 
