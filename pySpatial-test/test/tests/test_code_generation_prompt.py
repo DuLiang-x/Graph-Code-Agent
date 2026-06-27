@@ -82,9 +82,14 @@ def test_graph_api_prompt_documents_indexed_counting_nodes():
     assert "handle_1, handle_2" in api_specification
     assert "Count indexed instance nodes from graph.list_nodes()" in api_specification
     assert 'For "how many X" visual counting questions' in api_specification
-    assert 'name.startswith("handle_")' in api_specification
-    assert "Do not answer counting questions by checking only graph.get_node" in api_specification
-    assert "inspect graph.list_nodes() and count indexed same-category instance nodes" in code_generation_prompt
+    assert 'graph.nodes_with_prefix("handle_")' in api_specification
+    assert 'graph.count_prefix("handle_")' in api_specification
+    assert "Do not answer counting or same-category multi-instance questions" in api_specification
+    assert "count-ratio questions" in api_specification
+    assert "sink_1 and sink_2" in api_specification
+    assert "use graph.nodes_with_prefix(prefix) and graph.count_prefix(prefix)" in code_generation_prompt
+    assert "For count-ratio questions" in code_generation_prompt
+    assert "sink_1 and sink_2" in code_generation_prompt
     assert "Do not use a single aggregate node such as handles" in code_generation_prompt
 
 
@@ -178,6 +183,55 @@ def test_graph_examples_include_indexed_counting_pattern():
     from agent.prompt.template import example_problems
 
     assert "Example 13: counting indexed same-category instances" in example_problems
-    assert 'handles = [name for name in nodes if name.startswith("handle_")]' in example_problems
-    assert "answer = len(handles)" in example_problems
+    assert 'handles = graph.nodes_with_prefix("handle_")' in example_problems
+    assert 'answer = graph.count_prefix("handle_")' in example_problems
     assert '"counted_nodes": handles' in example_problems
+
+def test_graph_api_prompt_documents_minimal_geometry_helpers():
+    assert "graph.distance_to_camera(obj) -> float" in api_specification
+    assert "graph.closest_to_camera(candidates=None) -> str | None" in api_specification
+    assert "graph.furthest_from_camera(candidates=None) -> str | None" in api_specification
+    assert "graph.observer_from_object_to_camera(obj) -> Observer" in api_specification
+    assert "graph.volume(obj) -> float" in api_specification
+    assert "graph.screen_diagonal(obj) -> float" in api_specification
+    assert "graph.nodes_with_prefix(prefix) -> list[str]" in api_specification
+    assert "graph.count_prefix(prefix) -> int" in api_specification
+    assert "graph.footprint_overlap(a, b" in api_specification
+    assert "graph.vertical_clearance(upper, lower) -> float" in api_specification
+    assert "graph.would_collide_along_direction" in api_specification
+    assert "use graph.distance_to_camera(obj), graph.closest_to_camera(candidates), or graph.furthest_from_camera(candidates)" in api_specification
+    assert "use graph.observer_from_object_to_camera(X)" in api_specification
+    assert "use graph.volume(obj)" in api_specification
+    assert "use graph.screen_diagonal(obj)" in code_generation_prompt
+    assert "graph.distance_to_camera/closest_to_camera/furthest_from_camera" in code_generation_prompt
+    assert "graph.would_collide_along_direction or graph.footprint_overlap" in code_generation_prompt
+
+
+def test_graph_examples_use_minimal_geometry_helpers():
+    from agent.prompt.template import example_problems
+
+    assert "graph.screen_diagonal(tv)" in example_problems
+    assert 'graph.volume("bedside table")' in example_problems
+    assert "graph.closest_to_camera(candidates)" in example_problems
+    assert "graph.would_collide_along_direction" in example_problems
+    assert 'graph.count_prefix("handle_")' in example_problems
+
+def test_codeagent_prompt_documents_badcase_semantic_guards():
+    assert 'never call graph.distance(obj, "camera")' in code_generation_prompt
+    assert 'Do not call graph.observer_from_object("camera")' in code_generation_prompt
+    assert "do not use //, int(), round(), floor(), or ceil()" in code_generation_prompt
+    assert "use graph.screen_diagonal(obj); do not include depth" in code_generation_prompt
+    assert "return a needs_visual_* computed result" in code_generation_prompt
+    assert "do not decide from a single z/y threshold" in code_generation_prompt
+    assert "Do not use //, int(), round(), floor(), or ceil()" in api_specification
+    assert "does not include depth" in api_specification
+    assert "Return needs_visual_visibility_check" in api_specification
+    assert "needs_visual_clock_reading" in api_specification
+
+
+def test_answer_prompt_preserves_numeric_and_visual_fallback_format():
+    assert "keep the numeric value and do not round it to 0" in ANSWER_FORMAT_RULES
+    assert "needs_visual_*" in ANSWER_FORMAT_RULES
+    assert 'answer exactly "yes" or "no"' in ANSWER_FORMAT_RULES
+    assert "answer with a single numeric value" in ANSWER_FORMAT_RULES
+

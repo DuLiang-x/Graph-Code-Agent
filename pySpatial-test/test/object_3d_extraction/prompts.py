@@ -27,6 +27,8 @@ Numeric-measurement rules:
 - For known-size calibration questions, include both the object with the provided size and the object whose size is requested.
 - Preserve relation modifiers such as rightmost, leftmost, topmost, bottommost, under, above, or next to when they identify which instance is needed.
 - Preserve color and material attributes such as white, black, glass, wooden, or metal when they disambiguate the target object.
+- If the question says two X, both X, multiple X, all X, or combined height/width/length/depth/volume of two X, include the natural plural/category phrase so the pipeline can detect each instance separately.
+- Count-ratio questions such as "ratio of coasters to remotes" require all visible instances on both sides of the ratio; include both countable categories.
 
 # Example: height ratio with combined denominator
 [Question] What is the ratio of the height of the fireplace to the combined height of the coffee table and the sofa to the right of the coffee table?
@@ -35,6 +37,18 @@ Numeric-measurement rules:
 # Example: known-size calibration
 [Question] If the black table is 1.5m wide, how tall is the TV?
 [Detect] [black table, TV]
+
+# Example: two same-category numeric operands
+[Question] What is the combined width of the two sinks compared with the bathtub?
+[Detect] [sinks, bathtub]
+
+# Example: count-ratio numeric operands
+[Question] What is the ratio of coasters to black TV remotes?
+[Detect] [coasters, black TV remotes]
+
+# Example: combined volume of repeated objects
+[Question] How many objects with the combined volume of two bedside tables fit in the bed?
+[Detect] [bedside tables, bed]
 """,
     "yes_no": """
 Question type: yes/no relation, visibility, or collision.
@@ -102,6 +116,13 @@ Attribute distinction rule:
 - Do not merge "gray chair" and "black chair" into "chair".
 - Do not drop attributes such as gray, black, white, glass, wooden, translucent, transparent, clear, circular, round, or square when they identify the target instance.
 - If the question compares two attributed objects of the same category, include both attributed phrases separately.
+
+Badcase-guided object mention rules:
+- Do not output answer-format or math words as objects, such as decimal, sum, direction, square, format, greater, closer, furthest point, or can you fit.
+- Do not output color words alone, such as red, white, blue, or black, unless the question explicitly refers to visible color swatches or colored objects as physical candidates.
+- Keep TV and TV stand as different objects; do not replace TV stand with TV or merge them into one target.
+- If the question explicitly says two X, both X, multiple X, or combined size/volume of two X, keep the countable category in [Detect] so the pipeline can produce X_1, X_2, etc.
+- For generic surface counting such as objects stuck on a fridge, keep the counted small-object target and the reference surface; do not collapse the answer to only the fridge.
 
 # Example: camera perspective should not be detected as an object
 [Question] From the camera's perspective, is the chair on the left or right of the table?
@@ -180,6 +201,8 @@ Rules:
 - Do not replace "chair" with "stool".
 - Do not replace "bench", "sofa", "couch", "ottoman", or "seat" with "chair" unless the question itself uses that word.
 - Do not include relation words such as left, right, closer, farther, above, below, front, behind.
+- Do not include answer-format or math words such as decimal, sum, direction, square, format, closer, furthest point, or can you fit.
+- Do not include color words alone unless they are visible physical color swatches or colored candidate objects.
 - Do not include "camera" unless it is a visible physical camera object.
 
 [Question] {question}

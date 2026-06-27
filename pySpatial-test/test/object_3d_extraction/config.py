@@ -21,6 +21,8 @@ class GroundingDINOConfig:
     box_threshold: float = 0.05
     text_threshold: float = 0.05
     num_candidates: int = 5
+    count_max_instances: int = 20
+    count_candidate_multiplier: int = 4
     use_vlm_refinement: bool = False
 
 

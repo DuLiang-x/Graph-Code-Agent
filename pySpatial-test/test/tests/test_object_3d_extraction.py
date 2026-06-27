@@ -19,7 +19,7 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, maybe_fallback_mask, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, is_count_ratio_question, is_same_category_multi_instance_numeric, is_visual_count_target, maybe_fallback_mask, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
@@ -164,6 +164,51 @@ def test_count_question_expands_count_target_into_indexed_instances():
     assert "cabinets" in result and "position" in result["cabinets"]
 
 
+def test_count_question_can_return_more_than_num_candidates():
+    locator = make_locator(
+        {
+            "handles": [
+                {"box2d": [2 + idx * 5, 2, 5 + idx * 5, 5], "score": 0.95 - idx * 0.01}
+                for idx in range(8)
+            ],
+        }
+    )
+    locator.config.detection.num_candidates = 5
+    locator.config.detection.count_max_instances = 20
+    image = Image.new("RGB", (48, 12), color="white")
+
+    result = locator.extract(
+        image,
+        ["handles"],
+        question="How many handles are visible?",
+        question_type="numeric_ct",
+    )
+
+    expected_names = [f"handle_{idx}" for idx in range(1, 9)]
+    assert result["handles"]["counting_instances"] == expected_names
+    assert all(name in result for name in expected_names)
+
+
+def test_count_candidate_pool_uses_independent_limit():
+    detections = {
+        "handles": [
+            {"box2d": [2 + idx * 3, 2, 4 + idx * 3, 4], "score": 1.0 - idx * 0.01}
+            for idx in range(12)
+        ]
+    }
+    locator = make_locator(detections)
+    locator.config.detection.num_candidates = 5
+    locator.config.detection.count_max_instances = 20
+    locator.config.detection.count_candidate_multiplier = 4
+    image = Image.new("RGB", (48, 10), color="white")
+
+    normal_candidates = locator._collect_detection_candidates(image, "handles", ["handles"])
+    count_candidates = locator._collect_detection_candidates(image, "handles", ["handles"], is_count_target=True)
+
+    assert len(normal_candidates) == 5
+    assert len(count_candidates) == 12
+
+
 def test_non_count_question_keeps_single_target_node():
     locator = make_locator(
         {
@@ -180,6 +225,69 @@ def test_non_count_question_keeps_single_target_node():
     assert "handles" in result
     assert "handle_1" not in result
     assert "position" in result["handles"]
+
+
+def test_count_ratio_and_same_category_numeric_helpers():
+    assert is_count_ratio_question("What is the ratio of coasters to black TV remotes?")
+    assert not is_count_ratio_question("What is the ratio of the height of the fireplace to the sofa height?")
+    assert is_same_category_multi_instance_numeric("What is the combined width of the two sinks compared with the bathtub?", "sinks")
+    assert is_same_category_multi_instance_numeric("How many objects with the combined volume of two bedside tables fit in the bed?", "bedside tables")
+    assert not is_same_category_multi_instance_numeric("What is the height of the sink?", "sink")
+    assert is_visual_count_target("numeric_other", "What is the ratio of coasters to black TV remotes?", "coaster")
+    assert is_visual_count_target("numeric_other", "What is the combined width of the two sinks compared with the bathtub?", "sinks")
+
+
+def test_numeric_other_two_sinks_expands_into_indexed_instances():
+    locator = make_locator(
+        {
+            "sinks": [
+                {"box2d": [2, 2, 8, 8], "score": 0.90},
+                {"box2d": [14, 2, 20, 8], "score": 0.88},
+            ],
+            "bathtub": [
+                {"box2d": [4, 10, 22, 18], "score": 0.80},
+            ],
+        }
+    )
+    image = Image.new("RGB", (32, 24), color="white")
+
+    result = locator.extract(
+        image,
+        ["sinks", "bathtub"],
+        question="What is the combined width of the two sinks compared with the bathtub?",
+        question_type="numeric_other",
+    )
+
+    assert result["sinks"]["counting_target"] is True
+    assert result["sinks"]["counting_instances"] == ["sink_1", "sink_2"]
+    assert all(name in result for name in ["sink_1", "sink_2"])
+    assert "position" in result["bathtub"]
+
+
+def test_count_ratio_expands_both_sides_into_indexed_instances():
+    locator = make_locator(
+        {
+            "coasters": [
+                {"box2d": [2, 2, 5, 5], "score": 0.90},
+                {"box2d": [7, 2, 10, 5], "score": 0.88},
+            ],
+            "black tv remotes": [
+                {"box2d": [14, 2, 20, 5], "score": 0.87},
+            ],
+        }
+    )
+    image = Image.new("RGB", (32, 16), color="white")
+
+    result = locator.extract(
+        image,
+        ["coasters", "black tv remotes"],
+        question="What is the ratio of coasters to black TV remotes?",
+        question_type="numeric_other",
+    )
+
+    assert result["coasters"]["counting_instances"] == ["coaster_1", "coaster_2"]
+    assert result["black tv remotes"]["counting_instances"] == ["tv_remote_1"]
+    assert all(name in result for name in ["coaster_1", "coaster_2", "tv_remote_1"])
 
 
 def test_success_records_sam_mask_usage_fields():
@@ -758,6 +866,9 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert content[1]["type"] == "image"
     assert content[2]["type"] == "text"
     prompt = content[2]["text"]
+    assert "Candidate metadata table:" in prompt
+    assert "index | prompt | box2d | center | area_ratio | dino_score | rank_score | rank_reasons" in prompt
+    assert "Coordinate hint: larger x means farther right" in prompt
     assert "Candidate 0 is the rule-ranked best candidate, but you may choose another candidate if it better matches the exact target object category and question context." in prompt
     assert "not just the most visually obvious object of the category" in prompt
     assert "Target object phrase:" in prompt
@@ -792,6 +903,12 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert "not a black plastic table or ordinary dark table" in prompt
     assert "Treat shape words such as circular, round, square, rectangular, and oval" in prompt
     assert 'For "circular table" or "round table", choose the round/circular table' in prompt
+    assert 'For "gray chair" vs "black chair", choose the chair matching the requested color' in prompt
+    assert 'For "polka-dot", "striped", "solid", "translucent", "glass", "circular", or "round" targets, the attribute is mandatory.' in prompt
+    assert "TV and TV stand are different targets" in prompt
+    assert "two sinks" in prompt
+    assert "count-ratio targets" in prompt
+    assert "Do not select answer words or non-object fragments" in prompt
     assert "Return only one integer index" in prompt
     assert "return INVALID" in prompt
 
@@ -857,6 +974,32 @@ def test_vlm_selection_rejects_reference_object_for_relation_target():
     assert allowed is False
     assert reject_reason == "reference_object_selected"
 
+
+
+
+def test_vlm_selection_rejects_wrong_color_when_attribute_candidate_exists():
+    candidates = [
+        {"box2d": [0, 0, 20, 20], "score": 0.80, "rank_score": 0.90, "prompt": "black chair"},
+        {"box2d": [30, 0, 50, 20], "score": 0.75, "rank_score": 0.88, "prompt": "gray chair"},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("black chair", candidates[1], candidates)
+
+    assert allowed is False
+    assert reject_reason == "attribute_mismatch"
+
+
+def test_vlm_selection_rejects_tv_for_tv_stand_and_stand_for_tv():
+    tv_for_stand = {"box2d": [0, 0, 40, 25], "score": 0.90, "rank_score": 0.95, "prompt": "tv"}
+    stand_for_tv = {"box2d": [0, 25, 40, 45], "score": 0.90, "rank_score": 0.95, "prompt": "tv stand"}
+
+    allowed, reject_reason = validate_vlm_selection("tv stand", tv_for_stand, [stand_for_tv, tv_for_stand])
+    assert allowed is False
+    assert reject_reason == "tv_tv_stand_mismatch"
+
+    allowed, reject_reason = validate_vlm_selection("tv", stand_for_tv, [tv_for_stand, stand_for_tv])
+    assert allowed is False
+    assert reject_reason == "tv_tv_stand_mismatch"
 
 def test_vlm_selection_accepts_larger_translucent_cube_attribute_candidate():
     candidates = [
@@ -1066,6 +1209,9 @@ def test_object_extraction_prompt_has_question_type_rules():
     assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "Question type: numeric measurement or ratio" in QUESTION_TYPE_RULES["numeric_other"]
     assert "combined height" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "two sinks" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "ratio of coasters to black TV remotes" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "bedside tables" in QUESTION_TYPE_RULES["numeric_other"]
     assert "Question type: yes/no" in QUESTION_TYPE_RULES["yes_no"]
     assert "visibility" in QUESTION_TYPE_RULES["yes_no"]
     assert "Question type: object choice" in QUESTION_TYPE_RULES["choice_object"]
@@ -1080,6 +1226,9 @@ def test_object_extraction_prompt_documents_attribute_distinction_rule():
     assert "black chair" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "[Detect] [gray chair, table, black chair]" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "translucent cube" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "Badcase-guided object mention rules" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "TV and TV stand" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "decimal, sum, direction" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Do not merge same-category attributed objects" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
     assert "Keep transparency phrases" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX
 

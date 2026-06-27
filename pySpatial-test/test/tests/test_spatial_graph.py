@@ -143,3 +143,116 @@ def test_spatial_graph_length_rejects_unknown_axis():
     with pytest.raises(ValueError):
         graph.length("left", axis="diagonal")
 
+def test_spatial_graph_camera_helpers():
+    graph = SpatialGraph({
+        "chair_1": {
+            "position": [0.0, 0.0, -2.0],
+            "box3d_center": [0.0, 0.0, -2.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [-0.5, -0.5, -2.5],
+            "box3d_max": [0.5, 0.5, -1.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+        "chair_2": {
+            "position": [0.0, 0.0, -5.0],
+            "box3d_center": [0.0, 0.0, -5.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [-0.5, -0.5, -5.5],
+            "box3d_max": [0.5, 0.5, -4.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+    })
+
+    assert graph.distance_to_camera("chair_1") == 2.0
+    assert graph.closest_to_camera(["chair_1", "chair_2"]) == "chair_1"
+    assert graph.furthest_from_camera(["chair_1", "chair_2"]) == "chair_2"
+    observer = graph.observer_from_object_to_camera("chair_1")
+    _, _, forward = observer.axes()
+    assert np.allclose(forward, [0.0, 0.0, 1.0])
+
+
+def test_spatial_graph_numeric_and_count_helpers():
+    graph = SpatialGraph({
+        "tv": {
+            "position": [0.0, 0.0, -3.0],
+            "box3d_center": [0.0, 0.0, -3.0],
+            "box3d_size": [3.0, 4.0, 12.0],
+            "box3d_min": [-1.5, -2.0, -9.0],
+            "box3d_max": [1.5, 2.0, 3.0],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+        "handle_1": {
+            "position": [1.0, 0.0, -3.0],
+            "box3d_center": [1.0, 0.0, -3.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [0.5, -0.5, -3.5],
+            "box3d_max": [1.5, 0.5, -2.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+        "handle_2": {
+            "position": [2.0, 0.0, -3.0],
+            "box3d_center": [2.0, 0.0, -3.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [1.5, -0.5, -3.5],
+            "box3d_max": [2.5, 0.5, -2.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+    })
+
+    assert graph.screen_diagonal("tv") == 5.0
+    assert graph.volume("tv") == 144.0
+    assert graph.nodes_with_prefix("handle_") == ["handle_1", "handle_2"]
+    assert graph.count_prefix("handle_") == 2
+
+
+def test_spatial_graph_overlap_clearance_and_collision_helpers():
+    graph = SpatialGraph({
+        "moving": {
+            "position": [0.0, 1.0, 0.0],
+            "box3d_center": [0.0, 1.0, 0.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [-0.5, 0.5, -0.5],
+            "box3d_max": [0.5, 1.5, 0.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+        "target": {
+            "position": [0.0, 1.0, -3.0],
+            "box3d_center": [0.0, 1.0, -3.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [-0.5, 0.5, -3.5],
+            "box3d_max": [0.5, 1.5, -2.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+        "overlap": {
+            "position": [0.0, 1.0, 0.0],
+            "box3d_center": [0.0, 1.0, 0.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [-0.5, 0.5, -0.5],
+            "box3d_max": [0.5, 1.5, 0.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+        "side": {
+            "position": [3.0, 1.0, -3.0],
+            "box3d_center": [3.0, 1.0, -3.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [2.5, 0.5, -3.5],
+            "box3d_max": [3.5, 1.5, -2.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+        "upper": {
+            "position": [0.0, 3.0, 0.0],
+            "box3d_center": [0.0, 3.0, 0.0],
+            "box3d_size": [1.0, 1.0, 1.0],
+            "box3d_min": [-0.5, 2.5, -0.5],
+            "box3d_max": [0.5, 3.5, 0.5],
+            "orientation": [0.0, 0.0, -1.0],
+        },
+    })
+
+    assert graph.footprint_overlap("moving", "overlap")
+    assert not graph.footprint_overlap("moving", "side")
+    assert graph.vertical_clearance("upper", "moving") == 1.0
+    assert graph.would_collide_along_direction("moving", "target", [0.0, 0.0, -1.0])
+    assert not graph.would_collide_along_direction("moving", "side", [0.0, 0.0, -1.0])
+    assert not graph.would_collide_along_direction("moving", "target", [0.0, 0.0, 1.0])
+

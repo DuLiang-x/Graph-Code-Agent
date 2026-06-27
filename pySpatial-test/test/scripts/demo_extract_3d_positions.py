@@ -154,6 +154,7 @@ class ObjectExtractionRunner:
         api_key: str = None,
         base_url: str = None,
         use_vlm_object_extraction: bool = True,
+        count_max_instances: int = 20,
     ):
         print("Initializing reusable object extractor...")
         self.device = device
@@ -167,6 +168,7 @@ class ObjectExtractionRunner:
             text_threshold=0.05,
             use_vlm_refinement=use_vlm_refinement,
             use_vlm_object_extraction=use_vlm_object_extraction,
+            count_max_instances=count_max_instances,
             vlm_model_path=vlm_model_path,
             mask_fallback=mask_fallback,
         )
@@ -174,6 +176,7 @@ class ObjectExtractionRunner:
         config.detection.box_threshold = self.args.box_threshold
         config.detection.text_threshold = self.args.text_threshold
         config.detection.use_vlm_refinement = use_vlm_refinement
+        config.detection.count_max_instances = count_max_instances
         config.mask_fallback_mode = mask_fallback
 
         if vlm_model is None and (use_vlm_refinement or use_vlm_object_extraction):
@@ -361,6 +364,12 @@ def parse_args() -> argparse.Namespace:
         help="Root directory for per-sample JSON outputs and debug visualizations.",
     )
     parser.add_argument("--no_visualize", action="store_true", help="Disable debug visualization output.")
+    parser.add_argument(
+        "--count_max_instances",
+        type=int,
+        default=20,
+        help="Maximum number of indexed instances to keep for counting/count-ratio targets.",
+    )
     return parser.parse_args()
 
 
@@ -687,6 +696,7 @@ def main() -> None:
     config.detection.box_threshold = args.box_threshold
     config.detection.text_threshold = args.text_threshold
     config.detection.use_vlm_refinement = args.use_vlm_refinement
+    config.detection.count_max_instances = args.count_max_instances
     config.mask_fallback_mode = args.mask_fallback
     vlm_model = build_vlm_refinement_model(args)
     locator = Object3DLocator(config=config, device=args.device, vlm_model=vlm_model)

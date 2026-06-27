@@ -77,10 +77,28 @@ def test_spatial_answer_accepts_open_form_answers():
 
 def test_local_qwen_parse_keeps_non_choice_answer():
     parsed = parse_spatial_answer_text('{"reasoning": "ratio", "answer": "0.948"}')
+    assert parsed.reasoning == "ratio"
     assert parsed.answer == "0.948"
 
     parsed_text = parse_spatial_answer_text("yes")
     assert parsed_text.answer == "yes"
+
+
+def test_local_qwen_parse_fenced_json_answer():
+    parsed = parse_spatial_answer_text('```json\n{\n  "reasoning": "The reference is 2m long, then the computed final value is used.",\n  "answer": 2.2763279048419025\n}\n```')
+
+    assert parsed.reasoning == "The reference is 2m long, then the computed final value is used."
+    assert parsed.answer == "2.2763279048419025"
+    assert compute_numeric_relative_error(parsed.answer, 3.026) == compute_numeric_relative_error("2.2763279048419025", 3.026)
+    assert compute_numeric_relative_error(parsed.answer, 3.026) != compute_numeric_relative_error("2m", 3.026)
+
+
+def test_local_qwen_parse_embedded_json_answer():
+    parsed = parse_spatial_answer_text('Here is the result: {"reasoning": "computed", "answer": "yes"}')
+
+    assert parsed.reasoning == "computed"
+    assert parsed.answer == "yes"
+    assert evaluate_answer_correctness(parsed.answer, "yes", "str")
 
 
 def test_omni3d_float_and_string_evaluation():

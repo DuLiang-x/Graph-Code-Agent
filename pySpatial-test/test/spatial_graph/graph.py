@@ -110,6 +110,21 @@ def _normalize_node_name(name: str) -> str:
     return " ".join(str(name).replace("_", " ").replace("-", " ").split()).lower()
 
 
+def _axis_index(axis) -> int:
+    if isinstance(axis, int):
+        if axis not in (0, 1, 2):
+            raise ValueError("axis index must be 0, 1, or 2")
+        return axis
+    axis_name = str(axis).lower()
+    if axis_name in ("x", "width", "image_x"):
+        return 0
+    if axis_name in ("y", "height", "vertical"):
+        return 1
+    if axis_name in ("z", "depth", "depth_z"):
+        return 2
+    raise ValueError("axis must be x, y, z, or index 0/1/2")
+
+
 class SpatialGraph:
     def __init__(self, nodes: Optional[Union[Dict[str, dict], Iterable[SpatialNode]]] = None):
         self.nodes: Dict[str, SpatialNode] = {}
@@ -157,8 +172,34 @@ class SpatialGraph:
     def observer_from_to(self, from_obj: str, to_obj: str):
         return Observer.from_object_toward(self.get_node(from_obj), self.get_node(to_obj))
 
+    def observer_from_object_to_camera(self, obj: NodeRef):
+        return Observer(position=self.get_node(obj).position, look_at=np.zeros(3))
+
     def distance(self, a: NodeRef, b: NodeRef) -> float:
         return float(np.linalg.norm(self.get_node(a).position - self.get_node(b).position))
+
+    def distance_to_camera(self, obj: NodeRef) -> float:
+        return float(np.linalg.norm(self.get_node(obj).position - self.observer_from_camera().position))
+
+    def closest_to_camera(self, candidates: Optional[Sequence[NodeRef]] = None):
+        names = self._candidate_names(candidates)
+        if not names:
+            return None
+        return min(names, key=self.distance_to_camera)
+
+    def furthest_from_camera(self, candidates: Optional[Sequence[NodeRef]] = None):
+        names = self._candidate_names(candidates)
+        if not names:
+            return None
+        return max(names, key=self.distance_to_camera)
+
+    def _candidate_names(self, candidates: Optional[Sequence[NodeRef]] = None) -> List[str]:
+        if candidates is None:
+            return self.list_nodes()
+        names = []
+        for candidate in candidates:
+            names.append(self.get_node(candidate).name)
+        return names
 
     def is_above(self, a: NodeRef, b: NodeRef, tolerance: float = 0.0) -> bool:
         return bool(self.get_node(a).position[1] > self.get_node(b).position[1] + tolerance)
@@ -198,6 +239,13 @@ class SpatialGraph:
     def depth(self, obj: NodeRef) -> float:
         return float(self.get_node(obj).box3d_size[2])
 
+    def volume(self, obj: NodeRef) -> float:
+        return float(np.prod(np.maximum(self.get_node(obj).box3d_size, 0.0)))
+
+    def screen_diagonal(self, obj: NodeRef) -> float:
+        node = self.get_node(obj)
+        return float(np.sqrt(node.box3d_size[0] ** 2 + node.box3d_size[1] ** 2))
+
     def length(self, obj: NodeRef, axis: str = "auto") -> float:
         node = self.get_node(obj)
         if axis in ("x", "width", "image_x"):
@@ -213,6 +261,43 @@ class SpatialGraph:
         if abs(denominator) < eps:
             return float("inf")
         return float(numerator) / denominator
+
+    def nodes_with_prefix(self, prefix: str) -> List[str]:
+        return [name for name in self.list_nodes() if name.startswith(str(prefix))]
+
+    def count_prefix(self, prefix: str) -> int:
+        return len(self.nodes_with_prefix(prefix))
+
+    def footprint_overlap(self, a: NodeRef, b: NodeRef, axes=("x", "z")) -> bool:
+        node_a = self.get_node(a)
+        node_b = self.get_node(b)
+        for axis in axes:
+            idx = _axis_index(axis)
+            if node_a.box3d_max[idx] < node_b.box3d_min[idx] or node_a.box3d_min[idx] > node_b.box3d_max[idx]:
+                return False
+        return True
+
+    def vertical_clearance(self, upper: NodeRef, lower: NodeRef) -> float:
+        upper_node = self.get_node(upper)
+        lower_node = self.get_node(lower)
+        return float(upper_node.box3d_min[1] - lower_node.box3d_max[1])
+
+    def would_collide_along_direction(self, moving: NodeRef, target: NodeRef, direction, max_distance=None) -> bool:
+        moving_node = self.get_node(moving)
+        target_node = self.get_node(target)
+        direction_vec = _normalize(direction)
+        delta = target_node.box3d_center - moving_node.box3d_center
+        forward_distance = float(np.dot(delta, direction_vec))
+        if forward_distance < 0:
+            return False
+        if max_distance is not None and forward_distance > float(max_distance):
+            return False
+        travel = float(max_distance) if max_distance is not None else forward_distance
+        moved_min = moving_node.box3d_min + direction_vec * travel
+        moved_max = moving_node.box3d_max + direction_vec * travel
+        swept_min = np.minimum(moving_node.box3d_min, moved_min)
+        swept_max = np.maximum(moving_node.box3d_max, moved_max)
+        return bool(np.all(swept_max >= target_node.box3d_min) and np.all(swept_min <= target_node.box3d_max))
 
     def compare_height(self, a: NodeRef, b: NodeRef) -> float:
         return float(self.get_node(a).box3d_size[1] - self.get_node(b).box3d_size[1])

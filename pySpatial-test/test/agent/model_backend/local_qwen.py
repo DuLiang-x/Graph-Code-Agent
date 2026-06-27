@@ -102,19 +102,39 @@ def answer_with_local_qwen(messages, model_path: str = DEFAULT_LOCAL_QWEN_MODEL_
     return client.process_messages(qwen_messages, max_new_tokens=max_new_tokens)
 
 
+def _extract_json_object_text(text: str) -> Optional[str]:
+    value = str(text or "").strip()
+    if not value:
+        return None
+
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", value, re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    start = value.find("{")
+    end = value.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return value[start:end + 1].strip()
+    return value
+
+
 def parse_spatial_answer_text(text: str):
     from agent.anwer import SpatialAnswer
 
-    try:
-        data = json.loads(text)
-        return SpatialAnswer(
-            reasoning=str(data.get("reasoning", "")),
-            answer=str(data.get("answer", "")).strip(),
-        )
-    except Exception:
-        pass
+    for candidate in (str(text or "").strip(), _extract_json_object_text(text)):
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and ("answer" in data or "reasoning" in data):
+                return SpatialAnswer(
+                    reasoning=str(data.get("reasoning", "")),
+                    answer=str(data.get("answer", "")).strip(),
+                )
+        except Exception:
+            pass
 
-    return SpatialAnswer(reasoning=text.strip(), answer=text.strip())
+    return SpatialAnswer(reasoning=str(text or "").strip(), answer=str(text or "").strip())
 
 
 def _to_qwen_messages(messages):
