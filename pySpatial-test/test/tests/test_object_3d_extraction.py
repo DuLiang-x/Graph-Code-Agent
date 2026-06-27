@@ -19,7 +19,7 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, is_count_ratio_question, is_same_category_multi_instance_numeric, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, is_count_ratio_question, is_same_category_multi_instance_numeric, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
@@ -225,6 +225,70 @@ def test_count_question_expands_count_target_into_indexed_instances():
     assert "cabinets" in result and "position" in result["cabinets"]
 
 
+def test_count_filter_rejects_group_box_containing_multiple_handles():
+    candidates = [
+        {"candidate_index": 0, "box2d": [0, 0, 100, 30], "score": 0.95, "rank_score": 0.95},
+        {"candidate_index": 1, "box2d": [5, 5, 15, 15], "score": 0.80, "rank_score": 0.80},
+        {"candidate_index": 2, "box2d": [25, 5, 35, 15], "score": 0.79, "rank_score": 0.79},
+        {"candidate_index": 3, "box2d": [45, 5, 55, 15], "score": 0.78, "rank_score": 0.78},
+        {"candidate_index": 4, "box2d": [65, 5, 75, 15], "score": 0.77, "rank_score": 0.77},
+    ]
+
+    selected, debug = filter_count_instance_candidates(candidates, max_instances=20, image_size=(120, 40))
+
+    assert [item["candidate_index"] for item in selected] == [1, 2, 3, 4]
+    assert any(item["candidate_index"] == 0 and item["reject_reason"] == "group_box_contains_instances" for item in debug["rejected_candidates"])
+
+
+def test_count_filter_rejects_containing_post_it_region_when_tight_note_exists():
+    candidates = [
+        {"candidate_index": 0, "box2d": [0, 0, 100, 100], "score": 0.95, "rank_score": 0.95},
+        {"candidate_index": 1, "box2d": [10, 10, 40, 40], "score": 0.80, "rank_score": 0.80},
+    ]
+
+    selected, debug = filter_count_instance_candidates(candidates, max_instances=20, image_size=(120, 120))
+
+    assert [item["candidate_index"] for item in selected] == [1]
+    assert any(item["candidate_index"] == 0 and item["reject_reason"] == "contained_by_tighter_box" for item in debug["rejected_candidates"])
+
+
+def test_count_filter_rejects_high_iou_duplicate():
+    candidates = [
+        {"candidate_index": 0, "box2d": [10, 10, 30, 30], "score": 0.95, "rank_score": 0.95},
+        {"candidate_index": 1, "box2d": [11, 11, 31, 31], "score": 0.90, "rank_score": 0.90},
+    ]
+
+    selected, debug = filter_count_instance_candidates(candidates, max_instances=20, image_size=(100, 100))
+
+    assert [item["candidate_index"] for item in selected] == [0]
+    assert any(item["candidate_index"] == 1 and item["reject_reason"] == "duplicate_or_center_close" for item in debug["rejected_candidates"])
+
+
+def test_count_filter_rejects_center_close_duplicate_with_low_iou():
+    candidates = [
+        {"candidate_index": 0, "box2d": [10, 10, 30, 30], "score": 0.95, "rank_score": 0.95},
+        {"candidate_index": 1, "box2d": [8, 12, 28, 32], "score": 0.90, "rank_score": 0.90},
+    ]
+
+    selected, debug = filter_count_instance_candidates(candidates, max_instances=20, image_size=(100, 100))
+
+    assert [item["candidate_index"] for item in selected] == [0]
+    assert any(item["candidate_index"] == 1 and item["reject_reason"] == "duplicate_or_center_close" for item in debug["rejected_candidates"])
+
+
+def test_count_filter_keeps_max_twenty_independent_instances():
+    candidates = [
+        {"candidate_index": idx, "box2d": [idx * 5, 0, idx * 5 + 3, 3], "score": 1.0 - idx * 0.005, "rank_score": 1.0 - idx * 0.005}
+        for idx in range(25)
+    ]
+
+    selected, debug = filter_count_instance_candidates(candidates, max_instances=20, image_size=(200, 20))
+
+    assert len(selected) == 20
+    assert [item["candidate_index"] for item in selected] == list(range(20))
+    assert any(item["candidate_index"] == 20 and item["reject_reason"] == "max_instances_limit" for item in debug["rejected_candidates"])
+
+
 def test_count_question_can_return_more_than_num_candidates():
     locator = make_locator(
         {
@@ -247,6 +311,8 @@ def test_count_question_can_return_more_than_num_candidates():
 
     expected_names = [f"handle_{idx}" for idx in range(1, 9)]
     assert result["handles"]["counting_instances"] == expected_names
+    assert result["handles"]["counting_filter_summary"]["selected_count"] == 8
+    assert "counting_rejected_candidates" in result["handles"]
     assert all(name in result for name in expected_names)
 
 
@@ -751,6 +817,48 @@ def test_rule_ranker_selects_rightmost_candidate_when_quality_is_reasonable():
     assert selected["box2d"] == [70, 10, 95, 40]
 
 
+def test_bed_sofa_couch_ranker_prefers_complete_centered_sofa_over_edge_partial():
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [0, 40, 18, 70], "score": 0.78, "prompt": "sofa"},
+        {"box2d": [20, 20, 85, 85], "score": 0.55, "prompt": "sofa"},
+    ]
+
+    selected = rank_detection_candidates(image, "sofa", candidates, {})
+
+    assert selected["box2d"] == [20, 20, 85, 85]
+    assert "bed_sofa_area_bonus" in selected["rank_reasons"]
+    assert "bed_sofa_center_bonus" in selected["rank_reasons"]
+    assert "bed_sofa_complete_bonus" in selected["rank_reasons"]
+
+
+@pytest.mark.parametrize("target", ["bed", "couch"])
+def test_bed_sofa_couch_ranker_prefers_complete_centered_main_body(target):
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [0, 40, 18, 70], "score": 0.78, "prompt": target},
+        {"box2d": [20, 20, 85, 85], "score": 0.55, "prompt": target},
+    ]
+
+    selected = rank_detection_candidates(image, target, candidates, {})
+
+    assert selected["box2d"] == [20, 20, 85, 85]
+    assert "bed_sofa_complete_bonus" in selected["rank_reasons"]
+
+
+def test_bed_sofa_couch_complete_body_rule_does_not_apply_to_chair():
+    image = Image.new("RGB", (100, 100), color="white")
+    candidates = [
+        {"box2d": [0, 40, 18, 70], "score": 0.78, "prompt": "chair"},
+        {"box2d": [20, 20, 85, 85], "score": 0.55, "prompt": "chair"},
+    ]
+
+    selected = rank_detection_candidates(image, "chair", candidates, {})
+
+    assert selected["box2d"] == [0, 40, 18, 70]
+    assert not any(reason.startswith("bed_sofa_") for reason in selected["rank_reasons"])
+
+
 def test_leftmost_relation_keeps_extreme_large_chair_candidate():
     image = Image.new("RGB", (100, 100), color="white")
     candidates = [
@@ -957,6 +1065,9 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert "Object-specific rules:" in prompt
     assert "avoid boxes that include large carpet/floor/background regions or multiple objects" in prompt
     assert "avoid partial boxes that only cover the top, seat, backrest, leg, or one component" in prompt
+    assert "For bed, sofa, and couch targets, prefer the complete visible main body" in prompt
+    assert "armrest, cushion, seat patch, bed corner, headboard fragment" in prompt
+    assert "explicit position words such as leftmost, rightmost, topmost, bottommost, under, next to, or right of override the center preference" in prompt
     assert "prefer the large low horizontal floor-covering region" in prompt
     assert "Similar-object rules:" in prompt
     assert "chair, stool, bench, sofa, couch, ottoman, and seat" in prompt
@@ -1108,6 +1219,31 @@ def test_vlm_selection_accepts_complete_large_sofa_candidate():
 
     assert allowed is True
     assert reject_reason is None
+
+
+@pytest.mark.parametrize("target", ["bed", "couch"])
+def test_vlm_selection_accepts_complete_large_bed_or_couch_candidate(target):
+    candidates = [
+        {"box2d": [100, 80, 190, 120], "score": 0.20, "rank_score": 0.70, "prompt": target},
+        {"box2d": [95, 20, 195, 125], "score": 0.80, "rank_score": 0.60, "prompt": target},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection(target, candidates[1], candidates)
+
+    assert allowed is True
+    assert reject_reason is None
+
+
+def test_vlm_selection_rejects_large_table_candidate_because_bed_sofa_rule_is_limited():
+    candidates = [
+        {"box2d": [20, 20, 50, 50], "score": 0.70, "rank_score": 0.90, "prompt": "table"},
+        {"box2d": [0, 10, 95, 80], "score": 0.60, "rank_score": 0.75, "prompt": "table"},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("table", candidates[1], candidates)
+
+    assert allowed is False
+    assert reject_reason == "entity_box_too_large"
 
 
 def test_vlm_selection_still_rejects_nearly_whole_image_table_candidate():

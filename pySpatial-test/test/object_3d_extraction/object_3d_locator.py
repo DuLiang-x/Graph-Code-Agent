@@ -74,7 +74,7 @@ class Object3DLocator:
                     continue
 
                 if count_target:
-                    instance_results, instance_names, depth = self._extract_count_instances(
+                    instance_results, instance_names, depth, filter_debug = self._extract_count_instances(
                         image_pil=image_pil,
                         object_name=object_name,
                         candidates=candidates,
@@ -88,6 +88,8 @@ class Object3DLocator:
                         "counting_target": True,
                         "counting_instances": instance_names,
                         "counting_instance_count": len(instance_names),
+                        "counting_filter_summary": filter_debug.get("summary"),
+                        "counting_rejected_candidates": filter_debug.get("rejected_candidates", []),
                         "prompts_tried": prompts_tried,
                         "candidates_considered": summarize_candidates(candidates),
                     }
@@ -261,12 +263,13 @@ class Object3DLocator:
         depth,
         visualize: bool,
         save_dir: Optional[Union[str, Path]],
-    ) -> Tuple[Dict[str, Dict[str, object]], List[str], Any]:
+    ) -> Tuple[Dict[str, Dict[str, object]], List[str], Any, Dict[str, object]]:
         instances = {}  # type: Dict[str, Dict[str, object]]
         instance_names = []  # type: List[str]
-        selected_candidates = select_count_instance_candidates(
+        selected_candidates, filter_debug = filter_count_instance_candidates(
             candidates,
             max_instances=max(1, self.config.detection.count_max_instances),
+            image_size=image_pil.size,
         )
 
         for idx, detection in enumerate(selected_candidates, start=1):
@@ -350,7 +353,7 @@ class Object3DLocator:
                     mask_used_for_3d=mask_used_for_3d,
                 )
 
-        return instances, instance_names, depth
+        return instances, instance_names, depth, filter_debug
 
 
     def _select_detection(
@@ -549,12 +552,25 @@ def score_detection_candidate(
             score -= 0.25
             reasons.append("vertical_area_penalty")
     else:
+        bed_sofa_couch_target = is_bed_sofa_couch_target(object_name)
         if area_ratio > 0.22:
-            score -= 1.5 * area_ratio
-            reasons.append("large_entity_penalty")
+            if bed_sofa_couch_target:
+                score -= 0.35 * area_ratio
+                reasons.append("bed_sofa_large_entity_softened")
+            else:
+                score -= 1.5 * area_ratio
+                reasons.append("large_entity_penalty")
         if width_ratio > 0.65 or height_ratio > 0.70:
-            score -= 0.35
-            reasons.append("broad_entity_penalty")
+            if bed_sofa_couch_target:
+                score -= 0.10
+                reasons.append("bed_sofa_broad_entity_softened")
+            else:
+                score -= 0.35
+                reasons.append("broad_entity_penalty")
+        if bed_sofa_couch_target:
+            furniture_bonus, furniture_reasons = bed_sofa_couch_candidate_score(box, image_pil.size)
+            score += furniture_bonus
+            reasons.extend(furniture_reasons)
         if area_ratio < 0.002:
             score -= 0.15
             reasons.append("tiny_entity_penalty")
@@ -619,6 +635,9 @@ Selection rules:
 Object-specific rules:
 - For entity objects such as white coffee table, black table, cabinet, chair, sofa, bed, plant, person, or car, avoid boxes that include large carpet/floor/background regions or multiple objects.
 - For complete objects such as cabinet, table, sofa, bed, or chair, prefer the full visible object and avoid partial boxes that only cover the top, seat, backrest, leg, or one component.
+- For bed, sofa, and couch targets, prefer the complete visible main body. A reasonably larger and more central complete box is usually better than an edge partial box.
+- For bed, sofa, and couch targets, do not choose boxes that only cover an armrest, cushion, seat patch, bed corner, headboard fragment, or edge-truncated part.
+- For bed, sofa, and couch targets, explicit position words such as leftmost, rightmost, topmost, bottommost, under, next to, or right of override the center preference.
 - For carpet/rug/floor, prefer the large low horizontal floor-covering region and do not choose fireplace platforms, tabletops, beds, sofas, or other flat surfaces.
 - For entity objects, avoid overly large boxes that mostly cover floor/carpet/background.
 
@@ -654,6 +673,8 @@ Omnitest2 badcase-guided rules:
 - Do not select answer words or non-object fragments such as decimal, sum, direction, square, format, closer, furthest point, or can you fit.
 - Do not select a color word by itself unless the candidate is a physical object described by that color.
 - For books, letters, handles, lights, shelves, stickers, notes, placemats, grates, empty squares, and similar small count targets, prefer tight single-instance boxes over large group/container boxes.
+- For counting, do not treat a box that contains multiple visible instances as one instance; reject group boxes, container boxes, and duplicate boxes.
+- For post-it notes, handles, letters, and lightbulbs, prefer each single visible object with a tight box and reject large regions that contain several targets.
 
 Relation modifier rules:
 - Treat words such as rightmost, leftmost, topmost, and bottommost as part of the target object phrase, not as optional context.
@@ -704,6 +725,54 @@ def _is_large_object_target(object_name: str) -> bool:
     return any(term in words or term + "s" in words for term in LARGE_OBJECT_TERMS)
 
 
+BED_SOFA_COUCH_TERMS = {"bed", "sofa", "couch"}
+
+
+def is_bed_sofa_couch_target(object_name: str) -> bool:
+    target = parse_object_relation_context(object_name).get("target_phrase", object_name).lower()
+    if is_area_object(target):
+        return False
+    words = set(re.findall(r"[a-z]+", target))
+    return any(term in words or term + "s" in words for term in BED_SOFA_COUCH_TERMS)
+
+
+def bed_sofa_couch_candidate_score(box: List[int], image_size: Tuple[int, int]) -> Tuple[float, List[str]]:
+    width, height = image_size
+    image_area = float(max(1, width * height))
+    area_ratio = box_area(box) / image_area
+    box_w = max(0, int(box[2]) - int(box[0]))
+    box_h = max(0, int(box[3]) - int(box[1]))
+    width_ratio = box_w / float(max(1, width))
+    height_ratio = box_h / float(max(1, height))
+    cx, cy = box_center(box)
+    center_dx = abs(cx - width / 2.0) / float(max(1.0, width / 2.0))
+    center_dy = abs(cy - height / 2.0) / float(max(1.0, height / 2.0))
+    centrality = max(0.0, 1.0 - (center_dx + center_dy) / 2.0)
+
+    score = 0.0
+    reasons: List[str] = []
+    if 0.06 <= area_ratio <= 0.65:
+        score += min(0.28, area_ratio * 0.70)
+        reasons.append("bed_sofa_area_bonus")
+    if centrality >= 0.45:
+        score += 0.18 * centrality
+        reasons.append("bed_sofa_center_bonus")
+    if width_ratio >= 0.30 and height_ratio >= 0.20 and area_ratio >= 0.08:
+        score += 0.18
+        reasons.append("bed_sofa_complete_bonus")
+    if area_ratio < 0.05:
+        score -= 0.25
+        reasons.append("bed_sofa_partial_penalty")
+    if cx < width * 0.12 or cx > width * 0.88 or cy < height * 0.10 or cy > height * 0.90:
+        score -= 0.20
+        reasons.append("bed_sofa_edge_penalty")
+    touches_edge = int(box[0]) <= 1 or int(box[1]) <= 1 or int(box[2]) >= width - 1 or int(box[3]) >= height - 1
+    if touches_edge and area_ratio < 0.35:
+        score -= 0.15
+        reasons.append("bed_sofa_edge_penalty")
+    return score, reasons
+
+
 def _is_nearly_whole_image_candidate(candidate: Dict[str, object]) -> bool:
     box = candidate.get("box2d", [0, 0, 0, 0])
     area_ratio = float(candidate.get("area_ratio", 0.0) or 0.0)
@@ -714,7 +783,7 @@ def _is_nearly_whole_image_candidate(candidate: Dict[str, object]) -> bool:
 
 
 def _large_object_complete_box_override(object_name: str, selected: Dict[str, object], best: Dict[str, object]) -> bool:
-    if not _is_large_object_target(object_name):
+    if not is_bed_sofa_couch_target(object_name):
         return False
     if not _candidate_matches_target_phrase(object_name, selected):
         return False
@@ -1084,22 +1153,113 @@ def make_count_instance_name(object_name: str, idx: int) -> str:
 
 
 def select_count_instance_candidates(candidates: List[Dict[str, object]], max_instances: int = 20) -> List[Dict[str, object]]:
-    if not candidates:
-        return []
-    best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
-    selected = []
-    for candidate in candidates:
-        score = float(candidate.get("rank_score", candidate.get("score", 0.0)))
-        if score < best_score - 0.35:
-            continue
-        box = candidate.get("box2d", [0, 0, 0, 0])
-        if any(box_iou(box, item.get("box2d", [0, 0, 0, 0])) > 0.75 for item in selected):
-            continue
-        selected.append(candidate)
-        if len(selected) >= max_instances:
-            break
-    selected.sort(key=lambda item: (box_center(item.get("box2d", [0, 0, 0, 0]))[1], box_center(item.get("box2d", [0, 0, 0, 0]))[0]))
+    selected, _ = filter_count_instance_candidates(candidates, max_instances=max_instances)
     return selected
+
+
+def filter_count_instance_candidates(
+    candidates: List[Dict[str, object]],
+    max_instances: int = 20,
+    image_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    if not candidates:
+        return [], {"summary": {"input_count": 0, "selected_count": 0, "rejected_count": 0}, "rejected_candidates": []}
+    best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
+    score_floor = best_score - 0.35
+    eligible = [
+        candidate for candidate in candidates
+        if float(candidate.get("rank_score", candidate.get("score", 0.0))) >= score_floor
+    ]
+    rejected: List[Dict[str, object]] = []
+
+    def reject(candidate: Dict[str, object], reason: str, other: Optional[Dict[str, object]] = None) -> None:
+        item = {
+            "candidate_index": candidate.get("candidate_index"),
+            "box2d": candidate.get("box2d"),
+            "reject_reason": reason,
+        }
+        if other is not None:
+            item["overlap_with"] = other.get("candidate_index")
+            item["contained_by"] = other.get("candidate_index") if reason in {"contained_by_tighter_box", "group_box_contains_instances"} else None
+        rejected.append(item)
+
+    filtered = []
+    for candidate in eligible:
+        box = candidate.get("box2d", [0, 0, 0, 0])
+        if _candidate_contains_multiple_tighter_boxes(candidate, eligible):
+            reject(candidate, "group_box_contains_instances")
+            continue
+        duplicate_of = _find_count_duplicate(candidate, filtered, image_size)
+        if duplicate_of is not None:
+            reject(candidate, "duplicate_or_center_close", duplicate_of)
+            continue
+        containing = _find_tighter_contained_candidate(candidate, eligible)
+        if containing is not None:
+            reject(candidate, "contained_by_tighter_box", containing)
+            continue
+        filtered.append(candidate)
+
+    selected = filtered[: max(1, max_instances)]
+    if len(filtered) > max_instances:
+        for candidate in filtered[max_instances:]:
+            reject(candidate, "max_instances_limit")
+    selected.sort(key=lambda item: (box_center(item.get("box2d", [0, 0, 0, 0]))[1], box_center(item.get("box2d", [0, 0, 0, 0]))[0]))
+    return selected, {
+        "summary": {
+            "input_count": len(candidates),
+            "eligible_count": len(eligible),
+            "selected_count": len(selected),
+            "rejected_count": len(rejected),
+        },
+        "rejected_candidates": rejected,
+    }
+
+
+def _find_count_duplicate(candidate: Dict[str, object], selected: List[Dict[str, object]], image_size: Optional[Tuple[int, int]]) -> Optional[Dict[str, object]]:
+    box = candidate.get("box2d", [0, 0, 0, 0])
+    for item in selected:
+        other_box = item.get("box2d", [0, 0, 0, 0])
+        if box_iou(box, other_box) > 0.65:
+            return item
+        if image_size is not None and box_center_distance_ratio(box, other_box, image_size) < 0.035:
+            area_a = max(1, box_area(box))
+            area_b = max(1, box_area(other_box))
+            if 0.45 <= area_a / float(area_b) <= 2.2:
+                return item
+    return None
+
+
+def _find_tighter_contained_candidate(candidate: Dict[str, object], candidates: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    box = candidate.get("box2d", [0, 0, 0, 0])
+    area_value = max(1, box_area(box))
+    for other in candidates:
+        if other is candidate:
+            continue
+        other_box = other.get("box2d", [0, 0, 0, 0])
+        other_area = max(1, box_area(other_box))
+        if other_area >= area_value * 0.85:
+            continue
+        if box_containment_ratio(other_box, box) >= 0.90:
+            return other
+    return None
+
+
+def _candidate_contains_multiple_tighter_boxes(candidate: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:
+    box = candidate.get("box2d", [0, 0, 0, 0])
+    area_value = max(1, box_area(box))
+    contained = 0
+    for other in candidates:
+        if other is candidate:
+            continue
+        other_box = other.get("box2d", [0, 0, 0, 0])
+        other_area = max(1, box_area(other_box))
+        if other_area >= area_value * 0.65:
+            continue
+        if box_containment_ratio(other_box, box) >= 0.88:
+            contained += 1
+            if contained >= 2:
+                return True
+    return False
 
 
 def relation_modifier(object_name: str) -> str:
@@ -1347,6 +1507,23 @@ def box_iou(a: List[int], b: List[int]) -> float:
     if union <= 0:
         return 0.0
     return inter / float(union)
+
+
+def box_containment_ratio(inner: List[int], outer: List[int]) -> float:
+    inner_area = box_area(inner)
+    if inner_area <= 0:
+        return 0.0
+    x1 = max(int(inner[0]), int(outer[0]))
+    y1 = max(int(inner[1]), int(outer[1]))
+    x2 = min(int(inner[2]), int(outer[2]))
+    y2 = min(int(inner[3]), int(outer[3]))
+    return box_area([x1, y1, x2, y2]) / float(inner_area)
+
+
+def box_center_distance_ratio(a: List[int], b: List[int], image_size: Tuple[int, int]) -> float:
+    width, height = image_size
+    diag = math.sqrt(max(1, width) ** 2 + max(1, height) ** 2)
+    return distance(box_center(a), box_center(b)) / float(max(1.0, diag))
 
 
 def distance(a, b) -> float:
