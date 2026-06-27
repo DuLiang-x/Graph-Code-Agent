@@ -548,12 +548,50 @@ def _normalize_object_phrase_for_merge(name: str) -> str:
     return " ".join(words)
 
 
-def _has_precise_instance_modifier(name: str) -> bool:
+INSTANCE_MODIFIER_PATTERN = re.compile(
+    r"\b("
+    r"rightmost|leftmost|topmost|bottommost|right-most|left-most|top-most|bottom-most|right most|left most|top most|bottom most|"
+    r"center|centered|middle|upper|lower|nearest|closest|furthest|farthest|front|back|"
+    r"white|black|gray|grey|brown|red|blue|green|yellow|glass|wooden|metal|transparent|translucent|clear|circular|round|striped|solid|polka[- ]dot|"
+    r"under|below|above|next to|beside|right of|left of|in front of|behind|inside|on top of"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _instance_modifier_signature(name: str) -> tuple:
     text = str(name or "").lower()
-    return bool(re.search(
-        r"\b(rightmost|leftmost|topmost|bottommost|right-most|left-most|top-most|bottom-most|right most|left most|top most|bottom most|white|black|gray|grey|brown|red|blue|green|yellow|glass|wooden|metal|transparent|translucent|clear|circular|round|striped|solid|polka[- ]dot|under|below|above|next to|beside|right of|left of|in front of|behind|inside|on top of)\b",
-        text,
-    ))
+    normalized = []
+    for modifier in INSTANCE_MODIFIER_PATTERN.findall(text):
+        modifier = modifier.replace("-", " ").strip()
+        if modifier == "centered":
+            modifier = "center"
+        if modifier in {"right most", "rightmost"}:
+            modifier = "rightmost"
+        elif modifier in {"left most", "leftmost"}:
+            modifier = "leftmost"
+        elif modifier in {"top most", "topmost"}:
+            modifier = "topmost"
+        elif modifier in {"bottom most", "bottommost"}:
+            modifier = "bottommost"
+        elif modifier == "grey":
+            modifier = "gray"
+        elif modifier == "farthest":
+            modifier = "furthest"
+        normalized.append(modifier)
+    return tuple(sorted(set(normalized)))
+
+
+def _has_precise_instance_modifier(name: str) -> bool:
+    return bool(_instance_modifier_signature(name))
+
+
+def _same_category_but_distinct_instance(a: str, b: str) -> bool:
+    if not _same_general_object_category(a, b):
+        return False
+    sig_a = _instance_modifier_signature(a)
+    sig_b = _instance_modifier_signature(b)
+    return bool(sig_a and sig_b and sig_a != sig_b)
 
 
 def _same_general_object_category(a: str, b: str) -> bool:
@@ -620,13 +658,21 @@ def merge_vlm_and_rule_objects(question_type: str, vlm_objects: list, rule_objec
             merged.append(obj)
 
     for obj in vlm_objects:
-        if any(_same_general_object_category(obj, rule_obj) for rule_obj in precise_rules):
+        if any(
+            _same_general_object_category(obj, rule_obj)
+            and not _same_category_but_distinct_instance(obj, rule_obj)
+            for rule_obj in precise_rules
+        ):
             continue
         if obj not in merged:
             merged.append(obj)
 
     for obj in rule_objects:
-        if obj not in merged and not any(_same_general_object_category(obj, current) for current in merged):
+        if obj not in merged and not any(
+            _same_general_object_category(obj, current)
+            and not _same_category_but_distinct_instance(obj, current)
+            for current in merged
+        ):
             merged.append(obj)
 
     return merged or vlm_objects

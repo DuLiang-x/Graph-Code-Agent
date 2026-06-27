@@ -35,7 +35,8 @@ Numeric-measurement rules:
 - For "How many objects with the volume/height/width/length of X would fit/reach Y", treat it as a continuous numeric ratio/measurement question, not visual counting.
 - For ratio, difference, sum, combined height, width, length, depth, distance, or volume questions, include all numerator, denominator, and reference objects.
 - For known-size calibration questions, include both the object with the provided size and the object whose size is requested.
-- Preserve relation modifiers such as rightmost, leftmost, topmost, bottommost, under, above, or next to when they identify which instance is needed.
+- Preserve relation modifiers such as rightmost, leftmost, topmost, bottommost, center, middle, closest, furthest, upper, lower, under, above, or next to when they identify which instance is needed.
+- Same-category objects with different instance modifiers are different numeric operands and must both be detected, such as leftmost cabinet and center cabinet.
 - Preserve color and material attributes such as white, black, glass, wooden, or metal when they disambiguate the target object.
 - If the question says two X, both X, multiple X, all X, or combined height/width/length/depth/volume of two X, include the natural plural/category phrase so the pipeline can detect each instance separately.
 - Count-ratio questions such as "ratio of coasters to remotes" or "ratio of brown chairs to black chairs" require all visible instances on both sides of the ratio; include both countable categories with their attributes.
@@ -47,6 +48,10 @@ Numeric-measurement rules:
 # Example: known-size calibration
 [Question] If the black table is 1.5m wide, how tall is the TV?
 [Detect] [black table, TV]
+
+# Example: same-category operands with different instance modifiers
+[Question] What is the ratio of the height of the leftmost cabinet to the width of the center cabinet?
+[Detect] [leftmost cabinet, center cabinet]
 
 # Example: known-height calibration with attributed source object
 [Question] If the 3D height of the wooden chair is 3.80 meters, what is the 3D height of the table in meters?

@@ -125,6 +125,37 @@ def test_numeric_other_keeps_precise_rule_objects_when_vlm_generalizes_to_plural
     assert "chairs" not in resolved["objects"]
 
 
+def test_numeric_other_keeps_same_category_different_instance_modifiers():
+    merged = demo_extract_3d_positions.merge_vlm_and_rule_objects(
+        "numeric_other",
+        ["leftmost cabinet", "center cabinet"],
+        ["leftmost cabinet", "center cabinet"],
+    )
+
+    assert merged == ["leftmost cabinet", "center cabinet"]
+
+
+def test_omni3d_4_style_extraction_keeps_leftmost_and_center_cabinets(tmpdir):
+    image_path = Path(str(tmpdir)) / "sample.png"
+    Image.new("RGB", (16, 16), color="white").save(str(image_path))
+    sample = {
+        "question": "What is the ratio of the height of the leftmost cabinet to the width of the center cabinet?",
+        "answer": 2.726,
+        "answer_type": "float",
+    }
+    vlm = FakeObjectExtractionVLM(["[leftmost cabinet, center cabinet]"])
+
+    resolved = demo_extract_3d_positions.resolve_object_names(
+        sample,
+        image=str(image_path),
+        vlm_model=vlm,
+        use_vlm_object_extraction=True,
+    )
+
+    assert resolved["question_type"] == "numeric_other"
+    assert resolved["objects"] == ["leftmost cabinet", "center cabinet"]
+
+
 def test_overlap_warnings_flag_different_non_area_same_box():
     warnings = overlap_warnings("wooden dresser", [10, 10, 50, 50], {"table": [10, 10, 50, 50]})
 
@@ -1513,6 +1544,8 @@ def test_object_extraction_prompt_has_question_type_rules():
     assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["numeric_ct"]
     assert "Question type: numeric measurement or ratio" in QUESTION_TYPE_RULES["numeric_other"]
     assert "How many of X would you stack/reach/match" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "leftmost cabinet and center cabinet" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "[Detect] [leftmost cabinet, center cabinet]" in QUESTION_TYPE_RULES["numeric_other"]
     assert "[Detect] [rightmost stool, leftmost chair]" in QUESTION_TYPE_RULES["numeric_other"]
     assert "combined height" in QUESTION_TYPE_RULES["numeric_other"]
     assert "two sinks" in QUESTION_TYPE_RULES["numeric_other"]
