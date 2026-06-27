@@ -214,10 +214,14 @@ def compute_numeric_relative_error(generated_answer, expected_answer) -> Optiona
     return abs(generated - expected) / abs(expected)
 
 
-def compute_numeric_mra(generated_answer, expected_answer, thresholds: Optional[List[float]] = None) -> Optional[float]:
-    relative_error = compute_numeric_relative_error(generated_answer, expected_answer)
-    if relative_error is None:
+def compute_numeric_mra(generated_answer, expected_answer, thresholds: Optional[List[float]] = None, abs_tol: float = 0.05) -> Optional[float]:
+    expected = _extract_number(expected_answer)
+    generated = _extract_number(generated_answer)
+    if expected is None or generated is None:
         return None
+    if expected == 0:
+        return 1.0 if abs(generated - expected) <= abs_tol else 0.0
+    relative_error = abs(generated - expected) / abs(expected)
     thresholds = thresholds or [0.5 + 0.05 * idx for idx in range(10)]
     passed = sum(1 for theta in thresholds if relative_error < 1 - theta)
     return passed / float(len(thresholds)) if thresholds else None

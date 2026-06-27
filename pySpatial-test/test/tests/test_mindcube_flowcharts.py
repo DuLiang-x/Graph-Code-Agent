@@ -96,6 +96,7 @@ def test_summarize_result_for_output_removes_large_intermediate_fields():
     result = {
         "scene_id": "omni3d_0",
         "question": "Question",
+        "question_type": "yes_no",
         "generated_answer": "yes",
         "generated_code": "def program(input_scene): pass",
         "answer_correct": True,

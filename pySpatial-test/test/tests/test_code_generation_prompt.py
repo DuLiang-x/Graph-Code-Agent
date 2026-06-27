@@ -222,7 +222,11 @@ def test_codeagent_prompt_documents_badcase_semantic_guards():
     assert 'Do not call graph.observer_from_object("camera")' in code_generation_prompt
     assert "do not use //, int(), round(), floor(), or ceil()" in code_generation_prompt
     assert "use graph.screen_diagonal(obj); do not include depth" in code_generation_prompt
-    assert "return a needs_visual_* computed result" in code_generation_prompt
+    assert "return structured needs_visual_* fields inside computed_results" in code_generation_prompt
+    assert 'do not set computed_results["answer"] to a needs_visual_* string' in code_generation_prompt
+    assert "candidate_nodes" in code_generation_prompt
+    assert "target_groups/options" in code_generation_prompt
+    assert "expected_answer_format" in code_generation_prompt
     assert "do not decide from a single z/y threshold" in code_generation_prompt
     assert "Do not use //, int(), round(), floor(), or ceil()" in api_specification
     assert "does not include depth" in api_specification
@@ -256,6 +260,9 @@ def test_codeagent_examples_include_stack_ratio_and_closer_to_a_or_b():
 def test_answer_prompt_preserves_numeric_and_visual_fallback_format():
     assert "keep the numeric value and do not round it to 0" in ANSWER_FORMAT_RULES
     assert "needs_visual_*" in ANSWER_FORMAT_RULES
+    assert "Do not output needs_visual_* as the final answer" in ANSWER_FORMAT_RULES
+    assert "object boxes/crops" in ANSWER_FORMAT_RULES
+    assert "needs_visual_color_check" in ANSWER_FORMAT_RULES
     assert 'answer exactly "yes" or "no"' in ANSWER_FORMAT_RULES
     assert "answer with a single numeric value" in ANSWER_FORMAT_RULES
 

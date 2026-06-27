@@ -30,6 +30,37 @@ def image_path_to_data_url(image_path: str) -> str:
         return pil_image_to_data_url(image.convert("RGB"))
 
 
+def _format_answer_object_context(scene: Scene, max_objects: int = 80) -> str:
+    object_boxes = getattr(scene, "object_3d_boxes", None)
+    if not isinstance(object_boxes, dict) or not object_boxes:
+        return ""
+
+    context_keys = (
+        "box2d",
+        "bbox_wh",
+        "prompt_used",
+        "counting_source_object",
+        "counting_selection_source",
+        "selection_decision",
+        "selected_prompt",
+    )
+    lines = []
+    for name, payload in object_boxes.items():
+        if not isinstance(payload, dict):
+            continue
+        parts = []
+        for key in context_keys:
+            if key in payload and payload.get(key) is not None:
+                parts.append(f"{key}={payload.get(key)}")
+        if not parts:
+            continue
+        lines.append(f"- {name}: " + ", ".join(parts))
+        if len(lines) >= max_objects:
+            lines.append("... truncated ...")
+            break
+    return "\n".join(lines)
+
+
 def _append_visual_clue_messages(messages, query_for_vlm: str, visual_clue):
     if visual_clue is None:
         messages.append({"role": "user", "content": query_for_vlm})
@@ -37,7 +68,9 @@ def _append_visual_clue_messages(messages, query_for_vlm: str, visual_clue):
         messages.append({"role": "user", "content": f"{query_for_vlm}\n\nVisual clue: {visual_clue}"})
     elif isinstance(visual_clue, dict):
         computed = visual_clue.get("computed_results") or visual_clue.get("results") or ""
-        text_query = f"{query_for_vlm}\n\nComputed results: {computed}"
+        object_context = visual_clue.get("object_context") or ""
+        object_context_text = f"\n\nObject boxes and node context for visual checks:\n{object_context}" if object_context else ""
+        text_query = f"{query_for_vlm}\n\nComputed results: {computed}{object_context_text}"
         content = [{"type": "input_text", "text": text_query}]
         visualization_path = visual_clue.get("visualization_path") or visual_clue.get("image_path")
         if visualization_path and os.path.exists(visualization_path):
@@ -199,11 +232,17 @@ def answer(scene: Scene, api_key: str = None, backend: str = "local_qwen", model
         {answer_prompt}
     """
 
+    object_context = _format_answer_object_context(scene)
+    object_context_text = f"Object boxes and node context for visual checks:\n{object_context}" if object_context else "Object boxes and node context for visual checks: unavailable"
+
     query_for_vlm = f"""
         {base_prompt}
         the question is {scene.question}
         the generated code is {scene.code}
-        the visual clue may include computed 3D results and optional visualization. Answer with the final open-form Omni3D-Bench answer, not an option letter. The visual clue is pasted below:
+        the visual clue may include computed 3D results and optional visualization. Answer with the final open-form Omni3D-Bench answer, not an option letter.
+        If computed_results contains needs_visual_color_check, needs_visual_visibility_check, needs_visual_clock_reading, or needs_visual_apparent_size_check, use the image, visualization, and object boxes below to complete the visual judgment. Do not output the needs_visual_* marker as the final answer.
+        {object_context_text}
+        The visual clue is pasted below:
 
     """
 

@@ -138,7 +138,9 @@ api_specification = """
             For "standing at X and facing camera", use graph.observer_from_object_to_camera(X), not observer_from_to(X, "camera").
             For compass direction questions, build a local north/forward vector first, derive a right vector, project the target vector, and map the angle to exactly one of N, NE, E, SE, S, SW, W, NW.
             For falling/collision questions, do not use only a single z/y threshold. Use graph.would_collide_along_direction(...) or graph.footprint_overlap(...) with the movement direction. If unreliable, return needs_visual_collision_check.
-            For visibility, occlusion, apparent taller/larger, clock reading, and color questions, do not invent color/clock/visibility APIs and do not infer them from 3D position alone. Return needs_visual_visibility_check, needs_visual_apparent_size_check, needs_visual_clock_reading, or needs_visual_color_check with the relevant object nodes/options.
+            For visibility, occlusion, apparent taller/larger, clock reading, and color questions, do not invent color/clock/visibility APIs and do not infer them from 3D position alone. Return structured needs_visual_visibility_check, needs_visual_apparent_size_check, needs_visual_clock_reading, or needs_visual_color_check fields inside computed_results with relevant object nodes/options.
+            needs_visual_* is only an intermediate task signal for the answer stage. Do not set computed_results["answer"] to a needs_visual_* string. Return needs_visual_visibility_check, needs_visual_apparent_size_check, needs_visual_clock_reading, or needs_visual_color_check as structured flags, not as the final answer.
+            Include candidate_nodes, target_groups, expected_answer_format, and any useful geometry evidence so the answer stage can finish the visual judgment from the image and object boxes.
             For closest/furthest object color questions, first compute the closest/furthest node geometrically, then let the answer stage use visual clues for color.
 
         Hypothetical reasoning APIs:
@@ -421,7 +423,15 @@ example_problems = """
         nodes = graph.list_nodes()
         candidates = graph.nodes_with_prefix("stool_") or [name for name in nodes if "stool" in name]
         closest = graph.closest_to_camera(candidates)
-        return {"computed_results": {"needs_visual_color_check": True, "target_object": closest, "nodes": nodes}}
+        return {
+            "computed_results": {
+                "needs_visual_color_check": True,
+                "candidate_nodes": [closest] if closest else [],
+                "target_groups": {"closest_stool": [closest] if closest else []},
+                "expected_answer_format": "yes/no or exact option requested by the question",
+                "nodes": nodes,
+            }
+        }
     ```
 
     Example 18: falling collision uses swept footprint, not a single axis
@@ -457,7 +467,8 @@ code_generation_prompt = f"""
     For numeric float questions, do not use //, int(), round(), floor(), or ceil() unless the question explicitly requests an integer.
     For TV/monitor/screen diagonal, use graph.screen_diagonal(obj); do not include depth.
     For closest/furthest to camera, use graph.distance_to_camera/closest_to_camera/furthest_from_camera; never call graph.distance(obj, "camera").
-    For clock/color/visibility/apparent-size questions, return a needs_visual_* computed result instead of inventing nonexistent graph APIs.
+    For clock/color/visibility/apparent-size questions, return structured needs_visual_* fields inside computed_results instead of inventing nonexistent graph APIs.
+    needs_visual_* is an intermediate signal only: do not set computed_results["answer"] to a needs_visual_* string. Provide candidate_nodes, target_groups/options, expected_answer_format, and useful geometry evidence for the answer stage.
     For falling/collision questions, use graph.would_collide_along_direction or graph.footprint_overlap; do not decide from a single z/y threshold.
     Also, the function written should be named as program and the input parameter should be a Scene object.
     for example,
@@ -491,7 +502,10 @@ Final answer formatting rules:
 - If the question provides options, answer with exactly one option from the provided options. Do not invent a new option.
 - If the question asks for a number, answer with a single numeric value. Include the unit only if the question explicitly requires a unit.
 - If computed_results contains a float such as 0.58, keep the numeric value and do not round it to 0 unless the question explicitly asks for rounding.
-- If computed_results contains a needs_visual_* flag, use the visual clue to answer, but still obey the exact final format for the question type.
+- Do not output needs_visual_* as the final answer.
+- If computed_results contains a needs_visual_* flag, use the visual clue, input image, object boxes/crops, and candidate node context to complete the visual judgment, but still obey the exact final format for the question type.
+- For needs_visual_color_check, inspect candidate boxes/crops to judge color or material, then output the requested final number, decimal ratio, object name, or yes/no.
+- For needs_visual_visibility_check, needs_visual_clock_reading, and needs_visual_apparent_size_check, use visual evidence to finish the task instead of repeating the marker.
 - If the question asks which object satisfies a relation, answer with the exact object name from the graph nodes or the provided options.
 - Do not include unnecessary explanation in the final answer.
 - Do not output Python code in the final answer.

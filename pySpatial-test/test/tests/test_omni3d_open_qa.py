@@ -6,7 +6,7 @@ TEST_ROOT = Path(__file__).resolve().parents[1]
 if str(TEST_ROOT) not in sys.path:
     sys.path.insert(0, str(TEST_ROOT))
 
-from agent.anwer import SpatialAnswer, answer_without_visual_clue
+from agent.anwer import SpatialAnswer, _format_answer_object_context, answer_without_visual_clue
 from agent.model_backend.local_qwen import parse_spatial_answer_text
 from pySpatial_Interface import Scene
 from mindcube import (
@@ -75,6 +75,28 @@ def test_spatial_answer_accepts_open_form_answers():
     assert SpatialAnswer(reasoning="computed", answer="the fireplace").answer == "the fireplace"
 
 
+def test_answer_object_context_includes_compact_box_fields():
+    scene = Scene([], "What color is the closest chair?", scene_id="ctx")
+    scene.object_3d_boxes = {
+        "brown_chair_1": {
+            "box2d": [1, 2, 30, 40],
+            "bbox_wh": [29, 38],
+            "prompt_used": "brown chair",
+            "counting_source_object": "brown chairs",
+            "box3d_center": [0.1, 0.2, 0.3],
+        }
+    }
+
+    context = _format_answer_object_context(scene)
+
+    assert "brown_chair_1" in context
+    assert "box2d=[1, 2, 30, 40]" in context
+    assert "bbox_wh=[29, 38]" in context
+    assert "prompt_used=brown chair" in context
+    assert "counting_source_object=brown chairs" in context
+    assert "box3d_center" not in context
+
+
 def test_local_qwen_parse_keeps_non_choice_answer():
     parsed = parse_spatial_answer_text('{"reasoning": "ratio", "answer": "0.948"}')
     assert parsed.reasoning == "ratio"
@@ -113,10 +135,15 @@ def test_omni3d_float_and_string_evaluation():
 
 def test_float_mra_metrics():
     assert compute_float_relative_error("1.1", 1.0) == 0.10000000000000009
+    assert compute_float_relative_error("0", 0.0) is None
     assert compute_float_mra("0.948", 0.948) == 1.0
     assert compute_float_mra("1.1", 1.0) == 0.8
+    assert compute_float_mra("0", 0.0) == 1.0
+    assert compute_float_mra("0.04", 0.0) == 1.0
+    assert compute_float_mra("0.06", 0.0) == 0.0
+    assert compute_float_mra("4", 0.0) == 0.0
     assert compute_float_mra("no number", 1.0) is None
-    assert compute_float_mra("1.0", 0.0) is None
+    assert compute_float_mra("no number", 0.0) is None
 
 
 def test_numeric_mra_metrics_include_int_answers():
@@ -127,8 +154,12 @@ def test_numeric_mra_metrics_include_int_answers():
     assert compute_numeric_mra("0.948", 0.948) == 1.0
     assert compute_numeric_mra("1.1", 1.0) == 0.8
     assert compute_numeric_mra("2", 3) == 0.4
+    assert compute_numeric_mra("0", 0) == 1.0
+    assert compute_numeric_mra("0.04", 0) == 1.0
+    assert compute_numeric_mra("0.06", 0) == 0.0
+    assert compute_numeric_mra("4", 0) == 0.0
     assert compute_numeric_mra("no number", 1.0) is None
-    assert compute_numeric_mra("1.0", 0.0) is None
+    assert compute_numeric_mra("no number", 0.0) is None
 
 
 def test_acc_mra_uses_mra_for_numeric_and_accuracy_for_other_types():
@@ -137,9 +168,11 @@ def test_acc_mra_uses_mra_for_numeric_and_accuracy_for_other_types():
         {"answer_type": "float", "expected_answer": 1.0, "generated_answer": "1.1", "float_mra": 0.8, "numeric_mra": 0.8, "answer_correct": False},
         {"answer_type": "str", "expected_answer": "yes", "generated_answer": "yes", "answer_correct": True},
         {"answer_type": "int", "expected_answer": 3, "generated_answer": "2", "numeric_mra": 0.4, "answer_correct": False},
+        {"answer_type": "int", "expected_answer": 0, "generated_answer": "0", "numeric_mra": 1.0, "answer_correct": True},
+        {"answer_type": "int", "expected_answer": 0, "generated_answer": "0.06", "numeric_mra": 0.0, "answer_correct": False},
     ]
 
-    assert compute_acc_mra(results) == {"acc_mra": 0.8, "acc_mra_count": 4, "mra_score": 0.8, "mra_score_count": 4}
+    assert compute_acc_mra(results) == {"acc_mra": 0.7, "acc_mra_count": 6, "mra_score": 0.7, "mra_score_count": 6}
 
 
 def test_entry_question_index_parsing_priority():
