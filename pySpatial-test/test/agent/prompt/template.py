@@ -138,10 +138,13 @@ api_specification = """
             For "standing at X and facing camera", use graph.observer_from_object_to_camera(X), not observer_from_to(X, "camera").
             For compass direction questions, build a local north/forward vector first, derive a right vector, project the target vector, and map the angle to exactly one of N, NE, E, SE, S, SW, W, NW.
             For falling/collision questions, do not use only a single z/y threshold. Use graph.would_collide_along_direction(...) or graph.footprint_overlap(...) with the movement direction. If unreliable, return needs_visual_collision_check.
-            For visibility, occlusion, apparent taller/larger, clock reading, and color questions, do not invent color/clock/visibility APIs and do not infer them from 3D position alone. Return structured needs_visual_visibility_check, needs_visual_apparent_size_check, needs_visual_clock_reading, or needs_visual_color_check fields inside computed_results with relevant object nodes/options.
-            needs_visual_* is only an intermediate task signal for the answer stage. Do not set computed_results["answer"] to a needs_visual_* string. Return needs_visual_visibility_check, needs_visual_apparent_size_check, needs_visual_clock_reading, or needs_visual_color_check as structured flags, not as the final answer.
+            For color questions, use pySpatial.visual_color(...) or pySpatial.visual_color_batch(...) with the exact graph node names and the relevant color choices. Do not infer color from 3D position or object names alone.
+            For color count-ratio questions, classify the candidate instance nodes with pySpatial.visual_color_batch(...), then count the returned colors and compute graph.ratio(count_a, count_b).
+            Only return structured needs_visual_color_check if visual_color returns "unknown" for the required objects and the final answer cannot be computed.
+            For visibility, occlusion, apparent taller/larger, and clock reading questions, do not invent clock/visibility APIs and do not infer them from 3D position alone. Return structured needs_visual_visibility_check, needs_visual_apparent_size_check, or needs_visual_clock_reading fields inside computed_results with relevant object nodes/options.
+            needs_visual_* is only an intermediate task signal for the answer stage. Do not set computed_results["answer"] to a needs_visual_* string.
             Include candidate_nodes, target_groups, expected_answer_format, and any useful geometry evidence so the answer stage can finish the visual judgment from the image and object boxes.
-            For closest/furthest object color questions, first compute the closest/furthest node geometrically, then let the answer stage use visual clues for color.
+            For closest/furthest object color questions, first compute the closest/furthest node geometrically, then call pySpatial.visual_color on that exact node.
 
         Hypothetical reasoning APIs:
             graph.move_object(name, delta)
@@ -150,8 +153,15 @@ api_specification = """
             graph.rotate_object(name, angle, axis="y")
             graph.snapshot(), graph.restore(snapshot), graph.with_state()
 
-        Visualization:
+        Visualization and visual attribute APIs:
             pySpatial.visualize_graph(graph, output_path) returns a PNG path.
+            pySpatial.visual_color(scene, object_name, choices=None) -> str
+                Uses the original image and scene.object_3d_boxes[object_name]["box2d"] to classify the visible color of one object.
+                If choices is provided, returns one of those choices or "unknown".
+            pySpatial.visual_color_batch(scene, object_names, choices=None) -> dict[str, str]
+                Batch version for color counting and count-ratio questions. Keys are exact graph node names.
+                Use this for questions such as "ratio of brown chairs to black chairs" or "is the table the same color as the chair".
+                If a node has no box2d or the color cannot be judged, its value is "unknown".
 
     Legacy reconstruction path remains available for comparison:
         reconstruction = pySpatial.reconstruct(scene)
@@ -357,14 +367,17 @@ example_problems = """
         }
     ```
 
-    Example 13a: count-ratio with attributed same-category instances
+    Example 13a: color count-ratio with visual_color_batch
     ```python
     def program(input_scene: Scene):
         graph = pySpatial.build_graph(input_scene)
-        brown = graph.count_prefix("brown_chair_")
-        black = graph.count_prefix("black_chair_")
+        nodes = graph.list_nodes()
+        chairs = graph.nodes_with_prefix("chair_") or [name for name in nodes if "chair" in name]
+        colors = pySpatial.visual_color_batch(input_scene, chairs, choices=["brown", "black"])
+        brown = sum(1 for color in colors.values() if color == "brown")
+        black = sum(1 for color in colors.values() if color == "black")
         answer = graph.ratio(brown, black)
-        return {"computed_results": {"answer": answer, "brown_chairs": brown, "black_chairs": black}}
+        return {"computed_results": {"answer": answer, "colors": colors, "brown_chairs": brown, "black_chairs": black}}
     ```
 
     Example 13b: stack/reach height is a continuous ratio, not counting
@@ -416,19 +429,19 @@ example_problems = """
         return {"computed_results": {"answer": closest, "camera_is_node": False}}
     ```
 
-    Example 17: visual-only color check after geometry
+    Example 17: color check with visual_color after geometry
     ```python
     def program(input_scene: Scene):
         graph = pySpatial.build_graph(input_scene)
         nodes = graph.list_nodes()
         candidates = graph.nodes_with_prefix("stool_") or [name for name in nodes if "stool" in name]
         closest = graph.closest_to_camera(candidates)
+        color = pySpatial.visual_color(input_scene, closest, choices=["black", "white", "brown", "gray"]) if closest else "unknown"
         return {
             "computed_results": {
-                "needs_visual_color_check": True,
-                "candidate_nodes": [closest] if closest else [],
-                "target_groups": {"closest_stool": [closest] if closest else []},
-                "expected_answer_format": "yes/no or exact option requested by the question",
+                "answer": color,
+                "closest_stool": closest,
+                "color": color,
                 "nodes": nodes,
             }
         }
@@ -467,7 +480,9 @@ code_generation_prompt = f"""
     For numeric float questions, do not use //, int(), round(), floor(), or ceil() unless the question explicitly requests an integer.
     For TV/monitor/screen diagonal, use graph.screen_diagonal(obj); do not include depth.
     For closest/furthest to camera, use graph.distance_to_camera/closest_to_camera/furthest_from_camera; never call graph.distance(obj, "camera").
-    For clock/color/visibility/apparent-size questions, return structured needs_visual_* fields inside computed_results instead of inventing nonexistent graph APIs.
+    For color questions, use pySpatial.visual_color(input_scene, object_name, choices=[...]) or pySpatial.visual_color_batch(input_scene, object_names, choices=[...]) instead of returning needs_visual_color_check by default.
+    Only use needs_visual_color_check as a fallback when visual_color returns "unknown" and the final answer cannot be computed.
+    For clock/visibility/apparent-size questions, return structured needs_visual_* fields inside computed_results instead of inventing nonexistent graph APIs.
     needs_visual_* is an intermediate signal only: do not set computed_results["answer"] to a needs_visual_* string. Provide candidate_nodes, target_groups/options, expected_answer_format, and useful geometry evidence for the answer stage.
     For falling/collision questions, use graph.would_collide_along_direction or graph.footprint_overlap; do not decide from a single z/y threshold.
     Also, the function written should be named as program and the input parameter should be a Scene object.

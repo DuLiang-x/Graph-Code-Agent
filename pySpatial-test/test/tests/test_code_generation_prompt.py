@@ -222,6 +222,7 @@ def test_codeagent_prompt_documents_badcase_semantic_guards():
     assert 'Do not call graph.observer_from_object("camera")' in code_generation_prompt
     assert "do not use //, int(), round(), floor(), or ceil()" in code_generation_prompt
     assert "use graph.screen_diagonal(obj); do not include depth" in code_generation_prompt
+    assert "use pySpatial.visual_color(input_scene, object_name" in code_generation_prompt
     assert "return structured needs_visual_* fields inside computed_results" in code_generation_prompt
     assert 'do not set computed_results["answer"] to a needs_visual_* string' in code_generation_prompt
     assert "candidate_nodes" in code_generation_prompt
@@ -230,7 +231,7 @@ def test_codeagent_prompt_documents_badcase_semantic_guards():
     assert "do not decide from a single z/y threshold" in code_generation_prompt
     assert "Do not use //, int(), round(), floor(), or ceil()" in api_specification
     assert "does not include depth" in api_specification
-    assert "Return needs_visual_visibility_check" in api_specification
+    assert "Return structured needs_visual_visibility_check" in api_specification
     assert "needs_visual_clock_reading" in api_specification
 
 
@@ -245,9 +246,8 @@ def test_codeagent_prompt_documents_plural_not_automatic_counting():
 def test_codeagent_examples_include_stack_ratio_and_closer_to_a_or_b():
     from agent.prompt.template import example_problems
 
-    assert "Example 13a: count-ratio with attributed same-category instances" in example_problems
-    assert 'graph.count_prefix("brown_chair_")' in example_problems
-    assert 'graph.count_prefix("black_chair_")' in example_problems
+    assert "Example 13a: color count-ratio with visual_color_batch" in example_problems
+    assert 'pySpatial.visual_color_batch(input_scene, chairs, choices=["brown", "black"])' in example_problems
     assert "Example 13b: stack/reach height is a continuous ratio, not counting" in example_problems
     assert 'graph.height("rightmost stool")' in example_problems
     assert 'graph.height("leftmost chair")' in example_problems
@@ -255,6 +255,28 @@ def test_codeagent_examples_include_stack_ratio_and_closer_to_a_or_b():
     assert "Example 13c: choose whether X is closer to A or B" in example_problems
     assert 'graph.distance("rightmost chair", "table")' in example_problems
     assert 'graph.distance("rightmost chair", "wooden dresser")' in example_problems
+
+
+
+
+def test_codeagent_prompt_documents_visual_color_api():
+    assert "pySpatial.visual_color(scene, object_name, choices=None) -> str" in api_specification
+    assert "pySpatial.visual_color_batch(scene, object_names, choices=None) -> dict[str, str]" in api_specification
+    assert 'Use this for questions such as "ratio of brown chairs to black chairs"' in api_specification
+    assert "use pySpatial.visual_color(input_scene, object_name" in code_generation_prompt
+    assert "pySpatial.visual_color_batch(input_scene, object_names" in code_generation_prompt
+    assert "instead of returning needs_visual_color_check by default" in code_generation_prompt
+
+
+def test_codeagent_examples_use_visual_color_batch_for_color_ratio():
+    from agent.prompt.template import example_problems
+
+    assert "Example 13a: color count-ratio with visual_color_batch" in example_problems
+    assert 'colors = pySpatial.visual_color_batch(input_scene, chairs, choices=["brown", "black"])' in example_problems
+    assert 'brown = sum(1 for color in colors.values() if color == "brown")' in example_problems
+    assert 'black = sum(1 for color in colors.values() if color == "black")' in example_problems
+    assert "Example 17: color check with visual_color after geometry" in example_problems
+    assert "pySpatial.visual_color(input_scene, closest" in example_problems
 
 
 def test_answer_prompt_preserves_numeric_and_visual_fallback_format():

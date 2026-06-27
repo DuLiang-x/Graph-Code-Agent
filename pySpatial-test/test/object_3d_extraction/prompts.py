@@ -48,6 +48,18 @@ Numeric-measurement rules:
 [Question] If the black table is 1.5m wide, how tall is the TV?
 [Detect] [black table, TV]
 
+# Example: known-height calibration with attributed source object
+[Question] If the 3D height of the wooden chair is 3.80 meters, what is the 3D height of the table in meters?
+[Detect] [wooden chair, table]
+
+# Example: known-height calibration with different target object
+[Question] If the 3D height of the fridge is 4.80 meters, what is the 3D height of the chair in meters?
+[Detect] [fridge, chair]
+
+# Example: same-height stack is numeric ratio, not visual counting
+[Question] How many objects of the same height as the armchair would I need to make a structure as tall as the dresser closest to the camera?
+[Detect] [armchair, dresser]
+
 # Example: two same-category numeric operands
 [Question] What is the combined width of the two sinks compared with the bathtub?
 [Detect] [sinks, bathtub]
@@ -71,6 +83,7 @@ Yes/no-question rules:
 - If the question asks whether X would block, hit, cover, fit on, contain, support, or be visible relative to Y, include both X and Y.
 - Include intermediate reference objects when the relation depends on them.
 - Do not include camera when it means the image viewpoint.
+- If the question asks whether there are two or more of the same object type, output the concrete repeated category visible in the image, such as [chairs], not [same object types].
 
 # Example: visibility after hypothetical placement
 [Question] If the sofa were placed in front of the fireplace, would the fireplace still be visible?
@@ -84,13 +97,13 @@ Yes/no-question rules:
 Question type: object choice or direction choice.
 Choice-question rules:
 - Detect every candidate object and every reference object needed to compare the candidates.
-- If the question provides Options:{...} or says choose from a list, every physical object in the options must be included in [Detect].
+- If the question provides Options:{{...}} or says choose from a list, every physical object in the options must be included in [Detect].
 - For questions asking which object is closer, farther, left, right, front, behind, above, below, or first hit, include all compared objects and the reference object.
 - Direction labels such as N, NE, E, SE, S, SW, W, NW are answers, not detectable objects.
 - Do not invent objects outside the candidates and references in the question.
 
 # Example: object-choice with options
-[Question] Which object is closer to the fireplace: the sofa or the white coffee table? Options: {sofa, coffee table}
+[Question] Which object is closer to the fireplace: the sofa or the white coffee table? Options: {{sofa, coffee table}}
 [Detect] [fireplace, sofa, white coffee table, coffee table]
 
 # Example: object-choice without explicit options
@@ -107,7 +120,7 @@ Generic rules:
 
 PROMPT_GET_OBJECTS_OF_INTEREST = """
 ### Situation Description
-Given an image and a spatial reasoning question, we need to all entities that are included in the question.
+Given an image and a spatial reasoning question, identify only the physical objects whose 3D boxes are required to answer the question.
 
 Camera rule:
 - In Omni3D-Bench single-image tasks, "camera" usually means the viewpoint of the current image, not a visible object.
@@ -135,10 +148,13 @@ Attribute distinction rule:
 Badcase-guided object mention rules:
 - Do not output answer-format or math words as objects, such as decimal, sum, direction, square, format, greater, closer, furthest point, or can you fit.
 - Do not output color words alone, such as red, white, blue, or black, unless the question explicitly refers to visible color swatches or colored objects as physical candidates.
+- Do not output abstract phrases such as same object types, object type, physical objects, answer, or objects required.
 - Keep TV and TV stand as different objects; do not replace TV stand with TV or merge them into one target.
+- If the question says combined X and Y, or X and Y combined, output the individual physical objects [X, Y], not a synthetic combined object.
 - If the question explicitly says two X, both X, multiple X, or combined size/volume of two X, keep the countable category in [Detect] so the pipeline can produce X_1, X_2, etc.
 - Do not convert a singular attributed or relation-specific target such as rightmost stool, leftmost chair, black chair, or circular table under the TV into a plural category unless the question truly asks to count visible instances.
 - For generic surface counting such as objects stuck on a fridge, keep the counted small-object target and the reference surface; do not collapse the answer to only the fridge.
+- For same-type existence questions such as "Are there two of the same object types?", output the concrete repeated physical category visible in the image, such as [chairs] or [lamps], not [same object types].
 
 # Example: camera perspective should not be detected as an object
 [Question] From the camera's perspective, is the chair on the left or right of the table?
@@ -188,6 +204,14 @@ Badcase-guided object mention rules:
 [Question] How many objects of height equal to the height of the translucent cube are needed to match the chair?
 [Detect] [translucent cube, chair]
 
+# Example: combined expression should be split into physical objects
+[Question] Which is taller in 3D: the sofa or the tv and the tv stand combined? Options: {{sofa, combined tv and tv stand}}
+[Detect] [sofa, tv, tv stand]
+
+# Example: same object type asks for repeated concrete categories
+[Question] Are there two of the same object types?
+[Detect] [chairs]
+
 {question_type_rules}
 
 ### Your Task
@@ -219,6 +243,8 @@ Rules:
 - Do not replace "bench", "sofa", "couch", "ottoman", or "seat" with "chair" unless the question itself uses that word.
 - Do not include relation words such as left, right, closer, farther, above, below, front, behind.
 - Do not include answer-format or math words such as decimal, sum, direction, square, format, closer, furthest point, or can you fit.
+- Do not include abstract phrases such as same object types, object type, or physical objects.
+- If your response contains a synthetic combined object such as "combined tv and tv stand", split it into the individual physical objects "tv" and "tv stand".
 - Do not include color words alone unless they are visible physical color swatches or colored candidate objects.
 - Do not include "camera" unless it is a visible physical camera object.
 

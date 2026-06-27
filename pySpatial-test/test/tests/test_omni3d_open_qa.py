@@ -8,7 +8,7 @@ if str(TEST_ROOT) not in sys.path:
 
 from agent.anwer import SpatialAnswer, _format_answer_object_context, answer_without_visual_clue
 from agent.model_backend.local_qwen import parse_spatial_answer_text
-from pySpatial_Interface import Scene
+from pySpatial_Interface import Scene, pySpatial
 from mindcube import (
     apply_index_range_and_max_entries,
     compute_acc_mra,
@@ -73,6 +73,56 @@ def test_spatial_answer_accepts_open_form_answers():
     assert SpatialAnswer(reasoning="computed", answer="yes").answer == "yes"
     assert SpatialAnswer(reasoning="computed", answer="0.948").answer == "0.948"
     assert SpatialAnswer(reasoning="computed", answer="the fireplace").answer == "the fireplace"
+
+
+
+
+def test_pyspatial_visual_color_uses_scene_visual_api():
+    scene = Scene([], "What color is the chair?", scene_id="visual_color")
+    scene.object_3d_boxes = {"chair": {"box2d": [1, 2, 30, 40]}}
+
+    class FakeVisualAPI:
+        def classify_color(self, scene_arg, object_name, choices=None):
+            assert scene_arg is scene
+            assert object_name == "chair"
+            assert choices == ["brown", "black"]
+            return "brown"
+
+    scene.visual_api = FakeVisualAPI()
+
+    assert pySpatial.visual_color(scene, "chair", ["brown", "black"]) == "brown"
+
+
+def test_pyspatial_visual_color_batch_keeps_exact_node_names():
+    scene = Scene([], "What is the ratio of brown chairs to black chairs?", scene_id="visual_batch")
+    scene.object_3d_boxes = {
+        "chair_1": {"box2d": [1, 2, 30, 40]},
+        "chair_2": {"box2d": [31, 2, 60, 40]},
+        "chair_3": {},
+    }
+
+    class FakeVisualAPI:
+        def classify_color_batch(self, scene_arg, object_names, choices=None):
+            assert scene_arg is scene
+            assert object_names == ["chair_1", "chair_2"]
+            assert choices == ["brown", "black"]
+            return {"chair_1": "brown", "chair_2": "black"}
+
+    scene.visual_api = FakeVisualAPI()
+
+    assert pySpatial.visual_color_batch(scene, ["chair_1", "chair_2", "chair_3"], ["brown", "black"]) == {
+        "chair_1": "brown",
+        "chair_2": "black",
+        "chair_3": "unknown",
+    }
+
+
+def test_pyspatial_visual_color_missing_box_returns_unknown():
+    scene = Scene([], "What color is the chair?", scene_id="visual_missing")
+    scene.object_3d_boxes = {"chair": {}}
+
+    assert pySpatial.visual_color(scene, "chair", ["brown", "black"]) == "unknown"
+    assert pySpatial.visual_color_batch(scene, ["chair"], ["brown", "black"]) == {"chair": "unknown"}
 
 
 def test_answer_object_context_includes_compact_box_fields():

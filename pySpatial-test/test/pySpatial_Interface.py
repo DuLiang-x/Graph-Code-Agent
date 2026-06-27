@@ -302,6 +302,36 @@ class pySpatial:
         return visualize_graph(graph, output_path, width=width, height=height)
 
     @staticmethod
+    def visual_color(scene: Scene, object_name: str, choices: List[str] = None) -> str:
+        boxes = getattr(scene, "object_3d_boxes", None)
+        payload = boxes.get(object_name) if isinstance(boxes, dict) else None
+        if not isinstance(payload, dict) or not payload.get("box2d"):
+            return "unknown"
+        visual_api = getattr(scene, "visual_api", None)
+        if visual_api is None:
+            return "unknown"
+        return visual_api.classify_color(scene, object_name, choices=choices)
+
+    @staticmethod
+    def visual_color_batch(scene: Scene, object_names: List[str], choices: List[str] = None) -> Dict[str, str]:
+        names = [str(name) for name in object_names]
+        boxes = getattr(scene, "object_3d_boxes", None)
+        result = {name: "unknown" for name in names}
+        if not isinstance(boxes, dict):
+            return result
+        valid_names = [
+            name for name in names
+            if isinstance(boxes.get(name), dict) and boxes[name].get("box2d")
+        ]
+        if not valid_names:
+            return result
+        visual_api = getattr(scene, "visual_api", None)
+        if visual_api is None:
+            return result
+        result.update(visual_api.classify_color_batch(scene, valid_names, choices=choices))
+        return result
+
+    @staticmethod
     def describe_camera_motion(recon: Reconstruction):
         """Describe camera motion from reconstruction results.
         Args:
@@ -478,6 +508,15 @@ class Agent:
         
         from agent.codeAgent.execute import execute_code
         program = execute_code(scene.code)
+        from agent.visual_api import VisualAttributeClient
+        scene.visual_api = VisualAttributeClient(
+            backend=self.backend,
+            api_key=self.api_key,
+            model=self.answer_model,
+            local_model_path=self.local_model_path,
+            base_url=self.base_url,
+            device=self.device,
+        )
         
         visual_clue = program(scene)
         return visual_clue

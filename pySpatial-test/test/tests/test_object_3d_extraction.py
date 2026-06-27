@@ -19,7 +19,7 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, is_count_ratio_question, is_same_category_multi_instance_numeric, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, is_count_ratio_question, is_same_category_multi_instance_numeric, is_same_type_existence_question, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
@@ -278,7 +278,7 @@ def test_count_filter_rejects_center_close_duplicate_with_low_iou():
 
 def test_count_filter_keeps_max_twenty_independent_instances():
     candidates = [
-        {"candidate_index": idx, "box2d": [idx * 5, 0, idx * 5 + 3, 3], "score": 1.0 - idx * 0.005, "rank_score": 1.0 - idx * 0.005}
+        {"candidate_index": idx, "box2d": [idx * 10, 0, idx * 10 + 3, 3], "score": 1.0 - idx * 0.005, "rank_score": 1.0 - idx * 0.005}
         for idx in range(25)
     ]
 
@@ -628,6 +628,56 @@ def test_classify_question_type_for_omni3d_categories():
     }) == "choice_object"
 
 
+def test_same_type_existence_question_triggers_multi_instance_target(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "Are there two of the same object types?",
+        "answer_type": "str",
+        "answer": "yes",
+    }
+    vlm = FakeObjectExtractionVLM(["[chair, chair]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    prompt = vlm.calls[0][0][0]["content"][1]["text"]
+    assert info["question_type"] == "yes_no"
+    assert info["objects"] == ["chair"]
+    assert is_same_type_existence_question(sample["question"])
+    assert is_visual_count_target("yes_no", sample["question"], "chair")
+    assert "same object type" in prompt
+    assert "[Detect] [chairs]" in prompt
+
+
+def test_combined_synthetic_object_is_split_for_detection(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "Which is taller in 3D: the sofa or the tv and the tv stand combined? Options: {sofa, combined tv and tv stand}",
+        "answer_type": "str",
+        "answer": "the combined tv and tv stand",
+    }
+    vlm = FakeObjectExtractionVLM(["[sofa, combined tv and tv stand]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert info["objects"] == ["sofa", "tv", "tv stand"]
+    assert "combined tv and tv stand" not in info["objects"]
+
+
+def test_rule_postprocess_removes_camera_and_abstract_object_type():
+    sample = {
+        "question": "I'm standing at the christmas tree and facing the camera. Call this direction north (N). What direction is the TV?",
+        "answer_type": "str",
+        "answer": "W",
+    }
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, use_vlm_object_extraction=False)
+
+    assert "camera" not in info["objects"]
+    assert "tv" in info["objects"]
+
+
 def test_vlm_object_extraction_prompt_uses_question_type_rules(tmpdir):
     image_path = Path(str(tmpdir)) / "scene.png"
     Image.new("RGB", (16, 16), color="white").save(image_path)
@@ -791,6 +841,20 @@ def test_parse_object_relation_context():
         "relation_context": "next to the sofa",
         "reference_object": "sofa",
     }
+
+def test_closest_relation_context_removed_from_grounding_caption():
+    assert parse_object_relation_context("dark gray cabinet closest to the ceiling") == {
+        "target_phrase": "dark gray cabinet",
+        "relation": "closest to",
+        "relation_context": "closest to the ceiling",
+        "reference_object": "ceiling",
+    }
+    prompts = detection_prompts_for_object("dark gray cabinet closest to the ceiling")
+
+    assert "dark gray cabinet" in prompts
+    assert all("closest" not in prompt for prompt in prompts)
+    assert all("ceiling" not in prompt for prompt in prompts)
+
 
 def test_rule_ranker_avoids_large_area_box_for_non_area_object():
     image = Image.new("RGB", (100, 100), color="white")
@@ -1058,6 +1122,9 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert "Reference object:" in prompt
     assert "color, material, shape, relative position, nearby objects, and role in the scene" in prompt
     assert '"white coffee table", "circular table", "black table", "person wearing a hat", "left chair", or "closer sofa"' in prompt
+    assert "very similar boxes, sizes, and positions" in prompt
+    assert "TV vs TV stand" in prompt
+    assert "Do not assume highly overlapping or near-identical candidates are interchangeable" in prompt
     assert "under the tv" in prompt
     assert "it does not mean choose the TV" in prompt
     assert "Use the full-image overlay first" in prompt
@@ -1453,12 +1520,13 @@ def test_object_extraction_prompt_has_question_type_rules():
     assert "bedside tables" in QUESTION_TYPE_RULES["numeric_other"]
     assert "Question type: yes/no" in QUESTION_TYPE_RULES["yes_no"]
     assert "visibility" in QUESTION_TYPE_RULES["yes_no"]
+    assert "same object type" in QUESTION_TYPE_RULES["yes_no"]
     assert "Question type: object choice" in QUESTION_TYPE_RULES["choice_object"]
     assert "every physical object in the options must be included" in QUESTION_TYPE_RULES["choice_object"]
 
 
 def test_object_extraction_prompt_documents_attribute_distinction_rule():
-    from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST, PROMPT_GET_OBJECTS_OF_INTEREST_AUX
+    from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST, PROMPT_GET_OBJECTS_OF_INTEREST_AUX, QUESTION_TYPE_RULES
 
     assert "Attribute distinction rule" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "gray chair" in PROMPT_GET_OBJECTS_OF_INTEREST
@@ -1466,6 +1534,14 @@ def test_object_extraction_prompt_documents_attribute_distinction_rule():
     assert "[Detect] [gray chair, table, black chair]" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "translucent cube" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Badcase-guided object mention rules" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "physical objects whose 3D boxes are required" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "same object types" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [sofa, tv, tv stand]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Detect] [chairs]" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "If the 3D height of the wooden chair is 3.80 meters" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "[Detect] [wooden chair, table]" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "dresser closest to the camera" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "[Detect] [armchair, dresser]" in QUESTION_TYPE_RULES["numeric_other"]
     assert "TV and TV stand" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "decimal, sum, direction" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Do not merge same-category attributed objects" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX

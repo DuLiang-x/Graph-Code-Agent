@@ -624,6 +624,9 @@ Selection rules:
 - Select the candidate that corresponds to the object referred to in the question, not just the most visually obvious object of the category.
 - Use spatial/contextual clues in the question, such as color, material, shape, relative position, nearby objects, and role in the scene.
 - If the question distinguishes similar objects, choose the candidate matching the distinguishing phrase, such as "white coffee table", "circular table", "black table", "person wearing a hat", "left chair", or "closer sofa".
+- In most Omni3D-Bench questions, different relevant objects should still have some visible difference in category, size, position, extent, or role. If two candidates for different object names have very similar boxes, sizes, and positions, re-read the question carefully: you may be confusing two similarly named but distinct objects, or selecting the same physical object for both targets.
+- Do not assume highly overlapping or near-identical candidates are interchangeable. Use subtle differences in box extent, center, object boundary, support surface, and scene role to distinguish related objects such as TV vs TV stand, cabinet vs cabinet top, table vs tabletop, chair vs cushion, or bed vs bedding.
+- For paired or adjacent objects such as TV and TV stand, the boxes may be close and partially overlapping, but they are not the same target: TV usually refers to the screen/display, while TV stand refers to the supporting furniture below or around it.
 - Match the Main target first. Use the Relation context only to choose among candidates for the same target category.
 - Relation context such as "under the tv" means choose the target object located under the TV; it does not mean choose the TV.
 - Relation context such as "right of X", "left of X", "next to X", "in front of X", and "behind X" is a candidate position constraint.
@@ -1015,6 +1018,8 @@ def parse_candidate_index_or_none(response: object, num_candidates: int) -> Opti
 def parse_object_relation_context(object_name: str) -> Dict[str, str]:
     text = re.sub(r"\s+", " ", str(object_name or "").strip().lower())
     patterns = [
+        (r"\s+(closest to|nearest to)\s+", "closest to"),
+        (r"\s+(furthest from|farthest from|furthest to|farthest to)\s+", "furthest from"),
         (r"\s+(to the right of|right of)\s+", "right of"),
         (r"\s+(to the left of|left of)\s+", "left of"),
         (r"\s+(in front of|front of)\s+", "in front of"),
@@ -1064,6 +1069,11 @@ def _remove_leading_color(prompt: str) -> str:
     ).strip()
 
 
+SAME_TYPE_EXISTENCE_RE = re.compile(
+    r"\b(?:two|2|multiple|more than one|same)\b.*\b(?:same object types?|same objects?|object types?)\b|"
+    r"\b(?:are|is) there (?:two|2|multiple|more than one) of the same objects?\b",
+    re.IGNORECASE,
+)
 NON_VISUAL_COUNT_RE = re.compile(r"\b(?:need|needed|stack|stacked|achieve|match|reach|same height|have to)\b")
 COUNT_RATIO_RE = re.compile(r"\bratio\s+of\b.*\b(?:to|and)\b", re.IGNORECASE)
 NUMERIC_DIMENSION_RE = re.compile(r"\b(?:height|width|length|depth|volume|distance|size|area|diagonal)\b", re.IGNORECASE)
@@ -1071,6 +1081,10 @@ MULTI_INSTANCE_NUMERIC_PATTERN = (
     r"\b(?:two|both|multiple|all)\s+(?:of\s+)?(?:the\s+)?{object}\b|"
     r"\bcombined\s+(?:height|width|length|depth|volume|size|area)\s+of\s+(?:the\s+)?(?:two|both|multiple|all)\s+(?:of\s+)?(?:the\s+)?{object}\b"
 )
+
+
+def is_same_type_existence_question(question: str) -> bool:
+    return bool(SAME_TYPE_EXISTENCE_RE.search(str(question or "")))
 
 
 def is_count_ratio_question(question: str) -> bool:
@@ -1099,6 +1113,8 @@ def _object_mentioned_in_question(question_text: str, object_name: str) -> bool:
 
 def is_visual_count_target(question_type: Optional[str], question: str, object_name: str) -> bool:
     question_text = re.sub(r"\s+", " ", str(question or "").lower())
+    if is_same_type_existence_question(question_text):
+        return True
     if is_same_category_multi_instance_numeric(question_text, object_name):
         return True
     if is_count_ratio_question(question_text) and _object_mentioned_in_question(question_text, object_name):

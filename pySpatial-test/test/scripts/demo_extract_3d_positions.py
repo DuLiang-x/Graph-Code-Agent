@@ -473,6 +473,15 @@ YES_NO_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 YES_NO_ANSWER_RE = re.compile(r"^\s*(yes|no)\s*[.!]?\s*$", re.IGNORECASE)
+SAME_TYPE_EXISTENCE_RE = re.compile(
+    r"\b(?:two|2|multiple|more than one|same)\b.*\b(?:same object types?|same objects?|object types?)\b|"
+    r"\b(?:are|is) there (?:two|2|multiple|more than one) of the same objects?\b",
+    re.IGNORECASE,
+)
+
+
+def is_same_type_existence_question(question: str) -> bool:
+    return bool(SAME_TYPE_EXISTENCE_RE.search(str(question or "")))
 
 
 def _sample_answer(sample):
@@ -555,6 +564,48 @@ def _same_general_object_category(a: str, b: str) -> bool:
     return base_a == base_b or base_a in base_b.split() or base_b in base_a.split()
 
 
+def postprocess_extracted_objects(objects: list, question: str = "", question_type: str = "generic") -> list:
+    output = []
+    for obj in objects or []:
+        for item in _split_synthetic_object_phrase(obj):
+            cleaned = _clean_extracted_object_phrase(item, question)
+            if cleaned and not _looks_like_non_object_phrase(cleaned):
+                output.append(cleaned)
+    if is_same_type_existence_question(question):
+        output = [obj for obj in output if not re.search(r"\b(?:same object types?|same objects?|object types?)\b", obj)]
+    return _dedupe_preserve_order(output)
+
+
+def _clean_extracted_object_phrase(name: str, question: str = "") -> str:
+    text = re.sub(r"\s+", " ", str(name or "").lower()).strip(" \"'`({[])}.,;:!?")
+    text = text.replace("left-most", "leftmost").replace("right-most", "rightmost").replace("top-most", "topmost")
+    text = re.sub(r"^(?:the|a|an)\s+", "", text)
+    text = re.sub(r"\bcombined$", "", text).strip()
+    text = re.sub(r"^(?:combined|same|double)\s+", "", text).strip()
+    text = re.sub(r"\s+", " ", text)
+    if text == "camera" and not re.search(r"\b(?:visible|physical|security|digital) camera\b", str(question or "").lower()):
+        return ""
+    if re.search(r"\b(?:same object types?|same objects?|object type|object types|physical objects|required objects)\b", text):
+        return ""
+    return text
+
+
+def _split_synthetic_object_phrase(name: str) -> list:
+    text = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    text = text.replace("television", "tv")
+    text = re.sub(r"^(?:the|a|an)\s+", "", text)
+    text = re.sub(r"\bcombined\b", "", text).strip()
+    if " and " in text and re.search(r"\b(tv|stand|table|chair|sink|cabinet|sofa|bed|dresser|nightstand|remote|coaster)\b", text):
+        parts = [part.strip() for part in text.split(" and ") if part.strip()]
+        if len(parts) == 2:
+            left, right = parts
+            left = _clean_extracted_object_phrase(left)
+            right = _clean_extracted_object_phrase(right)
+            if left and right:
+                return [left, right]
+    return [name]
+
+
 def merge_vlm_and_rule_objects(question_type: str, vlm_objects: list, rule_objects: list) -> list:
     if question_type != "numeric_other" or not vlm_objects or not rule_objects:
         return vlm_objects or rule_objects
@@ -589,13 +640,14 @@ def resolve_object_names(
 ) -> dict:
     question = sample.get("question", "")
     question_type = classify_question_type(sample)
-    rule_objects = resolve_object_names_by_rule(sample)
+    rule_objects = postprocess_extracted_objects(resolve_object_names_by_rule(sample), question, question_type)
     vlm_objects = []
     vlm_response = None
 
     if use_vlm_object_extraction and vlm_model is not None and image is not None:
         try:
             vlm_objects, vlm_response = extract_object_names_with_vlm(image, question, vlm_model, question_type=question_type)
+            vlm_objects = postprocess_extracted_objects(vlm_objects, question, question_type)
         except Exception as exc:
             vlm_response = "ERROR: {}".format(exc)
 
@@ -653,13 +705,13 @@ def extract_object_names_with_vlm(image, question: str, vlm_model, num_tries: in
             }
         ]
         response = vlm_model.process_messages(messages, max_new_tokens=128)
-        objects = parse_vlm_object_names(response)
+        objects = parse_vlm_object_names(response, preserve_duplicates=is_same_type_existence_question(question))
         if objects:
             return objects, response
     return [], response
 
 
-def parse_vlm_object_names(response: str) -> list:
+def parse_vlm_object_names(response: str, preserve_duplicates: bool = False) -> list:
     matches = re.findall(PATTERN_GET_OBJECTS_OF_INTEREST, str(response or ""))
     if not matches:
         return []
@@ -670,7 +722,7 @@ def parse_vlm_object_names(response: str) -> list:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if cleaned and not _looks_like_non_object_phrase(cleaned):
             names.append(cleaned)
-    return _dedupe_preserve_order(names)
+    return names if preserve_duplicates else _dedupe_preserve_order(names)
 
 
 def extract_object_names_from_omni3d_question(question: str) -> list:
@@ -724,6 +776,7 @@ def _looks_like_non_object_phrase(text: str) -> bool:
         "objects",
         "object",
         "one",
+        "physical",
     }
     non_objects = {
         "left",
@@ -738,6 +791,10 @@ def _looks_like_non_object_phrase(text: str) -> bool:
         "yes",
         "no",
         "same",
+        "same object types",
+        "same object type",
+        "object type",
+        "object types",
     }
     first_word = text.split()[0]
     return (
