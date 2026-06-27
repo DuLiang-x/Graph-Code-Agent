@@ -1178,8 +1178,9 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert "bench: usually elongated" in prompt
     assert "sofa/couch: usually larger" in prompt
     assert "ottoman: usually a low padded seat" in prompt
-    assert "Treat words such as rightmost, leftmost, topmost, and bottommost as part of the target object phrase" in prompt
+    assert "Treat words such as rightmost, leftmost, topmost, bottommost, center, and middle as part of the target object phrase" in prompt
     assert 'For "rightmost chair" or similar targets, choose the rightmost complete candidate' in prompt
+    assert 'For "center cabinet" or "middle cabinet" targets, choose the complete same-category candidate whose center is closest to the image center' in prompt
     assert "Do not choose a larger, clearer, or more central candidate" in prompt
     assert 'For "glass table", choose the actual glass/transparent table' in prompt
     assert "not a black plastic table or ordinary dark table" in prompt
@@ -1226,6 +1227,30 @@ def test_vlm_refinement_rejects_relation_mismatch_for_rightmost_object():
     item = result["rightmost chair"]
     assert item["box2d"] == [70, 10, 90, 50]
     assert item["candidate_rank_reason"] == "rule_ranker"
+    assert item["rule_selected_index"] == 0
+    assert item["vlm_selected_index"] == 1
+    assert item["final_selected_index"] == 0
+    assert item["selection_decision"] == "rule_ranker_vlm_rejected"
+    assert item["selection_reject_reason"] == "relation_mismatch"
+
+
+def test_vlm_refinement_rejects_relation_mismatch_for_center_object():
+    locator = make_locator(
+        {
+            "center cabinet": [
+                {"box2d": [40, 0, 60, 80], "score": 0.80, "prompt": "center cabinet"},
+                {"box2d": [75, 0, 98, 80], "score": 0.78, "prompt": "center cabinet"},
+            ]
+        },
+        vlm_model=FakeVLM(response="1"),
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (100, 100), color="white")
+
+    result = locator.extract(image, ["center cabinet"])
+
+    item = result["center cabinet"]
+    assert item["box2d"] == [40, 0, 60, 80]
     assert item["rule_selected_index"] == 0
     assert item["vlm_selected_index"] == 1
     assert item["final_selected_index"] == 0

@@ -388,7 +388,7 @@ class Object3DLocator:
                 rule_selected["selection_decision"] = "rule_ranker_vlm_invalid"
                 rule_selected["selection_reject_reason"] = "invalid_vlm_response"
             else:
-                allowed, reject_reason = validate_vlm_selection(object_name, selected, rule_ranked)
+                allowed, reject_reason = validate_vlm_selection(object_name, selected, rule_ranked, image_size=image_pil.size)
                 rule_selected["vlm_selected_index"] = selected.get("candidate_index")
                 if allowed:
                     selected = dict(selected)
@@ -680,9 +680,10 @@ Omnitest2 badcase-guided rules:
 - For post-it notes, handles, letters, and lightbulbs, prefer each single visible object with a tight box and reject large regions that contain several targets.
 
 Relation modifier rules:
-- Treat words such as rightmost, leftmost, topmost, and bottommost as part of the target object phrase, not as optional context.
+- Treat words such as rightmost, leftmost, topmost, bottommost, center, and middle as part of the target object phrase, not as optional context.
 - For "rightmost chair" or similar targets, choose the rightmost complete candidate among candidates that match the target category.
-- Do not choose a larger, clearer, or more central candidate if it violates the explicit rightmost/leftmost/topmost/bottommost modifier.
+- For "center cabinet" or "middle cabinet" targets, choose the complete same-category candidate whose center is closest to the image center; do not choose a clearer or higher-scoring left/right candidate.
+- Do not choose a larger, clearer, or more central candidate if it violates the explicit rightmost/leftmost/topmost/bottommost/center/middle modifier.
 
 Return format:
 - Return only one integer index.
@@ -797,7 +798,7 @@ def _large_object_complete_box_override(object_name: str, selected: Dict[str, ob
     return selected_area <= best_area * 8.0
 
 
-def validate_vlm_selection(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> Tuple[bool, Optional[str]]:
+def validate_vlm_selection(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]], image_size: Optional[Tuple[int, int]] = None) -> Tuple[bool, Optional[str]]:
     if not candidates:
         return False, "no_candidates"
     selected_score = float(selected.get("rank_score", selected.get("score", 0.0)))
@@ -811,7 +812,7 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
     rank_margin = 0.45 if is_material_object(object_name) else 0.20
     if selected_score < best_score - rank_margin:
         return False, "rank_score_too_low"
-    if not _selection_matches_relation(object_name, selected, candidates):
+    if not _selection_matches_relation(object_name, selected, candidates, image_size=image_size):
         return False, "relation_mismatch"
     if not is_area_object(object_name):
         selected_area = box_area(selected.get("box2d", [0, 0, 0, 0]))
@@ -1280,9 +1281,9 @@ def _candidate_contains_multiple_tighter_boxes(candidate: Dict[str, object], can
 
 def relation_modifier(object_name: str) -> str:
     name = object_name.lower().replace("left-most", "leftmost").replace("top-most", "topmost")
-    for modifier in ["leftmost", "rightmost", "center", "topmost", "bottommost"]:
+    for modifier in ["leftmost", "rightmost", "center", "centered", "middle", "topmost", "bottommost"]:
         if name.startswith(modifier + " "):
-            return modifier
+            return "center" if modifier in {"centered", "middle"} else modifier
     return ""
 
 
@@ -1351,9 +1352,9 @@ def _same_box(a, b) -> bool:
     return [int(v) for v in a] == [int(v) for v in b]
 
 
-def _selection_matches_relation(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]]) -> bool:
+def _selection_matches_relation(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]], image_size: Optional[Tuple[int, int]] = None) -> bool:
     relation = relation_modifier(object_name)
-    if relation not in {"leftmost", "rightmost", "topmost", "bottommost"}:
+    if relation not in {"leftmost", "rightmost", "topmost", "bottommost", "center"}:
         return True
     reasonable = _reasonable_relation_candidates(candidates, relation)
     selected_box = selected.get("box2d", [0, 0, 0, 0])
@@ -1371,7 +1372,24 @@ def _selection_matches_relation(object_name: str, selected: Dict[str, object], c
     if relation == "bottommost":
         expected = max(reasonable, key=lambda item: box_center(item["box2d"])[1])
         return box_center(selected_box)[1] >= box_center(expected["box2d"])[1] - 1.0
+    if relation == "center":
+        image_center = (image_size[0] / 2.0, image_size[1] / 2.0) if image_size is not None else _candidate_set_center(candidates)
+        expected = min(reasonable, key=lambda item: distance(box_center(item["box2d"]), image_center))
+        selected_distance = distance(box_center(selected_box), image_center)
+        expected_distance = distance(box_center(expected["box2d"]), image_center)
+        return selected_distance <= expected_distance + 1.0
     return True
+
+
+def _candidate_set_center(candidates: List[Dict[str, object]]) -> Tuple[float, float]:
+    boxes = [item.get("box2d", [0, 0, 0, 0]) for item in candidates if item.get("box2d")]
+    if not boxes:
+        return (0.0, 0.0)
+    min_x = min(float(box[0]) for box in boxes)
+    min_y = min(float(box[1]) for box in boxes)
+    max_x = max(float(box[2]) for box in boxes)
+    max_y = max(float(box[3]) for box in boxes)
+    return ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
 
 
 def is_area_object(object_name: str) -> bool:
