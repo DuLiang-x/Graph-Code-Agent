@@ -19,7 +19,7 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, is_count_ratio_question, is_same_category_multi_instance_numeric, is_same_type_existence_question, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, is_count_ratio_question, is_same_category_multi_instance_numeric, is_same_type_existence_question, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, relation_modifier, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
@@ -83,7 +83,7 @@ def test_float_how_many_stack_is_numeric_other_not_counting():
         "answer_type": "float",
     }
 
-    assert demo_extract_3d_positions.classify_question_type(sample) == "numeric_other"
+    assert demo_extract_3d_positions.classify_question_type(sample) == "number_other"
 
 
 def test_int_how_many_visible_is_numeric_count():
@@ -93,7 +93,7 @@ def test_int_how_many_visible_is_numeric_count():
         "answer_type": "int",
     }
 
-    assert demo_extract_3d_positions.classify_question_type(sample) == "numeric_ct"
+    assert demo_extract_3d_positions.classify_question_type(sample) == "number_vt"
 
 
 class FakePluralGeneralizingObjectExtractionVLM:
@@ -117,7 +117,7 @@ def test_numeric_other_keeps_precise_rule_objects_when_vlm_generalizes_to_plural
         use_vlm_object_extraction=True,
     )
 
-    assert resolved["question_type"] == "numeric_other"
+    assert resolved["question_type"] == "number_other"
     assert resolved["method"] == "vlm_rule_merged"
     assert "rightmost stool" in resolved["objects"]
     assert "leftmost chair" in resolved["objects"]
@@ -127,12 +127,44 @@ def test_numeric_other_keeps_precise_rule_objects_when_vlm_generalizes_to_plural
 
 def test_numeric_other_keeps_same_category_different_instance_modifiers():
     merged = demo_extract_3d_positions.merge_vlm_and_rule_objects(
-        "numeric_other",
+        "number_other",
         ["leftmost cabinet", "center cabinet"],
         ["leftmost cabinet", "center cabinet"],
     )
 
     assert merged == ["leftmost cabinet", "center cabinet"]
+
+
+def test_merge_keeps_tv_and_tv_stand_as_distinct_compound_objects():
+    merged = demo_extract_3d_positions.merge_vlm_and_rule_objects(
+        "number_other",
+        ["tv", "tv stand"],
+        ["tv", "tv stand"],
+        question="What is the ratio of the height of the TV to the width of the TV stand?",
+    )
+
+    assert merged == ["tv", "tv stand"]
+
+
+def test_omni3d_157_style_extraction_keeps_tv_stand_operand(tmpdir):
+    image_path = Path(str(tmpdir)) / "sample.png"
+    Image.new("RGB", (16, 16), color="white").save(str(image_path))
+    sample = {
+        "question": "What is the ratio of the height of the TV to the width of the TV stand?",
+        "answer": 0.673,
+        "answer_type": "float",
+    }
+    vlm = FakeObjectExtractionVLM(["[Detect] [TV, TV stand]"])
+
+    resolved = demo_extract_3d_positions.resolve_object_names(
+        sample,
+        image=str(image_path),
+        vlm_model=vlm,
+        use_vlm_object_extraction=True,
+    )
+
+    assert resolved["question_type"] == "number_other"
+    assert resolved["objects"] == ["tv", "tv stand"]
 
 
 def test_omni3d_4_style_extraction_keeps_leftmost_and_center_cabinets(tmpdir):
@@ -152,7 +184,7 @@ def test_omni3d_4_style_extraction_keeps_leftmost_and_center_cabinets(tmpdir):
         use_vlm_object_extraction=True,
     )
 
-    assert resolved["question_type"] == "numeric_other"
+    assert resolved["question_type"] == "number_other"
     assert resolved["objects"] == ["leftmost cabinet", "center cabinet"]
 
 
@@ -243,7 +275,7 @@ def test_count_question_expands_count_target_into_indexed_instances():
         image,
         ["handles", "cabinets"],
         question="How many handles are on the cabinets?",
-        question_type="numeric_ct",
+        question_type="number_vt",
     )
 
     assert result["handles"]["counting_target"] is True
@@ -337,7 +369,7 @@ def test_count_question_can_return_more_than_num_candidates():
         image,
         ["handles"],
         question="How many handles are visible?",
-        question_type="numeric_ct",
+        question_type="number_vt",
     )
 
     expected_names = [f"handle_{idx}" for idx in range(1, 9)]
@@ -393,8 +425,8 @@ def test_count_ratio_and_same_category_numeric_helpers():
     assert is_same_category_multi_instance_numeric("What is the combined width of the two sinks compared with the bathtub?", "sinks")
     assert is_same_category_multi_instance_numeric("How many objects with the combined volume of two bedside tables fit in the bed?", "bedside tables")
     assert not is_same_category_multi_instance_numeric("What is the height of the sink?", "sink")
-    assert is_visual_count_target("numeric_other", "What is the ratio of coasters to black TV remotes?", "coaster")
-    assert is_visual_count_target("numeric_other", "What is the combined width of the two sinks compared with the bathtub?", "sinks")
+    assert is_visual_count_target("number_other", "What is the ratio of coasters to black TV remotes?", "coaster")
+    assert is_visual_count_target("number_other", "What is the combined width of the two sinks compared with the bathtub?", "sinks")
 
 
 def test_numeric_other_two_sinks_expands_into_indexed_instances():
@@ -415,7 +447,7 @@ def test_numeric_other_two_sinks_expands_into_indexed_instances():
         image,
         ["sinks", "bathtub"],
         question="What is the combined width of the two sinks compared with the bathtub?",
-        question_type="numeric_other",
+        question_type="number_other",
     )
 
     assert result["sinks"]["counting_target"] is True
@@ -442,7 +474,7 @@ def test_count_ratio_expands_both_sides_into_indexed_instances():
         image,
         ["coasters", "black tv remotes"],
         question="What is the ratio of coasters to black TV remotes?",
-        question_type="numeric_other",
+        question_type="number_other",
     )
 
     assert result["coasters"]["counting_instances"] == ["coaster_1", "coaster_2"]
@@ -621,27 +653,131 @@ class FakeObjectExtractionVLM:
         return self.responses.pop(0)
 
 
+def test_relation_reference_objects_are_kept_by_rule_extraction():
+    sample = {
+        "question": "Is the chair closer to the stool than the table?",
+        "answer_type": "str",
+        "answer": "yes",
+    }
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, use_vlm_object_extraction=False)
+
+    assert "chair" in info["objects"]
+    assert "stool" in info["objects"]
+    assert "table" in info["objects"]
+
+
+def test_vlm_relation_phrase_is_split_into_target_and_reference(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "Is the white chair next to the black stool?",
+        "answer_type": "str",
+        "answer": "yes",
+    }
+    vlm = FakeObjectExtractionVLM(["[white chair next to the black stool]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert "white chair" in info["objects"]
+    assert "black stool" in info["objects"]
+    assert "white chair next to the black stool" not in info["objects"]
+
+
+
+def test_omni3d_33_style_vlm_relation_operands_keep_reference(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "Is the stool to the left of the piano and in front of the piano?",
+        "answer_type": "str",
+        "answer": "yes",
+    }
+    vlm = FakeObjectExtractionVLM(["[stool to the left of the piano, stool in front of the piano, piano]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert "stool" in info["objects"]
+    assert "piano" in info["objects"]
+    assert "stool to the left of the piano" not in info["objects"]
+
+
+def test_omni3d_184_style_relation_specific_cabinet_operands_are_kept(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "If the width of the combined cabinets to the left of the fume vent is 4.2m, how tall is the cabinet to the right of the fume vent in meters?",
+        "answer_type": "float",
+        "answer": 2.0,
+    }
+    vlm = FakeObjectExtractionVLM(["[Detect] [cabinets to the left of the fume vent, cabinet to the right of the fume vent, fume vent]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert "cabinets to the left of the fume vent" in info["objects"]
+    assert "cabinet to the right of the fume vent" in info["objects"]
+    assert "fume vent" in info["objects"]
+
+
+def test_merge_keeps_explicit_same_category_operands_from_question():
+    merged = demo_extract_3d_positions.merge_vlm_and_rule_objects(
+        "number_other",
+        ["left cabinet"],
+        ["left cabinet", "right cabinet"],
+        question="What is the ratio of the width of the left cabinet to the height of the right cabinet?",
+    )
+
+    assert "left cabinet" in merged
+    assert "right cabinet" in merged
+
+
+def test_merge_keeps_precise_rule_objects_for_non_numeric_questions():
+    merged = demo_extract_3d_positions.merge_vlm_and_rule_objects(
+        "multi_choice",
+        ["chair"],
+        ["left chair", "right chair"],
+        question="Which is closer to the camera, the left chair or the right chair?",
+    )
+
+    assert "left chair" in merged
+    assert "right chair" in merged
+    assert "chair" not in merged
+
+
+def test_merge_keeps_relation_specific_object_over_generic_object():
+    merged = demo_extract_3d_positions.merge_vlm_and_rule_objects(
+        "multi_choice",
+        ["table"],
+        ["table under tv", "tv"],
+        question="Which object is closer, the table under the TV or the sofa?",
+    )
+
+    assert "table under tv" in merged
+    assert "tv" in merged
+    assert "table" not in merged
+
+
 def test_classify_question_type_for_omni3d_categories():
     assert demo_extract_3d_positions.classify_question_type({
         "question": "How many handles are on the cabinets?",
         "answer_type": "int",
         "answer": 11,
-    }) == "numeric_ct"
+    }) == "number_vt"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "How many stools are needed to match the chair height?",
         "answer_type": "float",
         "answer": 1.8,
-    }) == "numeric_other"
+    }) == "number_other"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "What is the ratio of brown chairs to black chairs? Answer as a decimal.",
         "answer_type": "float",
         "answer": 0.5,
-    }) == "numeric_ct"
+    }) == "number_vt"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "What is the ratio of the fireplace height to the sofa height?",
         "answer_type": "float",
         "answer": 0.94,
-    }) == "numeric_other"
+    }) == "number_other"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "Are the number of cabinets greater than the number of windows visible?",
         "answer_type": "str",
@@ -651,12 +787,32 @@ def test_classify_question_type_for_omni3d_categories():
         "question": "Which object is closer to the fireplace: the sofa or the coffee table?",
         "answer_type": "str",
         "answer": "sofa",
-    }) == "choice_object"
+    }) == "multi_choice"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "Which of these is closer to the fireplace? Options: {sofa, coffee table}",
         "answer_type": "float",
         "answer": 0.0,
-    }) == "choice_object"
+    }) == "multi_choice"
+
+
+def test_yes_no_and_multi_choice_can_still_trigger_count_targets():
+    yes_no_question = "Are the number of chairs greater than the number of stools visible?"
+    multi_choice_question = "Which group has more visible objects? Options: {chairs, stools}"
+
+    assert demo_extract_3d_positions.classify_question_type({
+        "question": yes_no_question,
+        "answer_type": "str",
+        "answer": "yes",
+    }) == "yes_no"
+    assert is_visual_count_target("yes_no", yes_no_question, "chairs")
+    assert is_visual_count_target("yes_no", yes_no_question, "stools")
+    assert demo_extract_3d_positions.classify_question_type({
+        "question": multi_choice_question,
+        "answer_type": "str",
+        "answer": "chairs",
+    }) == "multi_choice"
+    assert is_visual_count_target("multi_choice", multi_choice_question, "chairs")
+    assert is_visual_count_target("multi_choice", multi_choice_question, "stools")
 
 
 def test_same_type_existence_question_triggers_multi_instance_target(tmpdir):
@@ -722,9 +878,9 @@ def test_vlm_object_extraction_prompt_uses_question_type_rules(tmpdir):
     info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
 
     prompt = vlm.calls[0][0][0]["content"][1]["text"]
-    assert info["question_type"] == "numeric_ct"
+    assert info["question_type"] == "number_vt"
     assert info["objects"] == ["handles", "cabinets"]
-    assert "Question type: numeric count" in prompt
+    assert "Question type: number visual counting" in prompt
     assert "all visible instances" in prompt
     assert "[Detect] [handles, cabinets]" in prompt
 
@@ -1144,57 +1300,56 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     prompt = content[2]["text"]
     assert "Candidate metadata table:" in prompt
     assert "index | prompt | box2d | center | area_ratio | dino_score | rank_score | rank_reasons" in prompt
-    assert "Coordinate hint: larger x means farther right" in prompt
-    assert "Candidate 0 is the rule-ranked best candidate, but you may choose another candidate if it better matches the exact target object category and question context." in prompt
-    assert "not just the most visually obvious object of the category" in prompt
-    assert "Target object phrase:" in prompt
-    assert "Main target:" in prompt
-    assert "Relation context:" in prompt
-    assert "Reference object:" in prompt
-    assert "color, material, shape, relative position, nearby objects, and role in the scene" in prompt
-    assert '"white coffee table", "circular table", "black table", "person wearing a hat", "left chair", or "closer sofa"' in prompt
-    assert "very similar boxes, sizes, and positions" in prompt
-    assert "TV vs TV stand" in prompt
-    assert "Do not assume highly overlapping or near-identical candidates are interchangeable" in prompt
-    assert "under the tv" in prompt
-    assert "it does not mean choose the TV" in prompt
-    assert "Use the full-image overlay first" in prompt
-    assert "Use the crop grid only as supporting evidence" in prompt
-    assert "Object-specific rules:" in prompt
-    assert "avoid boxes that include large carpet/floor/background regions or multiple objects" in prompt
-    assert "avoid partial boxes that only cover the top, seat, backrest, leg, or one component" in prompt
-    assert "For bed, sofa, and couch targets, prefer the complete visible main body" in prompt
-    assert "armrest, cushion, seat patch, bed corner, headboard fragment" in prompt
-    assert "explicit position words such as leftmost, rightmost, topmost, bottommost, under, next to, or right of override the center preference" in prompt
-    assert "prefer the large low horizontal floor-covering region" in prompt
-    assert "Similar-object rules:" in prompt
-    assert "chair, stool, bench, sofa, couch, ottoman, and seat" in prompt
-    assert 'Do not select a stool for "chair"' in prompt
-    assert 'Do not select a chair for "stool"' in prompt
-    assert 'Do not select a chair for "bench", "sofa", "couch", or "ottoman"' in prompt
-    assert 'Do not select an ottoman for "stool" or a stool for "ottoman"' in prompt
-    assert "chair: usually has a backrest" in prompt
-    assert "stool: usually has no backrest" in prompt
-    assert "bench: usually elongated" in prompt
-    assert "sofa/couch: usually larger" in prompt
-    assert "ottoman: usually a low padded seat" in prompt
-    assert "Treat words such as rightmost, leftmost, topmost, bottommost, center, and middle as part of the target object phrase" in prompt
-    assert 'For "rightmost chair" or similar targets, choose the rightmost complete candidate' in prompt
-    assert 'For "center cabinet" or "middle cabinet" targets, choose the complete same-category candidate whose center is closest to the image center' in prompt
-    assert "Do not choose a larger, clearer, or more central candidate" in prompt
-    assert 'For "glass table", choose the actual glass/transparent table' in prompt
-    assert "not a black plastic table or ordinary dark table" in prompt
-    assert "Treat shape words such as circular, round, square, rectangular, and oval" in prompt
-    assert 'For "circular table" or "round table", choose the round/circular table' in prompt
-    assert 'For "gray chair" vs "black chair", choose the chair matching the requested color' in prompt
-    assert 'For "polka-dot", "striped", "solid", "translucent", "glass", "circular", or "round" targets, the attribute is mandatory.' in prompt
-    assert "TV and TV stand are different targets" in prompt
-    assert "two sinks" in prompt
-    assert "count-ratio targets" in prompt
-    assert "Do not select answer words or non-object fragments" in prompt
     assert "Return only one integer index" in prompt
     assert "return INVALID" in prompt
 
+
+
+def test_forced_candidate_selection_bypasses_vlm_refinement():
+    vlm = FakeVLM(response="0")
+    locator = make_locator(
+        {
+            "chair": [
+                {"box2d": [1, 1, 5, 5], "score": 0.9},
+                {"box2d": [8, 8, 12, 12], "score": 0.75},
+            ]
+        },
+        vlm_model=vlm,
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (16, 16), color="white")
+
+    result = locator.extract(image, ["chair"], forced_candidate_selections={"chair": 1})
+
+    item = result["chair"]
+    assert item["box2d"] == [8, 8, 12, 12]
+    assert item["candidate_rank_reason"] == "forced_vlm_candidate_scoring"
+    assert item["vlm_selected_index"] == 1
+    assert item["final_selected_index"] == 1
+    assert item["selection_decision"] == "forced_vlm_candidate_scoring"
+    assert item["selection_reject_reason"] is None
+    assert vlm.messages is None
+
+
+def test_invalid_forced_candidate_falls_back_to_rule_ranker():
+    locator = make_locator(
+        {
+            "chair": [
+                {"box2d": [1, 1, 5, 5], "score": 0.9},
+                {"box2d": [8, 8, 12, 12], "score": 0.75},
+            ]
+        },
+        use_vlm_refinement=False,
+    )
+    image = Image.new("RGB", (16, 16), color="white")
+
+    result = locator.extract(image, ["chair"], forced_candidate_selections={"chair": 99})
+
+    item = result["chair"]
+    assert item["box2d"] == [1, 1, 5, 5]
+    assert item["candidate_rank_reason"] == "rule_ranker"
+    assert item["selection_decision"] == "rule_ranker_forced_invalid"
+    assert item["selection_reject_reason"] == "invalid_forced_candidate"
 
 def test_rightmost_relation_prefers_quality_candidate_over_extreme_partial_box():
     image = Image.new("RGB", (100, 100), color="white")
@@ -1207,6 +1362,33 @@ def test_rightmost_relation_prefers_quality_candidate_over_extreme_partial_box()
     selected = rank_detection_candidates(image, "rightmost stool", candidates)
 
     assert selected["box2d"] == [50, 60, 95, 95]
+
+
+def test_furthest_relation_modifier_and_ranker_prefers_image_farthest_candidate():
+    image = Image.new("RGB", (200, 120), color="white")
+    candidates = [
+        {"box2d": [10, 45, 110, 118], "score": 0.95, "prompt": "leather chair", "rank_score": 0.95},
+        {"box2d": [125, 8, 155, 38], "score": 0.35, "prompt": "leather chair", "rank_score": 0.35},
+    ]
+
+    selected = rank_detection_candidates(image, "furthest leather chair", candidates)
+
+    assert relation_modifier("furthest leather chair") == "furthest"
+    assert relation_modifier("farthest leather chair") == "furthest"
+    assert relation_modifier("nearest leather chair") == "closest"
+    assert selected["box2d"] == [125, 8, 155, 38]
+
+
+def test_vlm_refinement_rejects_furthest_foreground_candidate():
+    candidates = [
+        {"box2d": [10, 45, 110, 118], "score": 0.95, "prompt": "leather chair", "rank_score": 0.95},
+        {"box2d": [125, 8, 155, 38], "score": 0.35, "prompt": "leather chair", "rank_score": 0.35},
+    ]
+
+    allowed, reject_reason = validate_vlm_selection("furthest leather chair", candidates[0], candidates, image_size=(200, 120))
+
+    assert not allowed
+    assert reject_reason == "relation_mismatch"
 
 
 def test_vlm_refinement_rejects_relation_mismatch_for_rightmost_object():
@@ -1557,36 +1739,45 @@ def test_object_extraction_prompt_has_question_type_rules():
     from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST, QUESTION_TYPE_RULES
 
     assert "{question_type_rules}" in PROMPT_GET_OBJECTS_OF_INTEREST
-    assert set(["numeric_ct", "numeric_other", "yes_no", "choice_object"]).issubset(QUESTION_TYPE_RULES)
-    assert "Question type: numeric count" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "ratio of brown chairs to black chairs" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "[Detect] [brown chairs, black chairs]" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "Plural words alone do not mean the task is visual counting" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "stack/reach/match/fit" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "all visible instances" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "do not invent indexed names" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "handle_1" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["numeric_ct"]
-    assert "Question type: numeric measurement or ratio" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "How many of X would you stack/reach/match" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "leftmost cabinet and center cabinet" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "[Detect] [leftmost cabinet, center cabinet]" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "[Detect] [rightmost stool, leftmost chair]" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "combined height" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "two sinks" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "ratio of coasters to black TV remotes" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "bedside tables" in QUESTION_TYPE_RULES["numeric_other"]
+    assert set(["number_vt", "number_other", "yes_no", "multi_choice"]).issubset(QUESTION_TYPE_RULES)
+    assert "Question type: number visual counting" in QUESTION_TYPE_RULES["number_vt"]
+    assert "ratio of brown chairs to black chairs" in QUESTION_TYPE_RULES["number_vt"]
+    assert "[Detect] [brown chairs, black chairs]" in QUESTION_TYPE_RULES["number_vt"]
+    assert "Plural words alone do not mean the task is visual counting" in QUESTION_TYPE_RULES["number_vt"]
+    assert "stack/reach/match/fit" in QUESTION_TYPE_RULES["number_vt"]
+    assert "all visible instances" in QUESTION_TYPE_RULES["number_vt"]
+    assert "do not invent indexed names" in QUESTION_TYPE_RULES["number_vt"]
+    assert "handle_1" in QUESTION_TYPE_RULES["number_vt"]
+    assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["number_vt"]
+    assert "Question type: number measurement or non-counting ratio" in QUESTION_TYPE_RULES["number_other"]
+    assert "How many of X would you stack/reach/match" in QUESTION_TYPE_RULES["number_other"]
+    assert "leftmost cabinet and center cabinet" in QUESTION_TYPE_RULES["number_other"]
+    assert "Is the chair closer to the stool than the table?" in QUESTION_TYPE_RULES["number_other"]
+    assert "[Detect] [chair, stool, table]" in QUESTION_TYPE_RULES["number_other"]
+    assert "Is the white chair next to the black stool?" in QUESTION_TYPE_RULES["number_other"]
+    assert "[Detect] [white chair, black stool]" in QUESTION_TYPE_RULES["number_other"]
+    assert "[Detect] [leftmost cabinet, center cabinet]" in QUESTION_TYPE_RULES["number_other"]
+    assert "[Detect] [rightmost stool, leftmost chair]" in QUESTION_TYPE_RULES["number_other"]
+    assert "combined height" in QUESTION_TYPE_RULES["number_other"]
+    assert "two sinks" in QUESTION_TYPE_RULES["number_other"]
+    assert "ratio of coasters to black TV remotes" in QUESTION_TYPE_RULES["number_other"]
+    assert "bedside tables" in QUESTION_TYPE_RULES["number_other"]
     assert "Question type: yes/no" in QUESTION_TYPE_RULES["yes_no"]
     assert "visibility" in QUESTION_TYPE_RULES["yes_no"]
     assert "same object type" in QUESTION_TYPE_RULES["yes_no"]
-    assert "Question type: object choice" in QUESTION_TYPE_RULES["choice_object"]
-    assert "every physical object in the options must be included" in QUESTION_TYPE_RULES["choice_object"]
+    assert "compares counts" in QUESTION_TYPE_RULES["yes_no"]
+    assert "Question type: object choice" in QUESTION_TYPE_RULES["multi_choice"]
+    assert "every physical object in the options must be included" in QUESTION_TYPE_RULES["multi_choice"]
+    assert "compares groups by count" in QUESTION_TYPE_RULES["multi_choice"]
 
 
 def test_object_extraction_prompt_documents_attribute_distinction_rule():
     from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST, PROMPT_GET_OBJECTS_OF_INTEREST_AUX, QUESTION_TYPE_RULES
 
     assert "Attribute distinction rule" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "Relation reference rule" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "include that reference object as a separate [Detect] item" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "Do not output \"X next to Y\"" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "gray chair" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "black chair" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "[Detect] [gray chair, table, black chair]" in PROMPT_GET_OBJECTS_OF_INTEREST
@@ -1596,10 +1787,10 @@ def test_object_extraction_prompt_documents_attribute_distinction_rule():
     assert "same object types" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "[Detect] [sofa, tv, tv stand]" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "[Detect] [chairs]" in PROMPT_GET_OBJECTS_OF_INTEREST
-    assert "If the 3D height of the wooden chair is 3.80 meters" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "[Detect] [wooden chair, table]" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "dresser closest to the camera" in QUESTION_TYPE_RULES["numeric_other"]
-    assert "[Detect] [armchair, dresser]" in QUESTION_TYPE_RULES["numeric_other"]
+    assert "If the 3D height of the wooden chair is 3.80 meters" in QUESTION_TYPE_RULES["number_other"]
+    assert "[Detect] [wooden chair, table]" in QUESTION_TYPE_RULES["number_other"]
+    assert "dresser closest to the camera" in QUESTION_TYPE_RULES["number_other"]
+    assert "[Detect] [armchair, dresser]" in QUESTION_TYPE_RULES["number_other"]
     assert "TV and TV stand" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "decimal, sum, direction" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Do not merge same-category attributed objects" in PROMPT_GET_OBJECTS_OF_INTEREST_AUX

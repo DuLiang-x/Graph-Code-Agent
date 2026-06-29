@@ -1,5 +1,10 @@
 #!/usr/bin/env python
-"""CLI demo for object_3d_extraction."""
+"""Extract Omni3D object 3D positions with VLM candidate scoring.
+
+This entry point is self-contained. Ordinary non-counting targets use a
+candidate-scoring VLM prompt instead of the standard refinement validator.
+Counting targets still use Object3DLocator's existing multi-instance path.
+"""
 
 from __future__ import annotations
 
@@ -8,20 +13,30 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from PIL import Image, ImageDraw
 
 REPO_TEST_DIR = Path(__file__).resolve().parents[1]
 if str(REPO_TEST_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_TEST_DIR))
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
+from object_3d_extraction.object_3d_locator import (
+    clamp_box_to_image,
+    draw_labeled_box,
+    is_count_ratio_question,
+    rank_candidates_for_object,
+)
 from object_3d_extraction.prompts import (
     PATTERN_GET_OBJECTS_OF_INTEREST,
     PROMPT_GET_OBJECTS_OF_INTEREST,
     PROMPT_GET_OBJECTS_OF_INTEREST_AUX,
     QUESTION_TYPE_RULES,
 )
-from object_3d_extraction.object_3d_locator import is_count_ratio_question
 from object_3d_extraction.utils import extract_object_names_from_question_options
+
+
 
 DEFAULT_LOCAL_QWEN_MODEL_PATH = "/data/pretrain_models/Qwen/models--Qwen--Qwen2.5-VL-7B-Instruct"
 
@@ -955,21 +970,453 @@ def write_sample_json(sample_dir: Path, sample_key: str, record: dict) -> Path:
     return output_path
 
 
-def main() -> None:
-    args = parse_args()
-    samples = load_samples(args)
-    if not samples:
-        raise ValueError("No samples found in --dataset_json, --sample_json, or --jsonl")
-
+def build_scoring_config(args: argparse.Namespace) -> Object3DExtractionConfig:
     config = Object3DExtractionConfig()
     config.detection.box_threshold = args.box_threshold
     config.detection.text_threshold = args.text_threshold
     config.detection.use_vlm_refinement = args.use_vlm_refinement
     config.detection.count_max_instances = args.count_max_instances
     config.mask_fallback_mode = args.mask_fallback
-    vlm_model = build_vlm_refinement_model(args)
-    locator = Object3DLocator(config=config, device=args.device, vlm_model=vlm_model)
+    return config
+
+
+def safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name).strip()).strip("_") or "object"
+
+
+def clamp_box(box: List[int], image_size: Tuple[int, int]) -> List[int]:
+    return [int(v) for v in clamp_box_to_image([int(x) for x in box], image_size)]
+
+
+def make_candidate_overlay(image: Image.Image, candidates: List[Dict[str, Any]], selected_index: Optional[int] = None) -> Image.Image:
+    overlay = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(overlay)
+    colors = ["red", "lime", "cyan", "yellow", "magenta", "orange", "white", "blue"]
+    for order, candidate in enumerate(candidates):
+        box = clamp_box(candidate["box2d"], image.size)
+        candidate_index = int(candidate.get("candidate_index", order))
+        color = "lime" if selected_index is not None and candidate_index == selected_index else colors[order % len(colors)]
+        width = 6 if selected_index is not None and candidate_index == selected_index else 4
+        draw_labeled_box(draw, box, color, width=width)
+        x1, y1 = box[0], box[1]
+        draw.rectangle([x1, y1, x1 + 42, y1 + 28], fill="black")
+        draw.text((x1 + 8, y1 + 5), str(candidate_index), fill=color)
+    return overlay
+
+
+def make_crop_grid(image: Image.Image, candidates: List[Dict[str, Any]]) -> Image.Image:
+    crops = []
+    for order, candidate in enumerate(candidates):
+        box = clamp_box(candidate["box2d"], image.size)
+        crop = image.crop(tuple(box)).resize((224, 224))
+        draw = ImageDraw.Draw(crop)
+        candidate_index = int(candidate.get("candidate_index", order))
+        draw.rectangle([0, 0, 68, 30], fill="white")
+        draw.text((8, 6), str(candidate_index), fill="red")
+        crops.append(crop)
+    cols = min(5, max(1, len(crops)))
+    rows = (len(crops) + cols - 1) // cols
+    grid = Image.new("RGB", (cols * 224, rows * 224), "white")
+    for idx, crop in enumerate(crops):
+        grid.paste(crop, ((idx % cols) * 224, (idx // cols) * 224))
+    return grid
+
+
+def build_scoring_prompt(question: str, object_name: str, candidates: List[Dict[str, Any]]) -> str:
+    rows = []
+    for order, candidate in enumerate(candidates):
+        candidate_index = int(candidate.get("candidate_index", order))
+        prompt = candidate.get("prompt") or candidate.get("phrase") or ""
+        rows.append(f'- index {candidate_index}: box2d={candidate.get("box2d")}, crop label={candidate_index}, detector prompt="{prompt}"')
+    return f"""
+You are scoring bounding-box candidates for Omni3D-Bench 3D object extraction.
+
+Question context: {question}
+Target object: {object_name}
+
+You are given two images: first, the full image with numbered candidate boxes; second, a crop grid with the same candidate indexes.
+Use only the images, box coordinates, target object name, and question context. Do not rely on detector scores or prior rank scores.
+
+Candidate boxes:
+{chr(10).join(rows)}
+
+Scoring rules:
+- Score each candidate from 0 to 100 for how well it matches the target object in the question.
+- Consider exact object category, color, material, shape, side/position words, relation/reference phrases, and scene role.
+- Relation phrases such as "under the TV", "next to the sofa", "left of the chair", or "rightmost" are selection constraints; they do not mean choosing the reference object itself.
+- Prefer the complete visible target object when the target is a complete object.
+- If the target object phrase is plural or group-like, such as "topmost cabinets", "cabinets to the left of the fume vent", "both sinks", or "two bedside tables", score the candidate higher only when it represents the requested group/multiple-instance operand, not just one member of that group.
+- For plural/group targets, do not downgrade the target to a singular object. A single cabinet is not the best match for "topmost cabinets" when there is a candidate covering the top row/group of cabinets.
+- Do not choose a box that contains multiple unrelated objects or large background regions unless the target is an area object.
+- If the target object is naturally truncated by the camera viewpoint, occlusion, or image boundary, a partially visible but semantically correct box can be valid.
+- Similar names are not interchangeable: distinguish TV vs TV stand, table vs tabletop, chair vs cushion, cabinet vs cabinet top, sofa vs pillow, and same-category objects with different colors or positions.
+
+Return only valid JSON in this exact shape:
+{{"scores":[{{"index":0,"score":85,"reason":"short reason"}}],"selected_index":0}}
+Use INVALID as selected_index only if none of the candidates match the target.
+""".strip()
+
+
+def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1)
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for pos in range(start, len(text)):
+        char = text[pos]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:pos + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def parse_scoring_response(response: str, valid_indices: List[int]) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    data = extract_json_object(response)
+    if not isinstance(data, dict):
+        return None, None
+    selected = data.get("selected_index")
+    if isinstance(selected, str) and selected.strip().upper() == "INVALID":
+        return None, data
+    try:
+        selected_int = int(selected)
+    except (TypeError, ValueError):
+        return None, data
+    if selected_int not in valid_indices:
+        return None, data
+    return selected_int, data
+
+
+def _choose_candidate_by_scoring_vlm(
+    vlm_model,
+    image_pil: Image.Image,
+    object_name: str,
+    candidates: List[Dict[str, object]],
+    question: str,
+    save_dir: Optional[Union[str, Path]],
+    max_new_tokens: int,
+) -> Dict[str, object]:
+    overlay = make_candidate_overlay(image_pil, candidates)
+    grid = make_crop_grid(image_pil, candidates)
+    prompt = build_scoring_prompt(question, object_name, candidates)
+
+    candidate_overlay_path = None
+    candidate_grid_path = None
+    selected_overlay_path = None
+    if save_dir is not None:
+        object_dir = Path(save_dir) / "candidate_scoring"
+        object_dir.mkdir(parents=True, exist_ok=True)
+        safe = safe_name(object_name)
+        candidate_overlay_path = object_dir / "{}_candidate_overlay.png".format(safe)
+        candidate_grid_path = object_dir / "{}_crop_grid.png".format(safe)
+        overlay.save(candidate_overlay_path)
+        grid.save(candidate_grid_path)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": overlay},
+                {"type": "image", "image": grid},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    response = vlm_model.process_messages(messages, max_new_tokens=max_new_tokens)
+    valid_indices = [int(candidate.get("candidate_index", idx)) for idx, candidate in enumerate(candidates)]
+    selected_index, parsed = parse_scoring_response(response, valid_indices)
+
+    selected_candidate = None
+    if selected_index is not None:
+        selected_candidate = next(
+            (
+                candidate
+                for idx, candidate in enumerate(candidates)
+                if int(candidate.get("candidate_index", idx)) == selected_index
+            ),
+            None,
+        )
+        if selected_candidate is not None and save_dir is not None:
+            selected_overlay = make_candidate_overlay(image_pil, candidates, selected_index=selected_index)
+            selected_overlay_path = Path(save_dir) / "candidate_scoring" / "{}_vlm_selected_overlay.png".format(safe_name(object_name))
+            selected_overlay.save(selected_overlay_path)
+
+    return {
+        "selected_index": selected_index,
+        "selected_candidate": selected_candidate,
+        "raw_response": response,
+        "parsed_response": parsed,
+        "candidate_overlay_path": str(candidate_overlay_path) if candidate_overlay_path else None,
+        "candidate_grid_path": str(candidate_grid_path) if candidate_grid_path else None,
+        "selected_overlay_path": str(selected_overlay_path) if selected_overlay_path else None,
+    }
+
+
+class ScoringObject3DLocator(Object3DLocator):
+    def __init__(
+        self,
+        config: Optional[Union[Object3DExtractionConfig, Dict[str, Any]]] = None,
+        device: str = "cuda",
+        detection_module: Optional[Any] = None,
+        depth_module: Optional[Any] = None,
+        orientation_module: Optional[Any] = None,
+        vlm_model: Optional[Any] = None,
+        scoring_max_new_tokens: int = 768,
+    ):
+        super().__init__(
+            config=config,
+            device=device,
+            detection_module=detection_module,
+            depth_module=depth_module,
+            orientation_module=orientation_module,
+            vlm_model=vlm_model,
+        )
+        self.scoring_max_new_tokens = scoring_max_new_tokens
+
+    def _select_detection(
+        self,
+        image_pil: Image.Image,
+        object_name: str,
+        candidates: List[Dict[str, object]],
+        selected_boxes: Dict[str, List[int]],
+        save_dir: Optional[Union[str, Path]],
+        question: str,
+        forced_candidate_selections: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, object]:
+        rule_ranked = rank_candidates_for_object(image_pil, object_name, candidates, selected_boxes)
+        rule_selected = dict(rule_ranked[0])
+        rule_selected["_ranked_candidates"] = rule_ranked
+        rule_selected["rule_selected_index"] = 0
+        rule_selected["vlm_selected_index"] = None
+        rule_selected["final_selected_index"] = 0
+        rule_selected["selection_decision"] = "rule_ranker_no_scoring_model"
+        rule_selected["selection_reject_reason"] = None
+        rule_selected["rank_reason"] = "rule_ranker"
+
+        if self.vlm_model is None or not self.config.detection.use_vlm_refinement:
+            return rule_selected
+
+        try:
+            scoring = _choose_candidate_by_scoring_vlm(
+                self.vlm_model,
+                image_pil,
+                object_name,
+                rule_ranked,
+                question,
+                save_dir,
+                self.scoring_max_new_tokens,
+            )
+        except Exception as exc:
+            rule_selected["selection_decision"] = "rule_ranker_scoring_error"
+            rule_selected["selection_reject_reason"] = str(exc)
+            return rule_selected
+
+        for key in ("candidate_overlay_path", "candidate_grid_path", "selected_overlay_path"):
+            if scoring.get(key):
+                rule_selected[key] = scoring[key]
+
+        selected_candidate = scoring.get("selected_candidate")
+        if selected_candidate is None:
+            rule_selected["selection_decision"] = "rule_ranker_scoring_invalid"
+            rule_selected["selection_reject_reason"] = "invalid_vlm_candidate_scoring_response"
+            rule_selected["vlm_response"] = scoring.get("raw_response")
+            rule_selected["vlm_candidate_scores"] = scoring.get("parsed_response")
+            return rule_selected
+
+        selected = dict(selected_candidate)
+        selected["_ranked_candidates"] = rule_ranked
+        selected["rule_selected_index"] = 0
+        selected["vlm_selected_index"] = scoring["selected_index"]
+        selected["final_selected_index"] = scoring["selected_index"]
+        selected["selection_decision"] = "vlm_candidate_scoring"
+        selected["selection_reject_reason"] = None
+        selected["rank_reason"] = "vlm_candidate_scoring"
+        selected["vlm_response"] = scoring.get("raw_response")
+        selected["vlm_candidate_scores"] = scoring.get("parsed_response")
+        for key in ("candidate_overlay_path", "candidate_grid_path", "selected_overlay_path"):
+            if scoring.get(key):
+                selected[key] = scoring[key]
+        return selected
+
+
+class ScoringObjectExtractionRunner:
+    def __init__(
+        self,
+        device: str = "cuda",
+        mask_fallback: str = "auto",
+        use_vlm_refinement: bool = True,
+        vlm_model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH,
+        vlm_model=None,
+        backend: str = "local_qwen",
+        api_model: str = "gpt-4.1",
+        api_key: str = None,
+        base_url: str = None,
+        use_vlm_object_extraction: bool = True,
+        count_max_instances: int = 20,
+        max_new_tokens: int = 768,
+        box_threshold: float = 0.05,
+        text_threshold: float = 0.05,
+        image_root: str = "/data/datasets/Omni3D-Bench/images",
+        base_data_path: str = None,
+    ):
+        print("Initializing scoring-based object extractor...")
+        self.device = device
+        self.mask_fallback = mask_fallback
+        self.args = argparse.Namespace(
+            image=None,
+            image_root=image_root,
+            base_data_path=base_data_path,
+            device=device,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            use_vlm_refinement=use_vlm_refinement,
+            use_vlm_object_extraction=use_vlm_object_extraction,
+            count_max_instances=count_max_instances,
+            vlm_model_path=vlm_model_path,
+            mask_fallback=mask_fallback,
+        )
+        config = Object3DExtractionConfig()
+        config.detection.box_threshold = self.args.box_threshold
+        config.detection.text_threshold = self.args.text_threshold
+        config.detection.use_vlm_refinement = use_vlm_refinement
+        config.detection.count_max_instances = count_max_instances
+        config.mask_fallback_mode = mask_fallback
+
+        if vlm_model is None and (use_vlm_refinement or use_vlm_object_extraction):
+            if backend == "openai":
+                vlm_model = OpenAIVLRefinementModel(api_key=api_key, model=api_model, base_url=base_url)
+            else:
+                vlm_model = QwenVLRefinementModel(vlm_model_path, device=device)
+
+        self.vlm_model = vlm_model
+        self.locator = ScoringObject3DLocator(
+            config=config,
+            device=device,
+            vlm_model=vlm_model,
+            scoring_max_new_tokens=max_new_tokens,
+        )
+
+    def extract_sample(
+        self,
+        sample: dict,
+        output_root,
+        visualize: bool = True,
+        image: str = None,
+        base_data_path: str = None,
+    ):
+        args = argparse.Namespace(**vars(self.args))
+        args.image = image
+        args.base_data_path = base_data_path
+        sample_key = get_sample_key(sample, 0)
+        resolved_image = resolve_image_path(args, sample)
+        object_info = resolve_object_names(
+            sample,
+            image=resolved_image,
+            vlm_model=self.vlm_model if self.args.use_vlm_object_extraction else None,
+            use_vlm_object_extraction=self.args.use_vlm_object_extraction,
+        )
+        object_names = object_info["objects"]
+        sample_save_dir = Path(output_root) / sample_key
+        result = self.locator.extract(
+            image=resolved_image,
+            object_names=object_names,
+            visualize=visualize,
+            save_dir=sample_save_dir,
+            question=sample.get("question", ""),
+            answer=sample.get("answer", sample.get("gt_answer", "")),
+            question_type=object_info["question_type"],
+        )
+        record = {
+            "sample_id": sample_key,
+            "image": resolved_image,
+            "objects": object_names,
+            "object_extraction_method": "{}+vlm_candidate_scoring".format(object_info["method"]),
+            "vlm_extracted_objects": object_info["vlm_extracted_objects"],
+            "rule_extracted_objects": object_info["rule_extracted_objects"],
+            "object_extraction_response": object_info["object_extraction_response"],
+            "question_type": object_info["question_type"],
+            "result": result,
+        }
+        output_path = write_sample_json(sample_save_dir, sample_key, record)
+        return record, str(output_path)
+
+
+def extract_objects_for_sample(
+    sample: dict,
+    output_root,
+    device: str = "cuda",
+    mask_fallback: str = "auto",
+    use_vlm_refinement: bool = True,
+    vlm_model_path: str = DEFAULT_LOCAL_QWEN_MODEL_PATH,
+    vlm_model=None,
+    visualize: bool = True,
+    image: str = None,
+    base_data_path: str = None,
+    backend: str = "local_qwen",
+    api_model: str = "gpt-4.1",
+    api_key: str = None,
+    base_url: str = None,
+    extractor=None,
+    use_vlm_object_extraction: bool = True,
+    count_max_instances: int = 20,
+    max_new_tokens: int = 768,
+):
+    if extractor is not None:
+        return extractor.extract_sample(
+            sample,
+            output_root=output_root,
+            visualize=visualize,
+            image=image,
+            base_data_path=base_data_path,
+        )
+
+    runner = ScoringObjectExtractionRunner(
+        device=device,
+        mask_fallback=mask_fallback,
+        use_vlm_refinement=use_vlm_refinement,
+        vlm_model_path=vlm_model_path,
+        vlm_model=vlm_model,
+        backend=backend,
+        api_model=api_model,
+        api_key=api_key,
+        base_url=base_url,
+        use_vlm_object_extraction=use_vlm_object_extraction,
+        count_max_instances=count_max_instances,
+        max_new_tokens=max_new_tokens,
+        base_data_path=base_data_path,
+    )
+    return runner.extract_sample(
+        sample,
+        output_root=output_root,
+        visualize=visualize,
+        image=image,
+        base_data_path=base_data_path,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    samples = load_samples(args)
+    if not samples:
+        raise ValueError("No samples found in --dataset_json, --sample_json, or --jsonl")
+
     output_root = Path(args.save_dir)
+    config = build_scoring_config(args)
+    vlm_model = build_vlm_refinement_model(args)
+    locator = ScoringObject3DLocator(
+        config=config,
+        device=args.device,
+        vlm_model=vlm_model,
+        scoring_max_new_tokens=args.max_new_tokens,
+    )
     written_files = []
 
     for idx, sample in enumerate(samples):
@@ -1007,7 +1454,7 @@ def main() -> None:
                 "sample_id": sample_key,
                 "image": image,
                 "objects": object_names,
-                "object_extraction_method": object_info["method"],
+                "object_extraction_method": "{}+vlm_candidate_scoring".format(object_info["method"]),
                 "vlm_extracted_objects": object_info["vlm_extracted_objects"],
                 "rule_extracted_objects": object_info["rule_extracted_objects"],
                 "object_extraction_response": object_info["object_extraction_response"],

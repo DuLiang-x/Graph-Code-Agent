@@ -1,8 +1,8 @@
 """Prompt templates for object 3D extraction."""
 
 QUESTION_TYPE_RULES = {
-    "numeric_ct": """
-Question type: numeric count.
+    "number_vt": """
+Question type: number visual counting.
 Count-question rules:
 - Use these rules only when the question asks for the number/count of visible instances in the image.
 - Plural words alone do not mean the task is visual counting.
@@ -26,8 +26,8 @@ Count-question rules:
 [Question] What is the ratio of brown chairs to black chairs? Answer as a decimal.
 [Detect] [brown chairs, black chairs]
 """,
-    "numeric_other": """
-Question type: numeric measurement or ratio.
+    "number_other": """
+Question type: number measurement or non-counting ratio.
 Numeric-measurement rules:
 - Detect every object used as a numeric operand in the calculation.
 - Plural words alone do not mean the task is visual counting.
@@ -35,8 +35,10 @@ Numeric-measurement rules:
 - For "How many objects with the volume/height/width/length of X would fit/reach Y", treat it as a continuous numeric ratio/measurement question, not visual counting.
 - For ratio, difference, sum, combined height, width, length, depth, distance, or volume questions, include all numerator, denominator, and reference objects.
 - For known-size calibration questions, include both the object with the provided size and the object whose size is requested.
+- Compound object names such as TV stand are independent physical objects; keep TV and TV stand separate when both are numeric operands.
 - Preserve relation modifiers such as rightmost, leftmost, topmost, bottommost, center, middle, closest, furthest, upper, lower, under, above, or next to when they identify which instance is needed.
 - Same-category objects with different instance modifiers are different numeric operands and must both be detected, such as leftmost cabinet and center cabinet.
+- Same base-category operands with different relation contexts are different operands and must both be detected, such as cabinets to the left of a fume vent and cabinet to the right of the fume vent.
 - Preserve color and material attributes such as white, black, glass, wooden, or metal when they disambiguate the target object.
 - If the question says two X, both X, multiple X, all X, or combined height/width/length/depth/volume of two X, include the natural plural/category phrase so the pipeline can detect each instance separately.
 - Count-ratio questions such as "ratio of coasters to remotes" or "ratio of brown chairs to black chairs" require all visible instances on both sides of the ratio; include both countable categories with their attributes.
@@ -48,6 +50,14 @@ Numeric-measurement rules:
 # Example: known-size calibration
 [Question] If the black table is 1.5m wide, how tall is the TV?
 [Detect] [black table, TV]
+
+# Example: compound object operand is distinct from its head noun
+[Question] What is the ratio of the height of the TV to the width of the TV stand?
+[Detect] [TV, TV stand]
+
+# Example: same-category operands with different relation contexts
+[Question] If the width of the combined cabinets to the left of the fume vent is 4.2m, how tall is the cabinet to the right of the fume vent in meters?
+[Detect] [cabinets to the left of the fume vent, cabinet to the right of the fume vent, fume vent]
 
 # Example: same-category operands with different instance modifiers
 [Question] What is the ratio of the height of the leftmost cabinet to the width of the center cabinet?
@@ -77,6 +87,18 @@ Numeric-measurement rules:
 [Question] How many objects with the combined volume of two bedside tables fit in the bed?
 [Detect] [bedside tables, bed]
 
+# Example: preposition reference object is a separate numeric operand
+[Question] Is the chair closer to the stool than the table?
+[Detect] [chair, stool, table]
+
+# Example: attributed objects around a reference relation
+[Question] Is the white chair next to the black stool?
+[Detect] [white chair, black stool]
+
+# Example: relation reference operands should be separate objects
+[Question] Is the chair closer to the stool than the table?
+[Detect] [chair, stool, table]
+
 # Example: stack/reach height is not visual counting
 [Question] How many of the rightmost stool would you have to stack to reach the same height as the left-most chair?
 [Detect] [rightmost stool, leftmost chair]
@@ -86,6 +108,7 @@ Question type: yes/no relation, visibility, or collision.
 Yes/no-question rules:
 - Detect all objects needed to evaluate the relation, visibility, support, containment, collision, or hypothetical movement.
 - If the question asks whether X would block, hit, cover, fit on, contain, support, or be visible relative to Y, include both X and Y.
+- If the yes/no question compares counts, such as whether the number of X is greater than the number of Y, include both countable categories so the pipeline can expand all visible instances.
 - Include intermediate reference objects when the relation depends on them.
 - Do not include camera when it means the image viewpoint.
 - If the question asks whether there are two or more of the same object type, output the concrete repeated category visible in the image, such as [chairs], not [same object types].
@@ -94,16 +117,21 @@ Yes/no-question rules:
 [Question] If the sofa were placed in front of the fireplace, would the fireplace still be visible?
 [Detect] [sofa, fireplace]
 
+# Example: relation phrase reference object
+[Question] Is the stool to the left of the piano and in front of the piano?
+[Detect] [stool, piano]
+
 # Example: collision target
 [Question] If the TV were to fall forward, would it hit the lamp or the glass table first?
 [Detect] [TV, lamp, glass table]
 """,
-    "choice_object": """
+    "multi_choice": """
 Question type: object choice or direction choice.
 Choice-question rules:
 - Detect every candidate object and every reference object needed to compare the candidates.
 - If the question provides Options:{{...}} or says choose from a list, every physical object in the options must be included in [Detect].
 - For questions asking which object is closer, farther, left, right, front, behind, above, below, or first hit, include all compared objects and the reference object.
+- If the choice question compares groups by count, such as which option has more/fewer visible X, include each countable option category so the pipeline can expand all visible instances.
 - Direction labels such as N, NE, E, SE, S, SW, W, NW are answers, not detectable objects.
 - Do not invent objects outside the candidates and references in the question.
 
@@ -114,6 +142,10 @@ Choice-question rules:
 # Example: object-choice without explicit options
 [Question] What is closer to the camera: the small tree or the leftmost lamp?
 [Detect] [small tree, leftmost lamp]
+
+# Example: same-category choice operands with different instance modifiers
+[Question] Which is closer to the camera, the left chair or the right chair?
+[Detect] [left chair, right chair]
 """,
     "generic": """
 Question type: generic spatial question.
@@ -122,6 +154,10 @@ Generic rules:
 - Keep object phrases faithful to the wording of the question.
 """,
 }
+
+QUESTION_TYPE_RULES["numeric_ct"] = QUESTION_TYPE_RULES["number_vt"]
+QUESTION_TYPE_RULES["numeric_other"] = QUESTION_TYPE_RULES["number_other"]
+QUESTION_TYPE_RULES["choice_object"] = QUESTION_TYPE_RULES["multi_choice"]
 
 PROMPT_GET_OBJECTS_OF_INTEREST = """
 ### Situation Description
@@ -149,6 +185,11 @@ Attribute distinction rule:
 - Do not merge "gray chair" and "black chair" into "chair".
 - Do not drop attributes such as gray, black, white, glass, wooden, translucent, transparent, clear, circular, round, or square when they identify the target instance.
 - If the question compares two attributed objects of the same category, include both attributed phrases separately.
+
+Relation reference rule:
+- If a prepositional phrase names a physical reference object needed for relation, comparison, or calculation, include that reference object as a separate [Detect] item.
+- Do not output "X next to Y", "X under Y", or "X to the left of Y" as one detection object; output [X, Y] while preserving attributes on each object.
+- Keep same-category operands with different instance modifiers separate, such as leftmost cabinet and center cabinet.
 
 Badcase-guided object mention rules:
 - Do not output answer-format or math words as objects, such as decimal, sum, direction, square, format, greater, closer, furthest point, or can you fit.

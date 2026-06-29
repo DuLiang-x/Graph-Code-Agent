@@ -43,9 +43,11 @@ class Object3DLocator:
         question: str = "",
         answer: str = "",
         question_type: str = None,
+        forced_candidate_selections: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Dict[str, object]]:
         image_pil = load_rgb_image(image)
         names = validate_object_names(object_names)
+        forced_candidate_selections = forced_candidate_selections or {}
 
         results = {}  # type: Dict[str, Dict[str, object]]
         selected_boxes = {}  # type: Dict[str, List[int]]
@@ -103,6 +105,7 @@ class Object3DLocator:
                     selected_boxes=selected_boxes,
                     save_dir=save_dir if visualize else None,
                     question=question,
+                    forced_candidate_selections=forced_candidate_selections,
                 )
                 box2d = [int(v) for v in best_detection["box2d"]]
                 sam_mask = self.detection_module.run_segmentation(image_pil, box2d)
@@ -131,8 +134,11 @@ class Object3DLocator:
                         "selection_decision": best_detection.get("selection_decision"),
                         "selection_reject_reason": best_detection.get("selection_reject_reason"),
                         "vlm_response": best_detection.get("vlm_response"),
+                        "vlm_candidate_scores": best_detection.get("vlm_candidate_scores"),
                         "mask_fallback_reason": mask_fallback_reason,
                         "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
+                        "candidate_grid_path": best_detection.get("candidate_grid_path"),
+                        "selected_overlay_path": best_detection.get("selected_overlay_path"),
                         "candidates_considered": summarize_candidates(best_detection.get("_ranked_candidates", candidates)),
                     }
                     continue
@@ -167,8 +173,11 @@ class Object3DLocator:
                     "selection_decision": best_detection.get("selection_decision"),
                     "selection_reject_reason": best_detection.get("selection_reject_reason"),
                     "vlm_response": best_detection.get("vlm_response"),
+                    "vlm_candidate_scores": best_detection.get("vlm_candidate_scores"),
                     "mask_fallback_reason": mask_fallback_reason,
                     "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
+                    "candidate_grid_path": best_detection.get("candidate_grid_path"),
+                    "selected_overlay_path": best_detection.get("selected_overlay_path"),
                     "overlap_warnings": overlap_warnings(object_name, box2d, selected_boxes),
                     "candidates_considered": summarize_candidates(best_detection.get("_ranked_candidates", candidates)),
                 }
@@ -364,6 +373,7 @@ class Object3DLocator:
         selected_boxes: Dict[str, List[int]],
         save_dir: Optional[Union[str, Path]],
         question: str,
+        forced_candidate_selections: Optional[Dict[str, int]] = None,
     ) -> Dict[str, object]:
         rule_ranked = rank_candidates_for_object(image_pil, object_name, candidates, selected_boxes)
         rule_selected = dict(rule_ranked[0])
@@ -373,6 +383,34 @@ class Object3DLocator:
         rule_selected["final_selected_index"] = 0
         rule_selected["selection_decision"] = "rule_ranker"
         rule_selected["selection_reject_reason"] = None
+        forced_reject_reason = None
+
+        forced_candidate_selections = forced_candidate_selections or {}
+        if object_name in forced_candidate_selections:
+            try:
+                forced_index = int(forced_candidate_selections[object_name])
+            except (TypeError, ValueError):
+                forced_index = None
+            if forced_index is not None:
+                for candidate in rule_ranked:
+                    if int(candidate.get("candidate_index", -1)) == forced_index:
+                        selected = dict(candidate)
+                        selected["_ranked_candidates"] = rule_ranked
+                        selected["rule_selected_index"] = 0
+                        selected["vlm_selected_index"] = forced_index
+                        selected["final_selected_index"] = forced_index
+                        selected["selection_decision"] = "forced_vlm_candidate_scoring"
+                        selected["selection_reject_reason"] = None
+                        selected["rank_reason"] = "forced_vlm_candidate_scoring"
+                        if save_dir is not None:
+                            save_candidate_grid(image_pil, object_name, rule_ranked, save_dir)
+                            selected["candidate_overlay_path"] = str(
+                                save_candidate_overlay(image_pil, object_name, rule_ranked, save_dir)
+                            )
+                        return selected
+            forced_reject_reason = "invalid_forced_candidate"
+            rule_selected["selection_decision"] = "rule_ranker_forced_invalid"
+            rule_selected["selection_reject_reason"] = forced_reject_reason
 
         if self.config.detection.use_vlm_refinement and self.vlm_model is not None:
             selected = select_candidate_with_vlm(
@@ -386,7 +424,7 @@ class Object3DLocator:
             )
             if selected is None:
                 rule_selected["selection_decision"] = "rule_ranker_vlm_invalid"
-                rule_selected["selection_reject_reason"] = "invalid_vlm_response"
+                rule_selected["selection_reject_reason"] = forced_reject_reason or "invalid_vlm_response"
             else:
                 allowed, reject_reason = validate_vlm_selection(object_name, selected, rule_ranked, image_size=image_pil.size)
                 rule_selected["vlm_selected_index"] = selected.get("candidate_index")
@@ -485,7 +523,7 @@ def rank_candidates_for_object(
         item["rank_reasons"] = reasons
         scored.append((score, idx, item))
 
-    if relation in {"leftmost", "rightmost", "center", "topmost", "bottommost"}:
+    if relation in {"leftmost", "rightmost", "center", "topmost", "bottommost", "closest", "furthest"}:
         selected = select_by_relation(scored, relation, width, height)
         rest = [item for _, _, item in sorted(scored, key=lambda value: value[0], reverse=True) if item is not selected]
         return [selected] + rest
@@ -624,6 +662,8 @@ Selection rules:
 - Select the candidate that corresponds to the object referred to in the question, not just the most visually obvious object of the category.
 - Use spatial/contextual clues in the question, such as color, material, shape, relative position, nearby objects, and role in the scene.
 - If the question distinguishes similar objects, choose the candidate matching the distinguishing phrase, such as "white coffee table", "circular table", "black table", "person wearing a hat", "left chair", or "closer sofa".
+- For closest/furthest/nearest/farthest targets, the distance word is part of the target phrase. Do not choose the largest, clearest, or highest-score candidate if it violates closest/furthest from the camera/image viewpoint.
+- Example: Target "furthest leather chair" means select the leather chair farthest from the camera/image viewpoint, not the large foreground chair.
 - In most Omni3D-Bench questions, different relevant objects should still have some visible difference in category, size, position, extent, or role. If two candidates for different object names have very similar boxes, sizes, and positions, re-read the question carefully: you may be confusing two similarly named but distinct objects, or selecting the same physical object for both targets.
 - Do not assume highly overlapping or near-identical candidates are interchangeable. Use subtle differences in box extent, center, object boundary, support surface, and scene role to distinguish related objects such as TV vs TV stand, cabinet vs cabinet top, table vs tabletop, chair vs cushion, or bed vs bedding.
 - For paired or adjacent objects such as TV and TV stand, the boxes may be close and partially overlapping, but they are not the same target: TV usually refers to the screen/display, while TV stand refers to the supporting furniture below or around it.
@@ -803,6 +843,7 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
         return False, "no_candidates"
     selected_score = float(selected.get("rank_score", selected.get("score", 0.0)))
     best_score = float(candidates[0].get("rank_score", candidates[0].get("score", 0.0)))
+    relation = relation_modifier(object_name)
     if _candidate_matches_reference_object(object_name, selected):
         return False, "reference_object_selected"
     if _candidate_crosses_tv_stand_boundary(object_name, selected):
@@ -811,7 +852,8 @@ def validate_vlm_selection(object_name: str, selected: Dict[str, object], candid
         return False, "attribute_mismatch"
     rank_margin = 0.45 if is_material_object(object_name) else 0.20
     if selected_score < best_score - rank_margin:
-        return False, "rank_score_too_low"
+        if not (relation in {"closest", "furthest"} and _selection_matches_relation(object_name, selected, candidates, image_size=image_size)):
+            return False, "rank_score_too_low"
     if not _selection_matches_relation(object_name, selected, candidates, image_size=image_size):
         return False, "relation_mismatch"
     if not is_area_object(object_name):
@@ -1077,6 +1119,7 @@ SAME_TYPE_EXISTENCE_RE = re.compile(
 )
 NON_VISUAL_COUNT_RE = re.compile(r"\b(?:need|needed|stack|stacked|achieve|match|reach|same height|have to)\b")
 COUNT_RATIO_RE = re.compile(r"\bratio\s+of\b.*\b(?:to|and)\b", re.IGNORECASE)
+COUNT_COMPARISON_RE = re.compile(r"\b(?:more|fewer|less|greater|larger|smaller|most|fewest|least)\b", re.IGNORECASE)
 NUMERIC_DIMENSION_RE = re.compile(r"\b(?:height|width|length|depth|volume|distance|size|area|diagonal)\b", re.IGNORECASE)
 MULTI_INSTANCE_NUMERIC_PATTERN = (
     r"\b(?:two|both|multiple|all)\s+(?:of\s+)?(?:the\s+)?{object}\b|"
@@ -1120,8 +1163,8 @@ def is_visual_count_target(question_type: Optional[str], question: str, object_n
         return True
     if is_count_ratio_question(question_text) and _object_mentioned_in_question(question_text, object_name):
         return True
-    if question_type != "numeric_ct":
-        return False
+    if COUNT_COMPARISON_RE.search(question_text) and _object_mentioned_in_question(question_text, object_name):
+        return True
     if NON_VISUAL_COUNT_RE.search(question_text):
         return False
     forms = _object_name_forms(object_name)
@@ -1279,16 +1322,36 @@ def _candidate_contains_multiple_tighter_boxes(candidate: Dict[str, object], can
     return False
 
 
+def _camera_distance_image_proxy(candidate: Dict[str, object], image_size: Tuple[int, int]) -> float:
+    box = candidate.get("box2d", [0, 0, 0, 0])
+    width, height = image_size
+    area_ratio = box_area(box) / float(max(1, width * height))
+    box_h = max(0.0, float(box[3]) - float(box[1])) / float(max(1, height))
+    _, cy = box_center(box)
+    bottom_ratio = float(box[3]) / float(max(1, height))
+    center_y_ratio = cy / float(max(1, height))
+    return area_ratio * 0.55 + box_h * 0.20 + bottom_ratio * 0.15 + center_y_ratio * 0.10
+
+
 def relation_modifier(object_name: str) -> str:
-    name = object_name.lower().replace("left-most", "leftmost").replace("top-most", "topmost")
-    for modifier in ["leftmost", "rightmost", "center", "centered", "middle", "topmost", "bottommost"]:
+    name = object_name.lower()
+    name = name.replace("left-most", "leftmost").replace("right-most", "rightmost")
+    name = name.replace("top-most", "topmost").replace("bottom-most", "bottommost")
+    for modifier in ["leftmost", "rightmost", "center", "centered", "middle", "topmost", "bottommost", "closest", "nearest", "furthest", "farthest"]:
         if name.startswith(modifier + " "):
-            return "center" if modifier in {"centered", "middle"} else modifier
+            if modifier in {"centered", "middle"}:
+                return "center"
+            if modifier == "nearest":
+                return "closest"
+            if modifier == "farthest":
+                return "furthest"
+            return modifier
     return ""
 
 
 def select_by_relation(ranked, relation: str, width: int, height: int) -> Dict[str, object]:
-    candidates = _reasonable_relation_candidates([item[2] for item in ranked], relation)
+    raw_candidates = [item[2] for item in ranked]
+    candidates = raw_candidates if relation in {"closest", "furthest"} else _reasonable_relation_candidates(raw_candidates, relation)
     if relation == "leftmost":
         return min(candidates, key=lambda item: box_center(item["box2d"])[0])
     if relation == "rightmost":
@@ -1300,6 +1363,10 @@ def select_by_relation(ranked, relation: str, width: int, height: int) -> Dict[s
     if relation == "center":
         image_center = (width / 2.0, height / 2.0)
         return min(candidates, key=lambda item: distance(box_center(item["box2d"]), image_center))
+    if relation == "closest":
+        return max(candidates, key=lambda item: _camera_distance_image_proxy(item, (width, height)))
+    if relation == "furthest":
+        return min(candidates, key=lambda item: _camera_distance_image_proxy(item, (width, height)))
     ranked.sort(key=lambda item: item[0], reverse=True)
     return ranked[0][2]
 
@@ -1354,9 +1421,9 @@ def _same_box(a, b) -> bool:
 
 def _selection_matches_relation(object_name: str, selected: Dict[str, object], candidates: List[Dict[str, object]], image_size: Optional[Tuple[int, int]] = None) -> bool:
     relation = relation_modifier(object_name)
-    if relation not in {"leftmost", "rightmost", "topmost", "bottommost", "center"}:
+    if relation not in {"leftmost", "rightmost", "topmost", "bottommost", "center", "closest", "furthest"}:
         return True
-    reasonable = _reasonable_relation_candidates(candidates, relation)
+    reasonable = candidates if relation in {"closest", "furthest"} else _reasonable_relation_candidates(candidates, relation)
     selected_box = selected.get("box2d", [0, 0, 0, 0])
     if not any(_same_box(selected_box, item.get("box2d", [0, 0, 0, 0])) for item in reasonable):
         return False
@@ -1378,8 +1445,27 @@ def _selection_matches_relation(object_name: str, selected: Dict[str, object], c
         selected_distance = distance(box_center(selected_box), image_center)
         expected_distance = distance(box_center(expected["box2d"]), image_center)
         return selected_distance <= expected_distance + 1.0
+    if relation in {"closest", "furthest"}:
+        size = image_size or _candidate_set_image_size(candidates)
+        selected_proxy = _camera_distance_image_proxy(selected, size)
+        proxies = [_camera_distance_image_proxy(item, size) for item in reasonable]
+        expected_proxy = max(proxies) if relation == "closest" else min(proxies)
+        tolerance = 0.03
+        if relation == "closest":
+            return selected_proxy >= expected_proxy - tolerance
+        return selected_proxy <= expected_proxy + tolerance
     return True
 
+
+def _candidate_set_image_size(candidates: List[Dict[str, object]]) -> Tuple[int, int]:
+    max_x = 1
+    max_y = 1
+    for item in candidates:
+        box = item.get("box2d", [0, 0, 0, 0])
+        if box:
+            max_x = max(max_x, int(box[2]))
+            max_y = max(max_y, int(box[3]))
+    return (max_x, max_y)
 
 def _candidate_set_center(candidates: List[Dict[str, object]]) -> Tuple[float, float]:
     boxes = [item.get("box2d", [0, 0, 0, 0]) for item in candidates if item.get("box2d")]
