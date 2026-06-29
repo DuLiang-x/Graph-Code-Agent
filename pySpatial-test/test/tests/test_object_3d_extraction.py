@@ -93,7 +93,7 @@ def test_int_how_many_visible_is_numeric_count():
         "answer_type": "int",
     }
 
-    assert demo_extract_3d_positions.classify_question_type(sample) == "number_vt"
+    assert demo_extract_3d_positions.classify_question_type(sample) == "number_ct"
 
 
 class FakePluralGeneralizingObjectExtractionVLM:
@@ -101,7 +101,7 @@ class FakePluralGeneralizingObjectExtractionVLM:
         return "[Detect] [stools, chairs]"
 
 
-def test_numeric_other_keeps_precise_rule_objects_when_vlm_generalizes_to_plural(tmpdir):
+def test_vlm_object_extraction_uses_vlm_objects_without_rule_merge(tmpdir):
     image_path = Path(str(tmpdir)) / "sample.png"
     Image.new("RGB", (16, 16), color="white").save(str(image_path))
     sample = {
@@ -118,11 +118,9 @@ def test_numeric_other_keeps_precise_rule_objects_when_vlm_generalizes_to_plural
     )
 
     assert resolved["question_type"] == "number_other"
-    assert resolved["method"] == "vlm_rule_merged"
-    assert "rightmost stool" in resolved["objects"]
-    assert "leftmost chair" in resolved["objects"]
-    assert "stools" not in resolved["objects"]
-    assert "chairs" not in resolved["objects"]
+    assert resolved["method"] == "vlm"
+    assert resolved["objects"] == ["stools", "chairs"]
+    assert resolved["rule_extracted_objects"] == ["rightmost stool", "leftmost chair"]
 
 
 def test_numeric_other_keeps_same_category_different_instance_modifiers():
@@ -275,7 +273,7 @@ def test_count_question_expands_count_target_into_indexed_instances():
         image,
         ["handles", "cabinets"],
         question="How many handles are on the cabinets?",
-        question_type="number_vt",
+        question_type="number_ct",
     )
 
     assert result["handles"]["counting_target"] is True
@@ -369,7 +367,7 @@ def test_count_question_can_return_more_than_num_candidates():
         image,
         ["handles"],
         question="How many handles are visible?",
-        question_type="number_vt",
+        question_type="number_ct",
     )
 
     expected_names = [f"handle_{idx}" for idx in range(1, 9)]
@@ -762,7 +760,7 @@ def test_classify_question_type_for_omni3d_categories():
         "question": "How many handles are on the cabinets?",
         "answer_type": "int",
         "answer": 11,
-    }) == "number_vt"
+    }) == "number_ct"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "How many stools are needed to match the chair height?",
         "answer_type": "float",
@@ -772,7 +770,7 @@ def test_classify_question_type_for_omni3d_categories():
         "question": "What is the ratio of brown chairs to black chairs? Answer as a decimal.",
         "answer_type": "float",
         "answer": 0.5,
-    }) == "number_vt"
+    }) == "number_ct"
     assert demo_extract_3d_positions.classify_question_type({
         "question": "What is the ratio of the fireplace height to the sofa height?",
         "answer_type": "float",
@@ -836,6 +834,44 @@ def test_same_type_existence_question_triggers_multi_instance_target(tmpdir):
     assert "[Detect] [chairs]" in prompt
 
 
+def test_enough_each_question_triggers_count_targets():
+    question = "Are there enough fruits in the basket for each person at the table to get one?"
+    sample = {
+        "question": question,
+        "answer_type": "str",
+        "answer": "yes",
+    }
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, use_vlm_object_extraction=False)
+
+    assert info["question_type"] == "yes_no"
+    assert info["objects"] == ["fruits", "basket", "people", "table"]
+    assert is_visual_count_target("yes_no", question, "fruits")
+    assert is_visual_count_target("yes_no", question, "people")
+    assert not is_visual_count_target("yes_no", question, "basket")
+    assert not is_visual_count_target("yes_no", question, "table")
+
+
+def test_material_options_keep_attributed_categories_not_bare_attributes(tmpdir):
+    image_path = Path(str(tmpdir)) / "scene.png"
+    Image.new("RGB", (16, 16), color="white").save(image_path)
+    sample = {
+        "question": "Are there more wooden chairs or leather chairs? Options: {wooden, leather}",
+        "answer_type": "str",
+        "answer": "wooden",
+    }
+    vlm = FakeObjectExtractionVLM(["[wooden chairs, leather chairs]"])
+
+    info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
+
+    assert info["question_type"] == "yes_no"
+    assert info["objects"] == ["wooden chairs", "leather chairs"]
+    assert "wooden" not in info["objects"]
+    assert "leather" not in info["objects"]
+    assert is_visual_count_target("yes_no", sample["question"], "wooden chairs")
+    assert is_visual_count_target("yes_no", sample["question"], "leather chairs")
+
+
 def test_combined_synthetic_object_is_split_for_detection(tmpdir):
     image_path = Path(str(tmpdir)) / "scene.png"
     Image.new("RGB", (16, 16), color="white").save(image_path)
@@ -878,7 +914,7 @@ def test_vlm_object_extraction_prompt_uses_question_type_rules(tmpdir):
     info = demo_extract_3d_positions.resolve_object_names(sample, image=str(image_path), vlm_model=vlm)
 
     prompt = vlm.calls[0][0][0]["content"][1]["text"]
-    assert info["question_type"] == "number_vt"
+    assert info["question_type"] == "number_ct"
     assert info["objects"] == ["handles", "cabinets"]
     assert "Question type: number visual counting" in prompt
     assert "all visible instances" in prompt
@@ -1739,16 +1775,17 @@ def test_object_extraction_prompt_has_question_type_rules():
     from object_3d_extraction.prompts import PROMPT_GET_OBJECTS_OF_INTEREST, QUESTION_TYPE_RULES
 
     assert "{question_type_rules}" in PROMPT_GET_OBJECTS_OF_INTEREST
-    assert set(["number_vt", "number_other", "yes_no", "multi_choice"]).issubset(QUESTION_TYPE_RULES)
-    assert "Question type: number visual counting" in QUESTION_TYPE_RULES["number_vt"]
-    assert "ratio of brown chairs to black chairs" in QUESTION_TYPE_RULES["number_vt"]
-    assert "[Detect] [brown chairs, black chairs]" in QUESTION_TYPE_RULES["number_vt"]
-    assert "Plural words alone do not mean the task is visual counting" in QUESTION_TYPE_RULES["number_vt"]
-    assert "stack/reach/match/fit" in QUESTION_TYPE_RULES["number_vt"]
-    assert "all visible instances" in QUESTION_TYPE_RULES["number_vt"]
-    assert "do not invent indexed names" in QUESTION_TYPE_RULES["number_vt"]
-    assert "handle_1" in QUESTION_TYPE_RULES["number_vt"]
-    assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["number_vt"]
+    assert set(["number_ct", "number_vt", "number_other", "yes_no", "multi_choice"]).issubset(QUESTION_TYPE_RULES)
+    assert QUESTION_TYPE_RULES["number_vt"] == QUESTION_TYPE_RULES["number_ct"]
+    assert "Question type: number visual counting" in QUESTION_TYPE_RULES["number_ct"]
+    assert "ratio of brown chairs to black chairs" in QUESTION_TYPE_RULES["number_ct"]
+    assert "[Detect] [brown chairs, black chairs]" in QUESTION_TYPE_RULES["number_ct"]
+    assert "Plural words alone do not mean the task is visual counting" in QUESTION_TYPE_RULES["number_ct"]
+    assert "stack/reach/match/fit" in QUESTION_TYPE_RULES["number_ct"]
+    assert "all visible instances" in QUESTION_TYPE_RULES["number_ct"]
+    assert "do not invent indexed names" in QUESTION_TYPE_RULES["number_ct"]
+    assert "handle_1" in QUESTION_TYPE_RULES["number_ct"]
+    assert "[Detect] [handles, cabinets]" in QUESTION_TYPE_RULES["number_ct"]
     assert "Question type: number measurement or non-counting ratio" in QUESTION_TYPE_RULES["number_other"]
     assert "How many of X would you stack/reach/match" in QUESTION_TYPE_RULES["number_other"]
     assert "leftmost cabinet and center cabinet" in QUESTION_TYPE_RULES["number_other"]

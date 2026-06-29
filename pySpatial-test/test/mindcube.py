@@ -285,8 +285,14 @@ def compute_acc_mra(results: List[Dict[str, Any]]) -> Dict[str, float]:
     return {"acc_mra": value, "acc_mra_count": total, "mra_score": value, "mra_score_count": total}
 
 
-QUESTION_TYPE_ORDER = ["number_vt", "number_other", "yes_no", "multi_choice"]
-QUESTION_TYPE_ALIASES = {"count_ratio": "number_vt", "numeric_ct": "number_vt", "numeric_other": "number_other", "choice_object": "multi_choice"}
+QUESTION_TYPE_ORDER = ["number_ct", "number_other", "yes_no", "multi_choice"]
+QUESTION_TYPE_ALIASES = {
+    "count_ratio": "number_ct",
+    "number_vt": "number_ct",
+    "numeric_ct": "number_ct",
+    "numeric_other": "number_other",
+    "choice_object": "multi_choice",
+}
 
 
 def normalize_question_type_for_summary(question_type: str = None) -> str:
@@ -565,7 +571,7 @@ def compute_summary_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 type_stats[scene_type]['correct_answers'] += 1
                 overall_stats['correct_answers'] += 1
                 question_type_stats[question_type]['correct_answers'] += 1
-            if question_type in {'number_vt', 'number_other'} and result.get('numeric_mra') is not None:
+            if question_type in {'number_ct', 'number_other'} and result.get('numeric_mra') is not None:
                 question_type_stats[question_type]['mra_sum'] += float(result.get('numeric_mra'))
                 question_type_stats[question_type]['mra_count'] += 1
 
@@ -600,7 +606,7 @@ def compute_summary_statistics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             'error_rate': round(stats['errors'] / total_q * 100, 2) if total_q > 0 else 0,
             'error_count': stats['errors'],
         }
-        if qtype in {'number_vt', 'number_other'}:
+        if qtype in {'number_ct', 'number_other'}:
             metrics['mra'] = round(stats['mra_sum'] / stats['mra_count'], 6) if stats['mra_count'] > 0 else 0.0
             metrics['mra_count'] = stats['mra_count']
         question_type_metrics[qtype] = metrics
@@ -1524,7 +1530,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted by user, shutting down...")
         sys.exit(1)
-
 
 
 

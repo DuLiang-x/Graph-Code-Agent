@@ -498,21 +498,37 @@ def _is_yes_no_answer(answer) -> bool:
     return bool(YES_NO_ANSWER_RE.match(str(answer or "")))
 
 
-def classify_question_type(sample) -> str:
+def classify_primary_question_type(sample) -> str:
     question = sample.get("question", "")
-    answer_type = str(sample.get("answer_type") or "").lower()
     answer = _sample_answer(sample)
 
     if _is_yes_no_answer(answer) or YES_NO_QUESTION_RE.search(question):
         return "yes_no"
     if OPTION_QUESTION_RE.search(question):
         return "multi_choice"
+    return "number"
+
+
+def is_number_counting_question(question: str, answer_type: str = None) -> bool:
+    answer_type = str(answer_type or "").lower()
     if is_count_ratio_question(question):
-        return "number_vt"
+        return True
     if answer_type == "int":
-        return "number_vt"
+        return True
     if COUNT_QUESTION_RE.search(question) and not NON_VISUAL_HOW_MANY_RE.search(question):
-        return "number_vt"
+        return True
+    return False
+
+
+def classify_question_type(sample) -> str:
+    question = sample.get("question", "")
+    answer_type = str(sample.get("answer_type") or "").lower()
+    primary_type = classify_primary_question_type(sample)
+
+    if primary_type != "number":
+        return primary_type
+    if is_number_counting_question(question, answer_type):
+        return "number_ct"
     return "number_other"
 
 
@@ -612,6 +628,22 @@ def _is_distinct_compound_object(a: str, b: str) -> bool:
     return False
 
 
+BARE_ATTRIBUTE_WORDS = {
+    "white", "black", "gray", "grey", "brown", "red", "blue", "green", "yellow", "orange", "purple", "pink",
+    "wooden", "wood", "metal", "metallic", "glass", "transparent", "translucent", "clear", "leather",
+}
+
+
+def _is_bare_attribute_phrase(name: str) -> bool:
+    text = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    return text in BARE_ATTRIBUTE_WORDS
+
+
+def _has_attribute_category_phrase(name: str) -> bool:
+    text = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    return len(text.split()) > 1 and any(re.search(r"\b{}\b".format(re.escape(attr)), text) for attr in BARE_ATTRIBUTE_WORDS)
+
+
 def postprocess_extracted_objects(objects: list, question: str = "", question_type: str = "generic", split_relation_phrases: bool = True) -> list:
     output = []
     for obj in objects or []:
@@ -639,6 +671,8 @@ def _object_phrase_explicitly_mentioned(question: str, object_name: str) -> bool
 
 
 def _should_keep_both_objects(question: str, a: str, b: str) -> bool:
+    if (_is_bare_attribute_phrase(a) and _has_attribute_category_phrase(b)) or (_is_bare_attribute_phrase(b) and _has_attribute_category_phrase(a)):
+        return False
     if _is_distinct_compound_object(a, b):
         return True
     if not _same_general_object_category(a, b):
@@ -735,7 +769,7 @@ def resolve_object_names(
 ) -> dict:
     question = sample.get("question", "")
     question_type = classify_question_type(sample)
-    split_rule_relation_phrases = question_type in {"yes_no", "number_vt", "numeric_ct"}
+    split_rule_relation_phrases = question_type in {"yes_no", "number_ct", "number_vt", "numeric_ct"}
     rule_objects = postprocess_extracted_objects(
         resolve_object_names_by_rule(sample),
         question,
@@ -753,10 +787,9 @@ def resolve_object_names(
             vlm_response = "ERROR: {}".format(exc)
 
     if vlm_objects:
-        merged_objects = merge_vlm_and_rule_objects(question_type, vlm_objects, rule_objects, question=question)
         return {
-            "objects": merged_objects,
-            "method": "vlm_rule_merged" if merged_objects != vlm_objects else "vlm",
+            "objects": vlm_objects,
+            "method": "vlm",
             "vlm_extracted_objects": vlm_objects,
             "rule_extracted_objects": rule_objects,
             "object_extraction_response": vlm_response,
@@ -810,6 +843,27 @@ def _extract_relation_reference_object_names(question: str) -> list:
     return names
 
 
+def _extract_distribution_count_object_names(question: str) -> list:
+    names = []
+    text = re.sub(r"\s+", " ", str(question or "").lower())
+    match = re.search(
+        r"\benough\s+(.+?)\s+in\s+(?:the|a|an)\s+(.+?)\s+for\s+each\s+(.+?)(?:\s+at\s+(?:the|a|an)\s+(.+?))?\s+to\s+get\s+one\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return names
+    for part in match.groups():
+        if not part:
+            continue
+        cleaned = _clean_omni3d_object_name(part)
+        if cleaned == "person":
+            cleaned = "people"
+        if cleaned and not _looks_like_non_object_phrase(cleaned):
+            names.append(cleaned)
+    return names
+
+
 
 def extract_object_names_with_vlm(image, question: str, vlm_model, num_tries: int = 2, question_type: str = "generic") -> tuple:
     from PIL import Image
@@ -856,7 +910,9 @@ def extract_object_names_from_omni3d_question(question: str) -> list:
     names = []
     options_match = re.search(r"Options:\s*\{([^}]+)\}", question, flags=re.IGNORECASE)
     if options_match:
-        names.extend(part.strip().lower() for part in options_match.group(1).split(","))
+        option_names = [part.strip().lower() for part in options_match.group(1).split(",")]
+        if not all(_is_bare_attribute_phrase(name) for name in option_names):
+            names.extend(option_names)
 
     question_without_options = re.sub(r"Options:\s*\{[^}]+\}", "", question, flags=re.IGNORECASE)
     article_pattern = re.compile(
@@ -870,6 +926,7 @@ def extract_object_names_from_omni3d_question(question: str) -> list:
 
     names.extend(_extract_relation_operand_phrases(question_without_options))
     names.extend(_extract_relation_reference_object_names(question_without_options))
+    names.extend(_extract_distribution_count_object_names(question_without_options))
     return _dedupe_preserve_order(names)
 
 

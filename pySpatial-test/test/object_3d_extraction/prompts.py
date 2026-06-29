@@ -1,7 +1,7 @@
 """Prompt templates for object 3D extraction."""
 
 QUESTION_TYPE_RULES = {
-    "number_vt": """
+    "number_ct": """
 Question type: number visual counting.
 Count-question rules:
 - Use these rules only when the question asks for the number/count of visible instances in the image.
@@ -121,6 +121,10 @@ Yes/no-question rules:
 [Question] Is the stool to the left of the piano and in front of the piano?
 [Detect] [stool, piano]
 
+# Example: enough/each implies counting the distributed objects
+[Question] Are there enough fruits in the basket for each person at the table to get one?
+[Detect] [fruits, basket, people, table]
+
 # Example: collision target
 [Question] If the TV were to fall forward, would it hit the lamp or the glass table first?
 [Detect] [TV, lamp, glass table]
@@ -146,6 +150,10 @@ Choice-question rules:
 # Example: same-category choice operands with different instance modifiers
 [Question] Which is closer to the camera, the left chair or the right chair?
 [Detect] [left chair, right chair]
+
+# Example: options may be labels for attributed object categories
+[Question] Are there more wooden chairs or leather chairs? Options: {{wooden, leather}}
+[Detect] [wooden chairs, leather chairs]
 """,
     "generic": """
 Question type: generic spatial question.
@@ -155,7 +163,8 @@ Generic rules:
 """,
 }
 
-QUESTION_TYPE_RULES["numeric_ct"] = QUESTION_TYPE_RULES["number_vt"]
+QUESTION_TYPE_RULES["number_vt"] = QUESTION_TYPE_RULES["number_ct"]
+QUESTION_TYPE_RULES["numeric_ct"] = QUESTION_TYPE_RULES["number_ct"]
 QUESTION_TYPE_RULES["numeric_other"] = QUESTION_TYPE_RULES["number_other"]
 QUESTION_TYPE_RULES["choice_object"] = QUESTION_TYPE_RULES["multi_choice"]
 

@@ -311,13 +311,14 @@ def test_omni3d_object_names_without_options():
 
 
 def test_question_type_normalization_and_fallback_classification():
-    assert normalize_question_type_for_summary("count_ratio") == "number_vt"
-    assert normalize_question_type_for_summary("numeric_ct") == "number_vt"
+    assert normalize_question_type_for_summary("count_ratio") == "number_ct"
+    assert normalize_question_type_for_summary("number_vt") == "number_ct"
+    assert normalize_question_type_for_summary("numeric_ct") == "number_ct"
     assert normalize_question_type_for_summary("numeric_other") == "number_other"
     assert normalize_question_type_for_summary("choice_object") == "multi_choice"
     assert normalize_question_type_for_summary("number_other") == "number_other"
     assert normalize_question_type_for_summary("unknown_kind") == "unknown"
-    assert infer_question_type("How many chairs are visible?", 3, "int") == "number_vt"
+    assert infer_question_type("How many chairs are visible?", 3, "int") == "number_ct"
     assert infer_question_type("What is the height ratio?", 0.5, "float") == "number_other"
     assert infer_question_type("Is the chair visible?", "yes", "str") == "yes_no"
     assert infer_question_type("Which object is closer?", "chair", "str") == "multi_choice"
@@ -327,7 +328,7 @@ def test_summary_statistics_group_by_question_type_not_answer_type():
     results = [
         {
             "scene_type": "unknown",
-            "question_type": "number_vt",
+            "question_type": "number_ct",
             "answer_type": "int",
             "expected_answer": 3,
             "generated_answer": "2",
@@ -379,9 +380,9 @@ def test_summary_statistics_group_by_question_type_not_answer_type():
     assert "question_type_metrics" in stats
     assert "answer_type_metrics" not in stats
     metrics = stats["question_type_metrics"]
-    assert metrics["number_vt"]["count"] == 2
-    assert metrics["number_vt"]["mra"] == 0.6
-    assert metrics["number_vt"]["mra_count"] == 2
+    assert metrics["number_ct"]["count"] == 2
+    assert metrics["number_ct"]["mra"] == 0.6
+    assert metrics["number_ct"]["mra_count"] == 2
     assert metrics["number_other"]["mra"] == 1.0
     assert "mra" not in metrics["yes_no"]
     assert stats["overall_metrics"]["mra_score"] == 0.8

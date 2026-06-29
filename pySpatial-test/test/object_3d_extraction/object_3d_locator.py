@@ -1155,6 +1155,24 @@ def _object_mentioned_in_question(question_text: str, object_name: str) -> bool:
     return False
 
 
+def is_distribution_count_target(question: str, object_name: str) -> bool:
+    question_text = re.sub(r"\s+", " ", str(question or "").lower())
+    match = re.search(
+        r"\benough\s+(.+?)\s+in\s+(?:the|a|an)\s+.+?\s+for\s+each\s+(.+?)(?:\s+at\s+(?:the|a|an)\s+.+?)?\s+to\s+get\s+one\b",
+        question_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return False
+    count_phrases = [re.sub(r"\s+", " ", part.strip()) for part in match.groups() if part]
+    object_forms = set(_object_name_forms(object_name))
+    for phrase in count_phrases:
+        phrase_forms = set(_object_name_forms(phrase))
+        if object_forms & phrase_forms:
+            return True
+    return False
+
+
 def is_visual_count_target(question_type: Optional[str], question: str, object_name: str) -> bool:
     question_text = re.sub(r"\s+", " ", str(question or "").lower())
     if is_same_type_existence_question(question_text):
@@ -1164,6 +1182,8 @@ def is_visual_count_target(question_type: Optional[str], question: str, object_n
     if is_count_ratio_question(question_text) and _object_mentioned_in_question(question_text, object_name):
         return True
     if COUNT_COMPARISON_RE.search(question_text) and _object_mentioned_in_question(question_text, object_name):
+        return True
+    if is_distribution_count_target(question_text, object_name):
         return True
     if NON_VISUAL_COUNT_RE.search(question_text):
         return False
@@ -1186,6 +1206,8 @@ def _object_name_forms(object_name: str) -> List[str]:
 
 def singularize_count_name(name: str) -> str:
     value = re.sub(r"\s+", " ", str(name or "").strip().lower())
+    if value == "people":
+        return "person"
     if value.endswith("ies") and len(value) > 3:
         return value[:-3] + "y"
     if value.endswith("ves") and len(value) > 3:

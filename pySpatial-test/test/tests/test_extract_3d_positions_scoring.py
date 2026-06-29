@@ -104,7 +104,7 @@ def test_scoring_locator_keeps_counting_path_without_vlm_scoring():
         image,
         ["handles"],
         question="How many handles are visible?",
-        question_type="number_vt",
+        question_type="number_ct",
         visualize=False,
     )
 
