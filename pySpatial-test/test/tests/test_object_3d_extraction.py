@@ -123,6 +123,88 @@ def test_vlm_object_extraction_uses_vlm_objects_without_rule_merge(tmpdir):
     assert resolved["rule_extracted_objects"] == ["rightmost stool", "leftmost chair"]
 
 
+def test_parse_structured_vlm_object_extraction_response():
+    response = """
+[Detect] [chair at the end of the counter, fireplace]
+[Objects]
+[
+  {"detect_phrase":"chair at the end of the counter","object":"chair","relation_context":"at the end of the counter","reference_object":"counter"},
+  {"detect_phrase":"fireplace","object":"fireplace","relation_context":"","reference_object":""}
+]
+"""
+
+    objects, items = demo_extract_3d_positions.parse_vlm_object_extraction_response(response)
+
+    assert objects == ["chair at the end of the counter", "fireplace", "counter"]
+    assert items[0] == {
+        "detect_phrase": "chair at the end of the counter",
+        "object": "chair",
+        "relation_context": "at the end of the counter",
+        "reference_object": "counter",
+    }
+    assert items[-1] == {
+        "detect_phrase": "counter",
+        "object": "counter",
+        "relation_context": "",
+        "reference_object": "",
+    }
+
+
+def test_parse_structured_vlm_object_extraction_falls_back_to_detect():
+    objects, items = demo_extract_3d_positions.parse_vlm_object_extraction_response(
+        "[Detect] [fireplace, coffee table, sofa]"
+    )
+
+    assert objects == ["fireplace", "coffee table", "sofa"]
+    assert items == []
+
+
+def test_structured_vlm_extraction_adds_reference_object(tmpdir):
+    image_path = Path(str(tmpdir)) / "sample.png"
+    Image.new("RGB", (16, 16), color="white").save(str(image_path))
+    sample = {
+        "question": "Is the chair at the end of the counter taller than the fireplace?",
+        "answer": "yes",
+        "answer_type": "str",
+    }
+    response = """
+[Detect] [chair at the end of the counter, fireplace]
+[Objects]
+[
+  {"detect_phrase":"chair at the end of the counter","object":"chair","relation_context":"at the end of the counter","reference_object":"counter"},
+  {"detect_phrase":"fireplace","object":"fireplace","relation_context":"","reference_object":""}
+]
+"""
+    vlm = FakeObjectExtractionVLM([response])
+
+    resolved = demo_extract_3d_positions.resolve_object_names(
+        sample,
+        image=str(image_path),
+        vlm_model=vlm,
+        use_vlm_object_extraction=True,
+    )
+
+    assert resolved["objects"] == ["chair at the end of the counter", "fireplace", "counter"]
+    assert resolved["object_extraction_items"][0]["object"] == "chair"
+    assert resolved["object_extraction_items"][0]["relation_context"] == "at the end of the counter"
+
+
+def test_table_under_tv_structured_extraction_adds_tv_reference():
+    response = """
+[Detect] [table under the TV]
+[Objects]
+[
+  {"detect_phrase":"table under the TV","object":"table","relation_context":"under the TV","reference_object":"TV"}
+]
+"""
+
+    objects, items = demo_extract_3d_positions.parse_vlm_object_extraction_response(response)
+
+    assert objects == ["table under the tv", "tv"]
+    assert items[0]["object"] == "table"
+    assert items[0]["reference_object"] == "tv"
+
+
 def test_numeric_other_keeps_same_category_different_instance_modifiers():
     merged = demo_extract_3d_positions.merge_vlm_and_rule_objects(
         "number_other",
@@ -1340,6 +1422,46 @@ def test_vlm_refinement_selects_mocked_candidate_index():
     assert "return INVALID" in prompt
 
 
+def test_structured_object_metadata_uses_main_object_for_grounding_and_relation_for_vlm():
+    vlm = FakeVLM(response="0")
+    locator = make_locator(
+        {
+            "chair": [
+                {"box2d": [1, 1, 8, 8], "score": 0.9},
+            ],
+            "counter": [
+                {"box2d": [0, 10, 15, 15], "score": 0.9},
+            ],
+        },
+        vlm_model=vlm,
+        use_vlm_refinement=True,
+    )
+    image = Image.new("RGB", (16, 16), color="white")
+
+    result = locator.extract(
+        image,
+        ["chair at the end of the counter"],
+        question="Is the chair at the end of the counter taller than the fireplace?",
+        object_extraction_items=[
+            {
+                "detect_phrase": "chair at the end of the counter",
+                "object": "chair",
+                "relation_context": "at the end of the counter",
+                "reference_object": "counter",
+            }
+        ],
+    )
+
+    assert "chair at the end of the counter" in result
+    assert locator.detection_module.detect_calls[0][0] == "chair"
+    assert "at the end of the counter" not in locator.detection_module.detect_calls[0][0]
+    prompt = vlm.messages[0]["content"][2]["text"]
+    assert "Target object phrase: chair at the end of the counter" in prompt
+    assert "Main target: chair" in prompt
+    assert "Relation context: at the end of the counter" in prompt
+    assert "Reference object: counter" in prompt
+
+
 
 def test_forced_candidate_selection_bypasses_vlm_refinement():
     vlm = FakeVLM(response="0")
@@ -1814,7 +1936,11 @@ def test_object_extraction_prompt_documents_attribute_distinction_rule():
     assert "Attribute distinction rule" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Relation reference rule" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "include that reference object as a separate [Detect] item" in PROMPT_GET_OBJECTS_OF_INTEREST
-    assert "Do not output \"X next to Y\"" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "Structured object decomposition rule" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "[Objects] as a JSON list" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "object is the main physical category used for GroundingDINO captions" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "chair at the end of the counter" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert '"detect_phrase":"chair at the end of the counter"' in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "gray chair" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "black chair" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "[Detect] [gray chair, table, black chair]" in PROMPT_GET_OBJECTS_OF_INTEREST

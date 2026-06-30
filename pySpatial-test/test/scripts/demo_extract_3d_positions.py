@@ -218,6 +218,7 @@ class ObjectExtractionRunner:
             question=sample.get("question", ""),
             answer=sample.get("answer", sample.get("gt_answer", "")),
             question_type=object_info["question_type"],
+            object_extraction_items=object_info.get("object_extraction_items"),
         )
         record = {
             "sample_id": sample_key,
@@ -227,6 +228,7 @@ class ObjectExtractionRunner:
             "vlm_extracted_objects": object_info["vlm_extracted_objects"],
             "rule_extracted_objects": object_info["rule_extracted_objects"],
             "object_extraction_response": object_info["object_extraction_response"],
+            "object_extraction_items": object_info.get("object_extraction_items", []),
             "question_type": object_info["question_type"],
             "result": result,
         }
@@ -708,7 +710,7 @@ def _clean_extracted_object_phrase(name: str, question: str = "") -> str:
 
 
 RELATION_CONNECTOR_RE = re.compile(
-    r"\b(to the left of|to the right of|in front of|on top of|next to|right of|left of|beside|under|below|above|over|behind|inside|near)\b",
+    r"\b(to the left of|to the right of|in front of|on top of|at the end of|next to|right of|left of|beside|under|below|above|over|behind|inside|near)\b",
     re.IGNORECASE,
 )
 
@@ -781,10 +783,13 @@ def resolve_object_names(
 
     if use_vlm_object_extraction and vlm_model is not None and image is not None:
         try:
-            vlm_objects, vlm_response = extract_object_names_with_vlm(image, question, vlm_model, question_type=question_type)
-            vlm_objects = postprocess_extracted_objects(vlm_objects, question, question_type)
+            vlm_objects, vlm_response, vlm_items = extract_object_names_with_vlm(image, question, vlm_model, question_type=question_type)
+            if not vlm_items:
+                vlm_objects = postprocess_extracted_objects(vlm_objects, question, question_type)
+                vlm_items = make_object_extraction_items(vlm_objects)
         except Exception as exc:
             vlm_response = "ERROR: {}".format(exc)
+            vlm_items = []
 
     if vlm_objects:
         return {
@@ -793,6 +798,7 @@ def resolve_object_names(
             "vlm_extracted_objects": vlm_objects,
             "rule_extracted_objects": rule_objects,
             "object_extraction_response": vlm_response,
+            "object_extraction_items": vlm_items,
             "question_type": question_type,
         }
 
@@ -803,6 +809,7 @@ def resolve_object_names(
             "vlm_extracted_objects": vlm_objects,
             "rule_extracted_objects": rule_objects,
             "object_extraction_response": vlm_response,
+            "object_extraction_items": make_object_extraction_items(rule_objects),
             "question_type": question_type,
         }
 
@@ -886,17 +893,22 @@ def extract_object_names_with_vlm(image, question: str, vlm_model, num_tries: in
             }
         ]
         response = vlm_model.process_messages(messages, max_new_tokens=128)
-        objects = parse_vlm_object_names(response, preserve_duplicates=is_same_type_existence_question(question))
+        objects, object_items = parse_vlm_object_extraction_response(
+            response,
+            preserve_duplicates=is_same_type_existence_question(question),
+        )
         if objects:
-            return objects, response
-    return [], response
+            return objects, response, object_items
+    return [], response, []
 
 
 def parse_vlm_object_names(response: str, preserve_duplicates: bool = False) -> list:
-    matches = re.findall(PATTERN_GET_OBJECTS_OF_INTEREST, str(response or ""))
+    text = str(response or "")
+    detect_match = re.search(r"\[Detect\]\s*(\[[^\]]*\])", text, flags=re.IGNORECASE)
+    matches = [detect_match.group(1)] if detect_match else re.findall(PATTERN_GET_OBJECTS_OF_INTEREST, text)
     if not matches:
         return []
-    match = matches[-1]
+    match = matches[0] if detect_match else matches[-1]
     names = []
     for part in match.strip().replace("[", "").replace("]", "").split(","):
         cleaned = part.strip().lower().replace("'", "").replace('\"', "")
@@ -904,6 +916,74 @@ def parse_vlm_object_names(response: str, preserve_duplicates: bool = False) -> 
         if cleaned and not _looks_like_non_object_phrase(cleaned):
             names.append(cleaned)
     return names if preserve_duplicates else _dedupe_preserve_order(names)
+
+
+def make_object_extraction_items(objects: list) -> list:
+    return [
+        {"detect_phrase": obj, "object": obj, "relation_context": "", "reference_object": ""}
+        for obj in _dedupe_preserve_order([str(item or "").strip().lower() for item in objects])
+        if obj
+    ]
+
+
+def _is_camera_reference(text: str) -> bool:
+    return str(text or "").strip().lower() in {"camera", "image", "image viewpoint", "viewpoint"}
+
+
+def _normalize_object_extraction_item(item, fallback_phrase: str = "") -> dict:
+    if not isinstance(item, dict):
+        item = {"detect_phrase": str(fallback_phrase or item or "")}
+    detect_phrase = str(item.get("detect_phrase") or fallback_phrase or item.get("object") or "").strip().lower()
+    main_object = str(item.get("object") or detect_phrase).strip().lower()
+    relation_context = str(item.get("relation_context") or "").strip().lower()
+    reference_object = str(item.get("reference_object") or "").strip().lower()
+    detect_phrase = re.sub(r"\s+", " ", detect_phrase).strip(" \"'`.,;:!?()[]{}")
+    main_object = re.sub(r"\s+", " ", main_object).strip(" \"'`.,;:!?()[]{}")
+    relation_context = re.sub(r"\s+", " ", relation_context).strip(" \"'`.,;:!?()[]{}")
+    reference_object = re.sub(r"\s+", " ", reference_object).strip(" \"'`.,;:!?()[]{}")
+    return {
+        "detect_phrase": detect_phrase,
+        "object": main_object or detect_phrase,
+        "relation_context": relation_context,
+        "reference_object": reference_object,
+    }
+
+
+def _parse_objects_json_block(response: str):
+    match = re.search(r"\[Objects\]\s*", str(response or ""), flags=re.IGNORECASE)
+    if not match:
+        return None
+    start = str(response).find("[", match.end())
+    if start < 0:
+        return None
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(str(response)[start:])
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def parse_vlm_object_extraction_response(response: str, preserve_duplicates: bool = False) -> tuple:
+    detect_objects = parse_vlm_object_names(response, preserve_duplicates=preserve_duplicates)
+    raw_items = _parse_objects_json_block(response)
+    if raw_items is None:
+        return detect_objects, []
+
+    items = []
+    for idx, item in enumerate(raw_items):
+        fallback = detect_objects[idx] if idx < len(detect_objects) else ""
+        normalized = _normalize_object_extraction_item(item, fallback_phrase=fallback)
+        if normalized["detect_phrase"] and not _looks_like_non_object_phrase(normalized["detect_phrase"]):
+            items.append(normalized)
+    seen = {item["detect_phrase"] for item in items}
+    for ref_item in list(items):
+        reference = ref_item.get("reference_object", "")
+        if reference and not _is_camera_reference(reference) and reference not in seen:
+            items.append({"detect_phrase": reference, "object": reference, "relation_context": "", "reference_object": ""})
+            seen.add(reference)
+    if not items:
+        return detect_objects, []
+    return [item["detect_phrase"] for item in items], items
 
 
 def extract_object_names_from_omni3d_question(question: str) -> list:
@@ -1059,6 +1139,7 @@ def main() -> None:
                 question=sample.get("question", ""),
                 answer=sample.get("answer", ""),
                 question_type=object_info["question_type"],
+                object_extraction_items=object_info.get("object_extraction_items"),
             )
             record = {
                 "sample_id": sample_key,
@@ -1068,6 +1149,7 @@ def main() -> None:
                 "vlm_extracted_objects": object_info["vlm_extracted_objects"],
                 "rule_extracted_objects": object_info["rule_extracted_objects"],
                 "object_extraction_response": object_info["object_extraction_response"],
+                "object_extraction_items": object_info.get("object_extraction_items", []),
                 "question_type": object_info["question_type"],
                 "result": result,
             }

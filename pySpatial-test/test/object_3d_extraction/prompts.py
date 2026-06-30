@@ -197,8 +197,16 @@ Attribute distinction rule:
 
 Relation reference rule:
 - If a prepositional phrase names a physical reference object needed for relation, comparison, or calculation, include that reference object as a separate [Detect] item.
-- Do not output "X next to Y", "X under Y", or "X to the left of Y" as one detection object; output [X, Y] while preserving attributes on each object.
+- Keep the original target phrase in [Detect] when relation context is needed, and decompose it in [Objects]. For example, [Detect] can include "chair at the end of the counter", while [Objects] sets object="chair" and reference_object="counter".
 - Keep same-category operands with different instance modifiers separate, such as leftmost cabinet and center cabinet.
+
+Structured object decomposition rule:
+- Always output the old [Detect] bracketed list first. [Detect] stores the raw target phrases used as result keys.
+- Then output [Objects] as a JSON list. Each item must have: detect_phrase, object, relation_context, reference_object.
+- object is the main physical category used for GroundingDINO captions. Do not include relation context in object.
+- relation_context and reference_object are only for candidate selection/disambiguation.
+- If reference_object is a physical object, include it as its own [Detect] item or let [Objects] reference_object add it automatically.
+- For simple objects with no relation, use empty strings for relation_context and reference_object.
 
 Badcase-guided object mention rules:
 - Do not output answer-format or math words as objects, such as decimal, sum, direction, square, format, greater, closer, furthest point, or can you fit.
@@ -267,6 +275,43 @@ Badcase-guided object mention rules:
 [Question] Are there two of the same object types?
 [Detect] [chairs]
 
+# Example: structured relation target
+[Question] Is the chair at the end of the counter taller than the fireplace?
+[Detect] [chair at the end of the counter, fireplace]
+[Objects]
+[
+  {{"detect_phrase":"chair at the end of the counter","object":"chair","relation_context":"at the end of the counter","reference_object":"counter"}},
+  {{"detect_phrase":"fireplace","object":"fireplace","relation_context":"","reference_object":""}}
+]
+
+# Example: table under TV uses table as GroundingDINO target
+[Question] Is the table under the TV wider than the sofa?
+[Detect] [table under the TV, sofa]
+[Objects]
+[
+  {{"detect_phrase":"table under the TV","object":"table","relation_context":"under the TV","reference_object":"TV"}},
+  {{"detect_phrase":"sofa","object":"sofa","relation_context":"","reference_object":""}}
+]
+
+# Example: relation-specific cabinet operands
+[Question] If the width of the cabinets to the left of the fume vent is 4.2m, how tall is the cabinet to the right of the fume vent?
+[Detect] [cabinets to the left of the fume vent, cabinet to the right of the fume vent, fume vent]
+[Objects]
+[
+  {{"detect_phrase":"cabinets to the left of the fume vent","object":"cabinets","relation_context":"to the left of the fume vent","reference_object":"fume vent"}},
+  {{"detect_phrase":"cabinet to the right of the fume vent","object":"cabinet","relation_context":"to the right of the fume vent","reference_object":"fume vent"}},
+  {{"detect_phrase":"fume vent","object":"fume vent","relation_context":"","reference_object":""}}
+]
+
+# Example: central/rightmost same-category targets
+[Question] What is the ratio of the height of the central couch to the height of the rightmost couch?
+[Detect] [central couch, rightmost couch]
+[Objects]
+[
+  {{"detect_phrase":"central couch","object":"couch","relation_context":"central","reference_object":""}},
+  {{"detect_phrase":"rightmost couch","object":"couch","relation_context":"rightmost","reference_object":""}}
+]
+
 {question_type_rules}
 
 ### Your Task
@@ -274,6 +319,7 @@ Now, given the question below, please identify the entities that are included in
 
 [Question] {question}
 [Detect]
+[Objects]
 """
 
 PROMPT_GET_OBJECTS_OF_INTEREST_AUX = """

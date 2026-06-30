@@ -44,10 +44,12 @@ class Object3DLocator:
         answer: str = "",
         question_type: str = None,
         forced_candidate_selections: Optional[Dict[str, int]] = None,
+        object_extraction_items: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Dict[str, object]]:
         image_pil = load_rgb_image(image)
         names = validate_object_names(object_names)
         forced_candidate_selections = forced_candidate_selections or {}
+        target_metadata_by_name = build_object_metadata_by_name(names, object_extraction_items)
 
         results = {}  # type: Dict[str, Dict[str, object]]
         selected_boxes = {}  # type: Dict[str, List[int]]
@@ -59,7 +61,9 @@ class Object3DLocator:
             sam_mask = None
             mask_used_for_3d = None
             mask_fallback_reason = None
-            prompts_tried = detection_prompts_for_object(object_name)
+            object_metadata = target_metadata_by_name.get(object_name)
+            grounding_object = object_metadata.get("object") if object_metadata else None
+            prompts_tried = detection_prompts_for_object(object_name, main_object=grounding_object)
             count_target = is_visual_count_target(question_type, question, object_name)
             try:
                 candidates = self._collect_detection_candidates(
@@ -106,6 +110,7 @@ class Object3DLocator:
                     save_dir=save_dir if visualize else None,
                     question=question,
                     forced_candidate_selections=forced_candidate_selections,
+                    object_metadata=object_metadata,
                 )
                 box2d = [int(v) for v in best_detection["box2d"]]
                 sam_mask = self.detection_module.run_segmentation(image_pil, box2d)
@@ -374,6 +379,7 @@ class Object3DLocator:
         save_dir: Optional[Union[str, Path]],
         question: str,
         forced_candidate_selections: Optional[Dict[str, int]] = None,
+        object_metadata: Optional[Dict[str, str]] = None,
     ) -> Dict[str, object]:
         rule_ranked = rank_candidates_for_object(image_pil, object_name, candidates, selected_boxes)
         rule_selected = dict(rule_ranked[0])
@@ -421,6 +427,7 @@ class Object3DLocator:
                 save_dir=save_dir,
                 question=question,
                 selected_boxes=selected_boxes,
+                object_metadata=object_metadata,
             )
             if selected is None:
                 rule_selected["selection_decision"] = "rule_ranker_vlm_invalid"
@@ -454,8 +461,37 @@ class Object3DLocator:
         return rule_selected
 
 
-def detection_prompts_for_object(object_name: str) -> List[str]:
-    original = str(object_name).strip().lower()
+def build_object_metadata_by_name(
+    object_names: List[str],
+    object_extraction_items: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Dict[str, str]]:
+    metadata = {}
+    for name in object_names:
+        cleaned = str(name or "").strip().lower()
+        if cleaned:
+            metadata[cleaned] = {
+                "detect_phrase": cleaned,
+                "object": cleaned,
+                "relation_context": "",
+                "reference_object": "",
+            }
+    for item in object_extraction_items or []:
+        if not isinstance(item, dict):
+            continue
+        detect_phrase = str(item.get("detect_phrase") or "").strip().lower()
+        if not detect_phrase:
+            continue
+        metadata[detect_phrase] = {
+            "detect_phrase": detect_phrase,
+            "object": str(item.get("object") or detect_phrase).strip().lower(),
+            "relation_context": str(item.get("relation_context") or "").strip().lower(),
+            "reference_object": str(item.get("reference_object") or "").strip().lower(),
+        }
+    return metadata
+
+
+def detection_prompts_for_object(object_name: str, main_object: Optional[str] = None) -> List[str]:
+    original = str(main_object or object_name).strip().lower()
     context = parse_object_relation_context(original)
     target = context["target_phrase"]
     prompt_target = _remove_count_quantifier(target or original)
@@ -636,12 +672,19 @@ def select_candidate_with_vlm(
     save_dir: Optional[Union[str, Path]] = None,
     question: str = "",
     selected_boxes: Optional[Dict[str, List[int]]] = None,
+    object_metadata: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, object]]:
     grid = save_candidate_grid(image_pil, object_name, candidates, save_dir)
     overlay_path = save_candidate_overlay(image_pil, object_name, candidates, save_dir)
     overlay_image = Image.open(overlay_path).convert("RGB") if overlay_path is not None else make_candidate_overlay(image_pil, candidates)
     object_kind = "area" if is_area_object(object_name) else "entity"
     relation_context = parse_object_relation_context(object_name)
+    if object_metadata:
+        relation_context = {
+            "target_phrase": object_metadata.get("object") or relation_context["target_phrase"],
+            "relation_context": object_metadata.get("relation_context") or relation_context["relation_context"],
+            "reference_object": object_metadata.get("reference_object") or relation_context["reference_object"],
+        }
     candidate_metadata = format_candidate_metadata(candidates, image_pil.size)
     prompt = f"""
 Choose the single numbered bounding box that best matches the target object in the full image.
