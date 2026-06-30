@@ -202,11 +202,14 @@ Relation reference rule:
 
 Structured object decomposition rule:
 - Always output the old [Detect] bracketed list first. [Detect] stores the raw target phrases used as result keys.
-- Then output [Objects] as a JSON list. Each item must have: detect_phrase, object, relation_context, reference_object.
+- Then output [Objects] as a JSON list. Each item must have: detect_phrase, object, relation_context, reference_object, multi_instance, multi_instance_reason.
 - object is the main physical category used for GroundingDINO captions. Do not include relation context in object.
 - relation_context and reference_object are only for candidate selection/disambiguation.
 - If reference_object is a physical object, include it as its own [Detect] item or let [Objects] reference_object add it automatically.
 - For simple objects with no relation, use empty strings for relation_context and reference_object.
+- Set multi_instance=true only when this object should be expanded into indexed instances for visual counting, count-ratio, count comparison, or explicit two/both/all/multiple same-category operands.
+- Set multi_instance=false for single relation-specific targets such as bottom-most/topmost/rightmost/leftmost X, collision choices such as X first or Y, and continuous numeric stack/reach/fit/height/volume questions.
+- Do not set multi_instance=true just because a word contains most, as in bottom-most/topmost/rightmost/leftmost.
 
 Badcase-guided object mention rules:
 - Do not output answer-format or math words as objects, such as decimal, sum, direction, square, format, greater, closer, furthest point, or can you fit.
@@ -280,8 +283,8 @@ Badcase-guided object mention rules:
 [Detect] [chair at the end of the counter, fireplace]
 [Objects]
 [
-  {{"detect_phrase":"chair at the end of the counter","object":"chair","relation_context":"at the end of the counter","reference_object":"counter"}},
-  {{"detect_phrase":"fireplace","object":"fireplace","relation_context":"","reference_object":""}}
+  {{"detect_phrase":"chair at the end of the counter","object":"chair","relation_context":"at the end of the counter","reference_object":"counter","multi_instance":false,"multi_instance_reason":"single relation-specific chair"}},
+  {{"detect_phrase":"fireplace","object":"fireplace","relation_context":"","reference_object":"","multi_instance":false,"multi_instance_reason":"single comparison target"}}
 ]
 
 # Example: table under TV uses table as GroundingDINO target
@@ -289,8 +292,8 @@ Badcase-guided object mention rules:
 [Detect] [table under the TV, sofa]
 [Objects]
 [
-  {{"detect_phrase":"table under the TV","object":"table","relation_context":"under the TV","reference_object":"TV"}},
-  {{"detect_phrase":"sofa","object":"sofa","relation_context":"","reference_object":""}}
+  {{"detect_phrase":"table under the TV","object":"table","relation_context":"under the TV","reference_object":"TV","multi_instance":false,"multi_instance_reason":"single relation-specific table"}},
+  {{"detect_phrase":"sofa","object":"sofa","relation_context":"","reference_object":"","multi_instance":false,"multi_instance_reason":"single comparison target"}}
 ]
 
 # Example: relation-specific cabinet operands
@@ -298,9 +301,9 @@ Badcase-guided object mention rules:
 [Detect] [cabinets to the left of the fume vent, cabinet to the right of the fume vent, fume vent]
 [Objects]
 [
-  {{"detect_phrase":"cabinets to the left of the fume vent","object":"cabinets","relation_context":"to the left of the fume vent","reference_object":"fume vent"}},
-  {{"detect_phrase":"cabinet to the right of the fume vent","object":"cabinet","relation_context":"to the right of the fume vent","reference_object":"fume vent"}},
-  {{"detect_phrase":"fume vent","object":"fume vent","relation_context":"","reference_object":""}}
+  {{"detect_phrase":"cabinets to the left of the fume vent","object":"cabinets","relation_context":"to the left of the fume vent","reference_object":"fume vent","multi_instance":true,"multi_instance_reason":"combined cabinets operand may require multiple cabinet instances"}},
+  {{"detect_phrase":"cabinet to the right of the fume vent","object":"cabinet","relation_context":"to the right of the fume vent","reference_object":"fume vent","multi_instance":false,"multi_instance_reason":"single relation-specific cabinet"}},
+  {{"detect_phrase":"fume vent","object":"fume vent","relation_context":"","reference_object":"","multi_instance":false,"multi_instance_reason":"reference object"}}
 ]
 
 # Example: central/rightmost same-category targets
@@ -308,8 +311,28 @@ Badcase-guided object mention rules:
 [Detect] [central couch, rightmost couch]
 [Objects]
 [
-  {{"detect_phrase":"central couch","object":"couch","relation_context":"central","reference_object":""}},
-  {{"detect_phrase":"rightmost couch","object":"couch","relation_context":"rightmost","reference_object":""}}
+  {{"detect_phrase":"central couch","object":"couch","relation_context":"central","reference_object":"","multi_instance":false,"multi_instance_reason":"single relation-specific couch"}},
+  {{"detect_phrase":"rightmost couch","object":"couch","relation_context":"rightmost","reference_object":"","multi_instance":false,"multi_instance_reason":"single relation-specific couch"}}
+]
+
+# Example: bottom-most is a spatial modifier, not a count trigger
+[Question] If the bottom-most frame on the left of the image were to detach from the wall and fall, would it hit the lamp first or the floor?
+[Detect] [bottom-most frame on the left of the image, wall, lamp, floor]
+[Objects]
+[
+  {{"detect_phrase":"bottom-most frame on the left of the image","object":"frame","relation_context":"bottom-most on the left of the image","reference_object":"image","multi_instance":false,"multi_instance_reason":"single relation-specific frame"}},
+  {{"detect_phrase":"wall","object":"wall","relation_context":"","reference_object":"","multi_instance":false,"multi_instance_reason":"collision reference"}},
+  {{"detect_phrase":"lamp","object":"lamp","relation_context":"","reference_object":"","multi_instance":false,"multi_instance_reason":"choice target"}},
+  {{"detect_phrase":"floor","object":"floor","relation_context":"","reference_object":"","multi_instance":false,"multi_instance_reason":"choice target"}}
+]
+
+# Example: count-ratio targets need multi-instance expansion
+[Question] What is the ratio of brown chairs to black chairs? Answer as a decimal.
+[Detect] [brown chairs, black chairs]
+[Objects]
+[
+  {{"detect_phrase":"brown chairs","object":"chairs","relation_context":"","reference_object":"","multi_instance":true,"multi_instance_reason":"count-ratio target; count all visible brown chairs"}},
+  {{"detect_phrase":"black chairs","object":"chairs","relation_context":"","reference_object":"","multi_instance":true,"multi_instance_reason":"count-ratio target; count all visible black chairs"}}
 ]
 
 {question_type_rules}

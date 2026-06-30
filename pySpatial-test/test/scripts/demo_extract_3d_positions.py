@@ -920,7 +920,14 @@ def parse_vlm_object_names(response: str, preserve_duplicates: bool = False) -> 
 
 def make_object_extraction_items(objects: list) -> list:
     return [
-        {"detect_phrase": obj, "object": obj, "relation_context": "", "reference_object": ""}
+        {
+            "detect_phrase": obj,
+            "object": obj,
+            "relation_context": "",
+            "reference_object": "",
+            "multi_instance": None,
+            "multi_instance_reason": "",
+        }
         for obj in _dedupe_preserve_order([str(item or "").strip().lower() for item in objects])
         if obj
     ]
@@ -937,6 +944,8 @@ def _normalize_object_extraction_item(item, fallback_phrase: str = "") -> dict:
     main_object = str(item.get("object") or detect_phrase).strip().lower()
     relation_context = str(item.get("relation_context") or "").strip().lower()
     reference_object = str(item.get("reference_object") or "").strip().lower()
+    multi_instance = _parse_optional_bool(item.get("multi_instance"))
+    multi_instance_reason = str(item.get("multi_instance_reason") or "").strip()
     detect_phrase = re.sub(r"\s+", " ", detect_phrase).strip(" \"'`.,;:!?()[]{}")
     main_object = re.sub(r"\s+", " ", main_object).strip(" \"'`.,;:!?()[]{}")
     relation_context = re.sub(r"\s+", " ", relation_context).strip(" \"'`.,;:!?()[]{}")
@@ -946,7 +955,22 @@ def _normalize_object_extraction_item(item, fallback_phrase: str = "") -> dict:
         "object": main_object or detect_phrase,
         "relation_context": relation_context,
         "reference_object": reference_object,
+        "multi_instance": multi_instance,
+        "multi_instance_reason": multi_instance_reason,
     }
+
+
+def _parse_optional_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"true", "yes", "1"}:
+        return True
+    if text in {"false", "no", "0"}:
+        return False
+    return None
 
 
 def _parse_objects_json_block(response: str):
@@ -979,7 +1003,14 @@ def parse_vlm_object_extraction_response(response: str, preserve_duplicates: boo
     for ref_item in list(items):
         reference = ref_item.get("reference_object", "")
         if reference and not _is_camera_reference(reference) and reference not in seen:
-            items.append({"detect_phrase": reference, "object": reference, "relation_context": "", "reference_object": ""})
+            items.append({
+                "detect_phrase": reference,
+                "object": reference,
+                "relation_context": "",
+                "reference_object": "",
+                "multi_instance": False,
+                "multi_instance_reason": "reference object",
+            })
             seen.add(reference)
     if not items:
         return detect_objects, []

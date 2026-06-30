@@ -19,7 +19,7 @@ DEMO_SPEC.loader.exec_module(demo_extract_3d_positions)
 
 from object_3d_extraction import Object3DExtractionConfig, Object3DLocator
 from object_3d_extraction.depth_module import unproject_to_3D
-from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, is_count_ratio_question, is_same_category_multi_instance_numeric, is_same_type_existence_question, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, relation_modifier, validate_vlm_selection
+from object_3d_extraction.object_3d_locator import detection_prompts_for_object, filter_count_instance_candidates, is_count_ratio_question, is_same_category_multi_instance_numeric, is_same_type_existence_question, is_visual_count_target, maybe_fallback_mask, overlap_warnings, parse_candidate_index, parse_object_relation_context, rank_detection_candidates, relation_modifier, resolve_multi_instance_decision, validate_vlm_selection
 from object_3d_extraction.utils import extract_object_names_from_question_options, save_debug_visuals
 
 
@@ -136,18 +136,13 @@ def test_parse_structured_vlm_object_extraction_response():
     objects, items = demo_extract_3d_positions.parse_vlm_object_extraction_response(response)
 
     assert objects == ["chair at the end of the counter", "fireplace", "counter"]
-    assert items[0] == {
-        "detect_phrase": "chair at the end of the counter",
-        "object": "chair",
-        "relation_context": "at the end of the counter",
-        "reference_object": "counter",
-    }
-    assert items[-1] == {
-        "detect_phrase": "counter",
-        "object": "counter",
-        "relation_context": "",
-        "reference_object": "",
-    }
+    assert items[0]["detect_phrase"] == "chair at the end of the counter"
+    assert items[0]["object"] == "chair"
+    assert items[0]["relation_context"] == "at the end of the counter"
+    assert items[0]["reference_object"] == "counter"
+    assert items[0]["multi_instance"] is None
+    assert items[-1]["detect_phrase"] == "counter"
+    assert items[-1]["multi_instance"] is False
 
 
 def test_parse_structured_vlm_object_extraction_falls_back_to_detect():
@@ -203,6 +198,138 @@ def test_table_under_tv_structured_extraction_adds_tv_reference():
     assert objects == ["table under the tv", "tv"]
     assert items[0]["object"] == "table"
     assert items[0]["reference_object"] == "tv"
+
+
+def test_parse_structured_vlm_object_extraction_multi_instance_flags():
+    response = """
+[Detect] [brown chairs, black chairs]
+[Objects]
+[
+  {"detect_phrase":"brown chairs","object":"chairs","relation_context":"","reference_object":"","multi_instance":true,"multi_instance_reason":"count all brown chairs"},
+  {"detect_phrase":"black chairs","object":"chairs","relation_context":"","reference_object":"","multi_instance":false,"multi_instance_reason":"single target"}
+]
+"""
+
+    objects, items = demo_extract_3d_positions.parse_vlm_object_extraction_response(response)
+
+    assert objects == ["brown chairs", "black chairs"]
+    assert items[0]["multi_instance"] is True
+    assert items[0]["multi_instance_reason"] == "count all brown chairs"
+    assert items[1]["multi_instance"] is False
+
+
+def test_multi_instance_metadata_overrides_rule_counting_decision():
+    false_decision, false_reason = resolve_multi_instance_decision(
+        "multi_choice",
+        "If the bottom-most frame on the left of the image were to detach from the wall and fall, would it hit the lamp first or the floor?",
+        "frame",
+        {"multi_instance": False, "multi_instance_reason": "single relation-specific frame"},
+    )
+    true_decision, true_reason = resolve_multi_instance_decision(
+        "number_ct",
+        "What is the ratio of brown chairs to black chairs?",
+        "brown chairs",
+        {"multi_instance": True, "multi_instance_reason": "count-ratio target"},
+    )
+
+    assert false_decision is False
+    assert false_reason == "single relation-specific frame"
+    assert true_decision is True
+    assert true_reason == "count-ratio target"
+
+
+def test_bottom_most_does_not_trigger_counting_without_vlm_flag():
+    decision, reason = resolve_multi_instance_decision(
+        "multi_choice",
+        "If the bottom-most frame on the left of the image were to detach from the wall and fall, would it hit the lamp first or the floor?",
+        "frame",
+        None,
+    )
+
+    assert decision is False
+    assert reason == "single_instance"
+
+
+def test_area_objects_do_not_count_without_explicit_vlm_true():
+    decision, reason = resolve_multi_instance_decision(
+        "multi_choice",
+        "If the bottom-most frame were to fall, would it hit the lamp first or the floor?",
+        "floor",
+        None,
+    )
+
+    assert decision is False
+    assert reason == "area_or_viewpoint_not_count_target"
+
+
+def test_vlm_multi_instance_false_prevents_omni3d_192_style_expansion():
+    locator = make_locator(
+        {
+            "frame": [{"box2d": [1, 1, 6, 6], "score": 0.9}],
+            "lamp": [{"box2d": [8, 1, 13, 8], "score": 0.9}],
+            "floor": [{"box2d": [0, 10, 15, 15], "score": 0.9}],
+        },
+        use_vlm_refinement=False,
+    )
+    image = Image.new("RGB", (16, 16), color="white")
+
+    result = locator.extract(
+        image,
+        ["bottom-most frame on the left of the image", "lamp", "floor"],
+        question="If the bottom-most frame on the left of the image were to detach from the wall and fall, would it hit the lamp first or the floor?",
+        question_type="multi_choice",
+        object_extraction_items=[
+            {
+                "detect_phrase": "bottom-most frame on the left of the image",
+                "object": "frame",
+                "relation_context": "bottom-most on the left of the image",
+                "reference_object": "image",
+                "multi_instance": False,
+                "multi_instance_reason": "single relation-specific frame",
+            },
+            {"detect_phrase": "lamp", "object": "lamp", "relation_context": "", "reference_object": "", "multi_instance": False, "multi_instance_reason": "choice target"},
+            {"detect_phrase": "floor", "object": "floor", "relation_context": "", "reference_object": "", "multi_instance": False, "multi_instance_reason": "choice target"},
+        ],
+    )
+
+    assert "frame_1" not in result
+    assert "lamp_1" not in result
+    assert "floor_1" not in result
+    assert result["bottom-most frame on the left of the image"]["multi_instance_decision"] is False
+
+
+def test_vlm_multi_instance_true_forces_counting_expansion():
+    locator = make_locator(
+        {
+            "chairs": [
+                {"box2d": [1, 1, 5, 8], "score": 0.9},
+                {"box2d": [8, 1, 12, 8], "score": 0.85},
+            ]
+        },
+        use_vlm_refinement=False,
+    )
+    image = Image.new("RGB", (16, 16), color="white")
+
+    result = locator.extract(
+        image,
+        ["brown chairs"],
+        question="What is the ratio of brown chairs to black chairs? Answer as a decimal.",
+        question_type="number_ct",
+        object_extraction_items=[
+            {
+                "detect_phrase": "brown chairs",
+                "object": "chairs",
+                "relation_context": "",
+                "reference_object": "",
+                "multi_instance": True,
+                "multi_instance_reason": "count-ratio target",
+            }
+        ],
+    )
+
+    assert result["brown chairs"]["counting_target"] is True
+    assert result["brown chairs"]["multi_instance_reason"] == "count-ratio target"
+    assert result["brown chairs"]["counting_instances"] == ["chair_1", "chair_2"]
 
 
 def test_numeric_other_keeps_same_category_different_instance_modifiers():
@@ -1938,9 +2065,15 @@ def test_object_extraction_prompt_documents_attribute_distinction_rule():
     assert "include that reference object as a separate [Detect] item" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "Structured object decomposition rule" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "[Objects] as a JSON list" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "multi_instance" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "multi_instance_reason" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "Set multi_instance=true only" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "Do not set multi_instance=true just because a word contains most" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "object is the main physical category used for GroundingDINO captions" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "chair at the end of the counter" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert '"detect_phrase":"chair at the end of the counter"' in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "bottom-most frame on the left of the image" in PROMPT_GET_OBJECTS_OF_INTEREST
+    assert "ratio of brown chairs to black chairs" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "gray chair" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "black chair" in PROMPT_GET_OBJECTS_OF_INTEREST
     assert "[Detect] [gray chair, table, black chair]" in PROMPT_GET_OBJECTS_OF_INTEREST

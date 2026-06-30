@@ -64,7 +64,12 @@ class Object3DLocator:
             object_metadata = target_metadata_by_name.get(object_name)
             grounding_object = object_metadata.get("object") if object_metadata else None
             prompts_tried = detection_prompts_for_object(object_name, main_object=grounding_object)
-            count_target = is_visual_count_target(question_type, question, object_name)
+            count_target, multi_instance_reason = resolve_multi_instance_decision(
+                question_type,
+                question,
+                object_name,
+                object_metadata,
+            )
             try:
                 candidates = self._collect_detection_candidates(
                     image_pil,
@@ -96,6 +101,8 @@ class Object3DLocator:
                         "counting_instance_count": len(instance_names),
                         "counting_filter_summary": filter_debug.get("summary"),
                         "counting_rejected_candidates": filter_debug.get("rejected_candidates", []),
+                        "multi_instance_decision": True,
+                        "multi_instance_reason": multi_instance_reason,
                         "prompts_tried": prompts_tried,
                         "candidates_considered": summarize_candidates(candidates),
                     }
@@ -144,6 +151,8 @@ class Object3DLocator:
                         "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
                         "candidate_grid_path": best_detection.get("candidate_grid_path"),
                         "selected_overlay_path": best_detection.get("selected_overlay_path"),
+                        "multi_instance_decision": False,
+                        "multi_instance_reason": multi_instance_reason,
                         "candidates_considered": summarize_candidates(best_detection.get("_ranked_candidates", candidates)),
                     }
                     continue
@@ -183,6 +192,8 @@ class Object3DLocator:
                     "candidate_overlay_path": best_detection.get("candidate_overlay_path"),
                     "candidate_grid_path": best_detection.get("candidate_grid_path"),
                     "selected_overlay_path": best_detection.get("selected_overlay_path"),
+                    "multi_instance_decision": False,
+                    "multi_instance_reason": multi_instance_reason,
                     "overlap_warnings": overlap_warnings(object_name, box2d, selected_boxes),
                     "candidates_considered": summarize_candidates(best_detection.get("_ranked_candidates", candidates)),
                 }
@@ -486,6 +497,8 @@ def build_object_metadata_by_name(
             "object": str(item.get("object") or detect_phrase).strip().lower(),
             "relation_context": str(item.get("relation_context") or "").strip().lower(),
             "reference_object": str(item.get("reference_object") or "").strip().lower(),
+            "multi_instance": item.get("multi_instance"),
+            "multi_instance_reason": str(item.get("multi_instance_reason") or "").strip(),
         }
     return metadata
 
@@ -1162,7 +1175,7 @@ SAME_TYPE_EXISTENCE_RE = re.compile(
 )
 NON_VISUAL_COUNT_RE = re.compile(r"\b(?:need|needed|stack|stacked|achieve|match|reach|same height|have to)\b")
 COUNT_RATIO_RE = re.compile(r"\bratio\s+of\b.*\b(?:to|and)\b", re.IGNORECASE)
-COUNT_COMPARISON_RE = re.compile(r"\b(?:more|fewer|less|greater|larger|smaller|most|fewest|least)\b", re.IGNORECASE)
+COUNT_COMPARISON_RE = re.compile(r"\b(?:more|fewer|less|greater|larger|smaller|fewest|least)\b", re.IGNORECASE)
 NUMERIC_DIMENSION_RE = re.compile(r"\b(?:height|width|length|depth|volume|distance|size|area|diagonal)\b", re.IGNORECASE)
 MULTI_INSTANCE_NUMERIC_PATTERN = (
     r"\b(?:two|both|multiple|all)\s+(?:of\s+)?(?:the\s+)?{object}\b|"
@@ -1238,6 +1251,25 @@ def is_visual_count_target(question_type: Optional[str], question: str, object_n
         if re.search(r"\bnumber of\s+" + escaped + r"\b", question_text):
             return True
     return False
+
+
+def resolve_multi_instance_decision(
+    question_type: Optional[str],
+    question: str,
+    object_name: str,
+    object_metadata: Optional[Dict[str, object]] = None,
+) -> Tuple[bool, str]:
+    if object_metadata and object_metadata.get("multi_instance") is True:
+        return True, str(object_metadata.get("multi_instance_reason") or "vlm_multi_instance_true")
+    if object_metadata and object_metadata.get("multi_instance") is False:
+        return False, str(object_metadata.get("multi_instance_reason") or "vlm_multi_instance_false")
+
+    if is_area_object(object_name) or str(object_name or "").strip().lower() in {"image", "viewpoint", "camera"}:
+        return False, "area_or_viewpoint_not_count_target"
+
+    if is_visual_count_target(question_type, question, object_name):
+        return True, "rule_multi_instance_fallback"
+    return False, "single_instance"
 
 
 def _object_name_forms(object_name: str) -> List[str]:
